@@ -1,0 +1,664 @@
+"""build_stock_snapshot()の決算日検証ロジックのテスト(コードレビュー対応:
+明治ホールディングス(2269)事例)。
+
+データ提供元(yfinance等)の更新遅延により、評価日より過去の日付が「次回決算
+予定日」として返ってくることがある。過去日をそのまま次回決算日として使わず、
+buy/sell/profit_takingの3消費者すべてが一元的に検証された値のみを使うことを
+build_stock_snapshot()の出力で直接確認する。
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import datetime as dt
+
+import pytest
+
+from jstock_advisor.config.loader import load_config
+from jstock_advisor.domain.entities.enums import (
+    EarningsDateStatus,
+    EarningsDecisionRelevance,
+    EarningsReleaseConfirmationState,
+    EarningsSurpriseEvaluationState,
+    EarningsTrendEvaluationState,
+    EnvironmentEvaluationState,
+    HistoricalValuationEvaluationState,
+    MarketEnvironmentEvaluationState,
+    PriceRangeEvaluationState,
+    SectorEnvironmentEvaluationState,
+    TimingScoreEvaluationState,
+    ValuationBasis,
+)
+from jstock_advisor.interfaces.provider_errors import (
+    ProviderDataError,
+    ProviderFailureCategory,
+)
+from jstock_advisor.interfaces.types import Disclosure
+from jstock_advisor.services import stock_snapshot_service as stock_snapshot_service_module
+from jstock_advisor.services.provider_factory import build_mock_provider_bundle
+from jstock_advisor.services.stock_snapshot_service import build_stock_snapshot
+
+_CFG = load_config()
+_NOW = dt.datetime(2026, 8, 6, tzinfo=dt.UTC)
+_STOCK_CODE = "2914"
+
+
+class _FixedEarningsDateDisclosureProvider:
+    """次回決算予定日を固定値(または欠損)で返すフェイク。get_disclosuresは
+    委譲元のモックProviderへそのまま委譲する(決算日検証以外は変更しない)。
+    """
+
+    def __init__(self, delegate: object, next_earnings_date: dt.date | None) -> None:
+        self._delegate = delegate
+        self._next_earnings_date = next_earnings_date
+
+    def get_disclosures(self, stock_code: str, since: dt.date) -> list[Disclosure]:
+        return self._delegate.get_disclosures(stock_code, since)  # type: ignore[attr-defined]
+
+    def get_next_earnings_date(self, stock_code: str) -> dt.date | None:
+        return self._next_earnings_date
+
+
+def _providers_with_fixed_earnings_date(next_earnings_date: dt.date | None):
+    base = build_mock_provider_bundle(_NOW)
+    fake_disclosure = _FixedEarningsDateDisclosureProvider(base.disclosure, next_earnings_date)
+    return dataclasses.replace(base, disclosure=fake_disclosure)
+
+
+def test_past_earnings_date_is_rejected_as_stale() -> None:
+    """明治HD事例の回帰: 過去の決算予定日をそのままnext_earnings_dateとして
+    使わない。"""
+    providers = _providers_with_fixed_earnings_date(dt.date(2026, 8, 5))
+    snapshot, error = build_stock_snapshot(providers, _STOCK_CODE, _NOW, _CFG)
+    assert error is None
+    assert snapshot is not None
+    assert snapshot.earnings_date_status == EarningsDateStatus.STALE_PAST_DATE
+    assert snapshot.earnings_date_raw == dt.date(2026, 8, 5)
+    assert snapshot.next_earnings_date is None
+
+
+def test_today_earnings_date_is_confirmed() -> None:
+    """予定日当日はCONFIRMEDとして扱う(過去日として除外しない)。"""
+    providers = _providers_with_fixed_earnings_date(_NOW.date())
+    snapshot, error = build_stock_snapshot(providers, _STOCK_CODE, _NOW, _CFG)
+    assert error is None
+    assert snapshot is not None
+    assert snapshot.earnings_date_status == EarningsDateStatus.CONFIRMED
+    assert snapshot.next_earnings_date == _NOW.date()
+
+
+def test_future_earnings_date_is_confirmed() -> None:
+    future = _NOW.date() + dt.timedelta(days=90)
+    providers = _providers_with_fixed_earnings_date(future)
+    snapshot, error = build_stock_snapshot(providers, _STOCK_CODE, _NOW, _CFG)
+    assert error is None
+    assert snapshot is not None
+    assert snapshot.earnings_date_status == EarningsDateStatus.CONFIRMED
+    assert snapshot.earnings_date_raw == future
+    assert snapshot.next_earnings_date == future
+
+
+def test_missing_earnings_date_is_unavailable() -> None:
+    providers = _providers_with_fixed_earnings_date(None)
+    snapshot, error = build_stock_snapshot(providers, _STOCK_CODE, _NOW, _CFG)
+    assert error is None
+    assert snapshot is not None
+    assert snapshot.earnings_date_status == EarningsDateStatus.UNAVAILABLE
+    assert snapshot.earnings_date_raw is None
+    assert snapshot.next_earnings_date is None
+
+
+# ===== JST基準の境界テスト(デプロイ前対応) =====
+
+
+def test_jst_boundary_rejects_date_that_is_today_in_utc_but_past_in_jst() -> None:
+    """UTC 2026-08-05T23:00 = JST 2026-08-06T08:00。素の.date()(UTC基準)なら
+    8/5になり「当日」と誤判定するが、JST基準では8/6が評価日のため、8/5は
+    過去日として正しくSTALE_PAST_DATEになる。
+    """
+    now_utc_23 = dt.datetime(2026, 8, 5, 23, 0, tzinfo=dt.UTC)
+    providers = _providers_with_fixed_earnings_date(dt.date(2026, 8, 5))
+    snapshot, error = build_stock_snapshot(providers, _STOCK_CODE, now_utc_23, _CFG)
+    assert error is None
+    assert snapshot is not None
+    assert snapshot.earnings_date_status == EarningsDateStatus.STALE_PAST_DATE
+    assert snapshot.next_earnings_date is None
+
+
+def test_jst_boundary_treats_date_as_today_when_jst_date_matches() -> None:
+    """UTC 2026-08-04T23:00 = JST 2026-08-05T08:00。決算予定日が8/5の場合、
+    JST基準では「当日」のためCONFIRMEDのままとなり、営業日数は0になる。
+    """
+    now_utc_23 = dt.datetime(2026, 8, 4, 23, 0, tzinfo=dt.UTC)
+    providers = _providers_with_fixed_earnings_date(dt.date(2026, 8, 5))
+    snapshot, error = build_stock_snapshot(providers, _STOCK_CODE, now_utc_23, _CFG)
+    assert error is None
+    assert snapshot is not None
+    assert snapshot.earnings_date_status == EarningsDateStatus.CONFIRMED
+    assert snapshot.next_earnings_date == dt.date(2026, 8, 5)
+    assert snapshot.business_days_to_earnings == 0
+
+
+def test_naive_now_is_rejected() -> None:
+    providers = _providers_with_fixed_earnings_date(None)
+    naive_now = dt.datetime(2026, 8, 6)
+    with pytest.raises(ValueError, match="timezone-aware"):
+        build_stock_snapshot(providers, _STOCK_CODE, naive_now, _CFG)
+
+
+def test_business_days_to_earnings_is_computed_once_on_snapshot() -> None:
+    """next_earnings_dateが未来日の場合、business_days_to_earningsがJST暦日
+    基準で1回だけ計算されsnapshotへ格納される(buy/sell/profit_takingが
+    個別に再計算しないための一元化)。"""
+    future = _NOW.date() + dt.timedelta(days=7)
+    providers = _providers_with_fixed_earnings_date(future)
+    snapshot, error = build_stock_snapshot(providers, _STOCK_CODE, _NOW, _CFG)
+    assert error is None
+    assert snapshot is not None
+    assert snapshot.business_days_to_earnings is not None
+    assert snapshot.business_days_to_earnings > 0
+
+
+def test_business_days_to_earnings_is_none_when_earnings_date_stale() -> None:
+    providers = _providers_with_fixed_earnings_date(dt.date(2026, 8, 5))
+    snapshot, error = build_stock_snapshot(providers, _STOCK_CODE, _NOW, _CFG)
+    assert error is None
+    assert snapshot is not None
+    assert snapshot.business_days_to_earnings is None
+
+
+# ===== 判定精度向上機能Phase B: Historical Valuation Score配線確認 =====
+
+
+def test_historical_valuation_score_is_computed_when_data_available() -> None:
+    """モックプロバイダの過去バリュエーションデータ・trailing_eps/forecast_bpsが
+    揃っていれば、-100〜+100の範囲でhistorical_valuation.scoreが計算されること
+    (配線確認。スコアの計算ロジック自体の詳細はtest_historical_valuation_score.py
+    で検証)。"""
+    providers = build_mock_provider_bundle(_NOW)
+    snapshot, error = build_stock_snapshot(providers, _STOCK_CODE, _NOW, _CFG)
+    assert error is None
+    assert snapshot is not None
+    assert snapshot.historical_valuation.state == HistoricalValuationEvaluationState.EVALUATED
+    assert snapshot.historical_valuation.score is not None
+    assert -100.0 <= snapshot.historical_valuation.score <= 100.0
+
+
+def test_historical_valuation_current_per_uses_trailing_basis() -> None:
+    """current PERはforecast_eps(forward)ではなくtrailing_epsから算出され、
+    TRAILING basisとして記録される(コードレビュー対応: basis整合性)。"""
+    providers = build_mock_provider_bundle(_NOW)
+    snapshot, error = build_stock_snapshot(providers, _STOCK_CODE, _NOW, _CFG)
+    assert error is None
+    assert snapshot is not None
+    assert snapshot.historical_valuation.current_per_basis == ValuationBasis.TRAILING
+    assert snapshot.historical_valuation.current_per == (
+        snapshot.current_price / snapshot.financial.trailing_eps
+    )
+
+
+# ===== 判定精度向上機能Phase B第二弾: Timing Score配線確認 =====
+
+
+def test_timing_score_is_computed_from_momentum_snapshot() -> None:
+    """StockSnapshot.timingがmomentum・current_priceを基に計算されること
+    (配線確認。算出式自体の詳細はtest_timing_score.pyで検証)。"""
+    providers = build_mock_provider_bundle(_NOW)
+    snapshot, error = build_stock_snapshot(providers, _STOCK_CODE, _NOW, _CFG)
+    assert error is None
+    assert snapshot is not None
+    assert snapshot.timing.trend_quality_component is not None
+    assert snapshot.timing.model_version == _CFG.timing_score.model_version
+
+
+# ===== 判定精度向上機能Phase C: build_stock_snapshot()統合配線確認
+# (コードレビュー対応 第3回)。EarningsDecisionRelevance判定・Earnings
+# Surprise履歴取得のI/O抑止(phase_c_earnings_blocked)の本番配線を検証する。
+# 単体のdecision_relevance挙動自体はtest_earnings_surprise.py/
+# test_earnings_trend.pyで検証済みのため、ここではbuild_stock_snapshot()
+# ↓resolve_earnings_release_confirmation()↓resolve_earnings_decision_
+# relevance()↓evaluate_earnings_surprise()/evaluate_earnings_trend()という
+# 実際の配線経路のみを対象とする。 =====
+
+
+class _SpyFinancialDataProvider:
+    """financial_data providerのフェイクラッパー。get_financial_summary()の
+    fetched_atを固定値へ差し替えて決算反映確認(DATA_UPDATED)の誤発火を防ぎ、
+    get_earnings_surprise_history()の呼び出し回数を数える(Medium対応の
+    回帰テスト用)。他のメソッドは委譲元へそのまま委譲する。"""
+
+    def __init__(self, delegate: object, fetched_at_override: dt.datetime) -> None:
+        self._delegate = delegate
+        self._fetched_at_override = fetched_at_override
+        self.earnings_surprise_history_call_count = 0
+
+    def get_financial_summary(self, stock_code: str):
+        summary = self._delegate.get_financial_summary(stock_code)  # type: ignore[attr-defined]
+        if summary is None:
+            return None
+        source = summary.source.model_copy(update={"fetched_at": self._fetched_at_override})
+        return summary.model_copy(update={"source": source})
+
+    def get_historical_valuation(self, stock_code: str, years: int):
+        return self._delegate.get_historical_valuation(stock_code, years)  # type: ignore[attr-defined]
+
+    def get_cashflow_decomposition(self, stock_code: str):
+        return self._delegate.get_cashflow_decomposition(stock_code)  # type: ignore[attr-defined]
+
+    def get_earnings_surprise_history(self, stock_code: str):
+        self.earnings_surprise_history_call_count += 1
+        return self._delegate.get_earnings_surprise_history(stock_code)  # type: ignore[attr-defined]
+
+
+def _providers_for_phase_c_earnings_window(
+    earnings_date_raw: dt.date, fetched_at_override: dt.datetime
+) -> tuple[object, _SpyFinancialDataProvider]:
+    base = build_mock_provider_bundle(_NOW)
+    fake_disclosure = _FixedEarningsDateDisclosureProvider(base.disclosure, earnings_date_raw)
+    spy_financial = _SpyFinancialDataProvider(base.financial_data, fetched_at_override)
+    providers = dataclasses.replace(base, disclosure=fake_disclosure, financial_data=spy_financial)
+    return providers, spy_financial
+
+
+class _SpyDividendDataProvider:
+    """dividend_data providerのフェイクラッパー。get_dividend_info()に渡された
+    fiscal_year_end_monthを記録する(配当クロスバリデーション根本修正:
+    financial.fiscal_year_end_monthの配線確認用)。"""
+
+    def __init__(self, delegate: object) -> None:
+        self._delegate = delegate
+        self.fiscal_year_end_month_calls: list[int | None] = []
+
+    def get_dividend_info(self, stock_code: str, fiscal_year_end_month: int | None = None):
+        self.fiscal_year_end_month_calls.append(fiscal_year_end_month)
+        return self._delegate.get_dividend_info(  # type: ignore[attr-defined]
+            stock_code, fiscal_year_end_month=fiscal_year_end_month
+        )
+
+
+def test_dividend_info_is_fetched_with_financial_summary_fiscal_year_end_month() -> None:
+    """build_stock_snapshot()がdividend_data.get_dividend_info()を呼ぶ際、
+    financial_data.get_financial_summary()で取得したfiscal_year_end_monthを
+    正しく引き渡すこと(配当クロスバリデーション根本修正の配線確認)。"""
+    base = build_mock_provider_bundle(_NOW)
+    financial = base.financial_data.get_financial_summary(_STOCK_CODE)
+    assert financial is not None
+    spy_dividend = _SpyDividendDataProvider(base.dividend_data)
+    providers = dataclasses.replace(base, dividend_data=spy_dividend)
+
+    snapshot, error = build_stock_snapshot(providers, _STOCK_CODE, _NOW, _CFG)
+
+    assert error is None
+    assert snapshot is not None
+    assert spy_dividend.fiscal_year_end_month_calls == [financial.fiscal_year_end_month]
+
+
+def test_unknown_relevance_does_not_block_shadow_evaluation_indefinitely() -> None:
+    """4.1: 古すぎる決算予定日(stale_earnings_relevance_days=10日を超える)
+    かつ財務データの更新が確認できない場合、release_confirmation_stateは
+    AWAITING_CONFIRMATION/DELAYED、decision_relevanceはUNKNOWNとなり、
+    決算待ちだけを理由にEarnings Surprise/TrendがNOT_APPLICABLEへ無期限
+    停止しないことを確認する(データ不足によるNOT_EVALUATEDは許容)。"""
+    earnings_date_raw = _NOW.date() - dt.timedelta(days=30)
+    fetched_at_override = _NOW - dt.timedelta(days=40)
+    providers, _spy = _providers_for_phase_c_earnings_window(earnings_date_raw, fetched_at_override)
+
+    snapshot, error = build_stock_snapshot(providers, _STOCK_CODE, _NOW, _CFG)
+
+    assert error is None
+    assert snapshot is not None
+    assert snapshot.earnings_date_status == EarningsDateStatus.STALE_PAST_DATE
+    assert snapshot.earnings_surprise.release_confirmation_state in (
+        EarningsReleaseConfirmationState.AWAITING_CONFIRMATION,
+        EarningsReleaseConfirmationState.DELAYED,
+    )
+    assert (
+        snapshot.earnings_surprise.earnings_decision_relevance == EarningsDecisionRelevance.UNKNOWN
+    )
+    assert snapshot.earnings_trend.earnings_decision_relevance == EarningsDecisionRelevance.UNKNOWN
+    assert snapshot.earnings_trend.release_confirmation_state == (
+        snapshot.earnings_surprise.release_confirmation_state
+    )
+    assert snapshot.earnings_surprise.state != EarningsSurpriseEvaluationState.NOT_APPLICABLE
+    assert snapshot.earnings_trend.state != EarningsTrendEvaluationState.NOT_APPLICABLE
+
+
+def test_relevant_stale_earnings_makes_phase_c_not_applicable() -> None:
+    """4.2: 直近(stale_earnings_relevance_days以内)の過去決算予定日で
+    財務データの更新が確認できない場合、decision_relevance=RELEVANTとなり
+    Earnings Surprise/TrendがNOT_APPLICABLEになる。あわせてMedium対応
+    (外部I/O抑止)の証明として、get_earnings_surprise_history()が
+    一度も呼ばれないことを確認する(今回最重要の回帰テスト)。"""
+    earnings_date_raw = _NOW.date() - dt.timedelta(days=1)
+    fetched_at_override = _NOW - dt.timedelta(days=10)
+    providers, spy = _providers_for_phase_c_earnings_window(earnings_date_raw, fetched_at_override)
+
+    snapshot, error = build_stock_snapshot(providers, _STOCK_CODE, _NOW, _CFG)
+
+    assert error is None
+    assert snapshot is not None
+    assert snapshot.earnings_date_status == EarningsDateStatus.STALE_PAST_DATE
+    assert snapshot.earnings_surprise.release_confirmation_state in (
+        EarningsReleaseConfirmationState.AWAITING_CONFIRMATION,
+        EarningsReleaseConfirmationState.DELAYED,
+    )
+    assert (
+        snapshot.earnings_surprise.earnings_decision_relevance == EarningsDecisionRelevance.RELEVANT
+    )
+    assert snapshot.earnings_surprise.state == EarningsSurpriseEvaluationState.NOT_APPLICABLE
+    assert snapshot.earnings_trend.state == EarningsTrendEvaluationState.NOT_APPLICABLE
+    # Medium対応: 必ずNOT_APPLICABLEになると分かっている場合、不要な
+    # Yahoo Finance問い合わせ(get_earnings_surprise_history())を行わない。
+    assert spy.earnings_surprise_history_call_count == 0
+
+
+def test_normal_case_still_fetches_earnings_surprise_history() -> None:
+    """4.3: phase_c_earnings_blocked=Falseの通常ケース(決算待ちで
+    ブロックされていない)では、従来どおりget_earnings_surprise_history()
+    が呼ばれる(最適化により一切取得されなくなる回帰を防ぐ)。"""
+    base = build_mock_provider_bundle(_NOW)
+    spy_financial = _SpyFinancialDataProvider(base.financial_data, _NOW)
+    providers = dataclasses.replace(base, financial_data=spy_financial)
+
+    snapshot, error = build_stock_snapshot(providers, _STOCK_CODE, _NOW, _CFG)
+
+    assert error is None
+    assert snapshot is not None
+    assert spy_financial.earnings_surprise_history_call_count == 1
+
+
+# --- Issue #59 Phase B4(2026-08-30): provider障害を欠測へロンダリングしない ------
+
+
+class _FailingEarningsDateDisclosureProvider:
+    """次回決算日の取得だけが provider 障害で失敗する disclosure provider。"""
+
+    def __init__(self, delegate: object) -> None:
+        self._delegate = delegate
+
+    def get_disclosures(self, stock_code: str, since: dt.date) -> object:
+        return self._delegate.get_disclosures(stock_code, since)  # type: ignore[attr-defined]
+
+    def get_next_earnings_date(self, stock_code: str) -> dt.date | None:
+        raise ProviderDataError(
+            provider_name="yfinance",
+            operation="get_next_earnings_date",
+            retryable=True,
+            failure_category=ProviderFailureCategory.RETRYABLE_PROVIDER_FAILURE,
+            error_type="RuntimeError",
+            error_summary="429 Too Many Requests",
+        )
+
+
+def test_provider_failure_is_not_converted_to_unavailable_status() -> None:
+    """T10: provider障害を EarningsDateStatus.UNAVAILABLE へ縮退させない。
+
+    以前は provider 例外が provider 内で None へ潰され、consumer 側で
+    「決算予定なし(UNAVAILABLE)」と同義になり、決算直前のBUY抑制ゲートが
+    無音ですり抜けていた(business_days_to_earnings=None のため条件不成立)。
+
+    Phase B4 以降は ProviderDataError がそのまま伝播し、呼び出し元の既存
+    retry 境界(call_with_rate_limit_retry)が観測する。snapshot 側で
+    UNAVAILABLE へ変換しない。
+    """
+    base = build_mock_provider_bundle(_NOW)
+    providers = dataclasses.replace(
+        base, disclosure=_FailingEarningsDateDisclosureProvider(base.disclosure)
+    )
+
+    with pytest.raises(ProviderDataError) as excinfo:
+        build_stock_snapshot(providers, _STOCK_CODE, _NOW, _CFG)
+
+    assert excinfo.value.operation == "get_next_earnings_date"
+    assert excinfo.value.retryable is True
+
+
+# --- Shadow計測の隔離(Issue #384 PR-3) -----------------------------------
+
+
+def _boom(*args: object, **kwargs: object) -> object:
+    raise ZeroDivisionError("injected shadow computation failure")
+
+
+def test_shadow_computation_failure_in_all_8_signals_does_not_break_snapshot_build(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """8箇所のevaluate_*()すべてが例外を出しても、build_stock_snapshot()
+    自体は失敗せず、各fieldがNOT_EVALUATED + SHADOW_COMPUTATION_FAILEDタグ
+    付きreason_codesで表現される(Issue #384 PR-3。8箇所すべてを隔離しな
+    ければsnapshot全体が失われるという#384本体の発見に対する固定)。
+
+    0.0/空dict/空値への偽装がないことも、各fieldの他の値がNoneのまま
+    (デフォルト値どおり)であることで併せて確認する。
+    """
+    for name in (
+        "evaluate_historical_valuation",
+        "evaluate_timing_score",
+        "evaluate_earnings_surprise",
+        "evaluate_earnings_trend",
+        "evaluate_entry_price_range",
+        "evaluate_market_environment",
+        "evaluate_sector_environment",
+        "evaluate_environment",
+    ):
+        monkeypatch.setattr(stock_snapshot_service_module, name, _boom)
+
+    providers = build_mock_provider_bundle(_NOW)
+    snapshot, error = build_stock_snapshot(providers, _STOCK_CODE, _NOW, _CFG)
+
+    assert error is None
+    assert snapshot is not None
+
+    # entry_price_rangeはscoreを持たず価格帯fieldを持つため、共通loopとは
+    # 分けて検証する(EntryPriceRangeResultだけ形状が異なる)。
+    score_bearing_checks = (
+        (snapshot.historical_valuation, HistoricalValuationEvaluationState.NOT_EVALUATED),
+        (snapshot.timing, TimingScoreEvaluationState.NOT_EVALUATED),
+        (snapshot.earnings_surprise, EarningsSurpriseEvaluationState.NOT_EVALUATED),
+        (snapshot.earnings_trend, EarningsTrendEvaluationState.NOT_EVALUATED),
+        (snapshot.market_environment, MarketEnvironmentEvaluationState.NOT_EVALUATED),
+        (snapshot.sector_environment, SectorEnvironmentEvaluationState.NOT_EVALUATED),
+        (snapshot.environment, EnvironmentEvaluationState.NOT_EVALUATED),
+    )
+    for result, expected_state in score_bearing_checks:
+        assert result.state == expected_state
+        assert len(result.reason_codes) == 1
+        assert result.reason_codes[0] == "SHADOW_COMPUTATION_FAILED:ZeroDivisionError"
+        # 0.0や空へ偽装しない: scoreはNone(デフォルト)のまま、EVALUATEDの
+        # ときのように具体的な数値が入らない。
+        assert result.score is None
+
+    entry_price_range = snapshot.entry_price_range
+    assert entry_price_range.state == PriceRangeEvaluationState.NOT_EVALUATED
+    assert len(entry_price_range.reason_codes) == 1
+    assert entry_price_range.reason_codes[0] == "SHADOW_COMPUTATION_FAILED:ZeroDivisionError"
+    # entry_price_rangeはscoreの代わりに価格帯fieldを持つ。0.0や空へ偽装
+    # せず、いずれもNone(デフォルト)のままであることを確認する。
+    assert entry_price_range.valuation_ceiling is None
+    assert entry_price_range.starter_entry_price is None
+    assert entry_price_range.preferred_entry_price is None
+    assert entry_price_range.strong_entry_price is None
+    assert entry_price_range.max_entry_price is None
+    assert entry_price_range.stop_review_price is None
+    assert entry_price_range.current_price == snapshot.current_price
+
+
+def test_shadow_computation_failure_is_isolated_per_signal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """隔離は算出ごと。historical_valuationだけが失敗しても、他の
+    Shadow計測(timing等)は影響を受けず算出されたまま残る。
+    """
+    monkeypatch.setattr(stock_snapshot_service_module, "evaluate_historical_valuation", _boom)
+
+    providers = build_mock_provider_bundle(_NOW)
+    snapshot, error = build_stock_snapshot(providers, _STOCK_CODE, _NOW, _CFG)
+
+    assert error is None
+    assert snapshot is not None
+    assert snapshot.historical_valuation.state == HistoricalValuationEvaluationState.NOT_EVALUATED
+    assert snapshot.historical_valuation.reason_codes == (
+        "SHADOW_COMPUTATION_FAILED:ZeroDivisionError",
+    )
+    # historical_valuationを入力に使うentry_price_rangeも、隔離された
+    # NOT_EVALUATED入力を受け取って正常に完走する(例外を再伝播しない)。
+    assert snapshot.entry_price_range is not None
+    assert snapshot.timing.state == TimingScoreEvaluationState.EVALUATED
+
+
+# --- Shadow計測専用inputの隔離(Issue #384 PR-8、サブちゃんのPR #406レビュー
+# F1対応) ---------------------------------------------------------------
+#
+# resolved_period / release_confirmation_state / decision_relevance /
+# earnings_surprise_historyは、いずれもearnings_surprise/earnings_trendの
+# Shadow計測専用input(全数grepで他の出力先が無いことを確認済み)。
+# `*_to_metrics()`/`evaluate_*()`という名前ではないため従来の名前軸sweepでは
+# 見つからなかったが、例外1件(特に外部I/Oのearnings_surprise_history)で
+# build_stock_snapshot()全体が失敗しうる形だった。
+
+
+class _FailingFinancialDataProvider:
+    """financial_data providerのフェイクラッパー。get_earnings_surprise_
+    history()のみ例外を出す(Issue #384 PR-8回帰テスト用)。他のメソッドは
+    委譲元へそのまま委譲する(_SpyFinancialDataProviderと同じ4メソッド)。"""
+
+    def __init__(self, delegate: object) -> None:
+        self._delegate = delegate
+
+    def get_financial_summary(self, stock_code: str):
+        return self._delegate.get_financial_summary(stock_code)  # type: ignore[attr-defined]
+
+    def get_historical_valuation(self, stock_code: str, years: int):
+        return self._delegate.get_historical_valuation(stock_code, years)  # type: ignore[attr-defined]
+
+    def get_cashflow_decomposition(self, stock_code: str):
+        return self._delegate.get_cashflow_decomposition(stock_code)  # type: ignore[attr-defined]
+
+    def get_earnings_surprise_history(self, stock_code: str):
+        raise ZeroDivisionError("injected earnings_surprise_history failure")
+
+
+def test_shadow_earnings_phase_c_precondition_failure_does_not_break_snapshot_build(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """resolved_period/release_confirmation_state/decision_relevanceの算出が
+    いずれも例外を出しても、build_stock_snapshot()自体は失敗しない(Issue
+    #384 PR-8)。これら3つはearnings_surprise/earnings_trendのShadow計測
+    専用inputであり、v1判定(historical_valuation/timing等)には使われない。
+
+    サブちゃんのPR #408レビューF1対応: 縮退が発生した事実がearnings_
+    surprise/earnings_trend自身のstate/reason_codesへ残ること(正常時と
+    区別できない値にならないこと)も固定する。
+    """
+    monkeypatch.setattr(stock_snapshot_service_module, "resolve_latest_financial_period_end", _boom)
+    monkeypatch.setattr(
+        stock_snapshot_service_module, "resolve_earnings_release_confirmation", _boom
+    )
+    monkeypatch.setattr(stock_snapshot_service_module, "resolve_earnings_decision_relevance", _boom)
+
+    providers = build_mock_provider_bundle(_NOW)
+    snapshot, error = build_stock_snapshot(providers, _STOCK_CODE, _NOW, _CFG)
+
+    assert error is None
+    assert snapshot is not None
+    # 下流のearnings_surprise/earnings_trend(既存のisolated_shadow_
+    # computation)は、精度前提の失敗を検知してNOT_EVALUATED +
+    # SHADOW_COMPUTATION_FAILEDへ強制される(fallback値で正常系を装って
+    # 完走しない)。build_stock_snapshot()自体は失敗しない。
+    expected_reason_codes = ("SHADOW_COMPUTATION_FAILED:ZeroDivisionError",)
+    assert snapshot.earnings_surprise.state == EarningsSurpriseEvaluationState.NOT_EVALUATED
+    assert snapshot.earnings_surprise.reason_codes == expected_reason_codes
+    assert snapshot.earnings_trend.state == EarningsTrendEvaluationState.NOT_EVALUATED
+    assert snapshot.earnings_trend.reason_codes == expected_reason_codes
+    # v1判定に使われる他のShadow計測は影響を受けない。
+    assert snapshot.historical_valuation.state == HistoricalValuationEvaluationState.EVALUATED
+    assert snapshot.timing.state == TimingScoreEvaluationState.EVALUATED
+
+
+def test_shadow_earnings_surprise_history_external_io_failure_does_not_break_snapshot_build(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """earnings_surprise_history算出(外部I/O、providers.financial_data.
+    get_earnings_surprise_history())が例外を出しても、build_stock_
+    snapshot()自体は失敗しない(Issue #384 PR-8)。サブちゃんのPR #406
+    レビューが実測した、939 passed中160件が落ちる反例に対する固定。
+
+    サブちゃんのPR #408レビューF1対応: earnings_surpriseはNOT_EVALUATED +
+    SHADOW_COMPUTATION_FAILEDへ強制される(「本当にアナリスト予想が無い」
+    というANALYST_CONSENSUS_UNAVAILABLE等の別の業務事実として記録されない
+    ことの固定)。隔離は観測ごと: earnings_surprise_historyを使わない
+    earnings_trend、および他のShadow計測(historical_valuation/timing等)・
+    resolved_period側の3箇所は影響を受けない。
+    """
+    base = build_mock_provider_bundle(_NOW)
+    providers = dataclasses.replace(
+        base, financial_data=_FailingFinancialDataProvider(base.financial_data)
+    )
+
+    snapshot, error = build_stock_snapshot(providers, _STOCK_CODE, _NOW, _CFG)
+
+    assert error is None
+    assert snapshot is not None
+    assert snapshot.earnings_surprise.state == EarningsSurpriseEvaluationState.NOT_EVALUATED
+    assert snapshot.earnings_surprise.reason_codes == (
+        "SHADOW_COMPUTATION_FAILED:ZeroDivisionError",
+    )
+    # earnings_trendはearnings_surprise_historyを入力に使わないため、
+    # この失敗の影響を受けず正常に完走する(隔離は観測ごとの原則)。
+    assert snapshot.earnings_trend.state == EarningsTrendEvaluationState.EVALUATED
+    assert snapshot.historical_valuation.state == HistoricalValuationEvaluationState.EVALUATED
+    assert snapshot.timing.state == TimingScoreEvaluationState.EVALUATED
+
+
+def test_shadow_release_confirmation_fallback_value_is_pinned(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """release_confirmation_stateのfallback値(NOT_APPLICABLE)そのものを
+    固定する(サブちゃんのPR #408レビューF2対応、Y5変異への固定)。
+
+    decision_relevanceは自然にRELEVANTへ解決するfixtureを使い、
+    release_confirmation_stateの算出のみを失敗させる。fallbackが
+    NOT_APPLICABLE(現在の値、抑止しない側)であればphase_c_earnings_
+    blocked=Falseとなり外部I/Oが呼ばれる。fallbackがAWAITING_
+    CONFIRMATION(抑止する側)へ変異すると、decision_relevance=RELEVANTと
+    組み合わさってphase_c_earnings_blocked=Trueとなり、外部I/Oが呼ばれなく
+    なるため本テストが落ちる。
+    """
+    earnings_date_raw = _NOW.date() - dt.timedelta(days=1)
+    fetched_at_override = _NOW - dt.timedelta(days=10)
+    providers, spy = _providers_for_phase_c_earnings_window(earnings_date_raw, fetched_at_override)
+    monkeypatch.setattr(
+        stock_snapshot_service_module, "resolve_earnings_release_confirmation", _boom
+    )
+
+    snapshot, error = build_stock_snapshot(providers, _STOCK_CODE, _NOW, _CFG)
+
+    assert error is None
+    assert snapshot is not None
+    assert spy.earnings_surprise_history_call_count == 1
+
+
+def test_shadow_decision_relevance_fallback_value_is_pinned(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """decision_relevanceのfallback値(UNKNOWN)そのものを固定する(サブ
+    ちゃんのPR #408レビューF2対応、Y6変異への固定)。
+
+    release_confirmation_stateは自然にAWAITING_CONFIRMATION/DELAYEDへ
+    解決するfixtureを使い、decision_relevanceの算出のみを失敗させる。
+    fallbackがUNKNOWN(現在の値、抑止しない側)であればphase_c_earnings_
+    blocked=Falseとなり外部I/Oが呼ばれる。fallbackがRELEVANT(抑止する側)
+    へ変異すると、release_confirmation_state側の自然な値と組み合わさって
+    phase_c_earnings_blocked=Trueとなり、外部I/Oが呼ばれなくなるため本
+    テストが落ちる。
+    """
+    earnings_date_raw = _NOW.date() - dt.timedelta(days=1)
+    fetched_at_override = _NOW - dt.timedelta(days=10)
+    providers, spy = _providers_for_phase_c_earnings_window(earnings_date_raw, fetched_at_override)
+    monkeypatch.setattr(stock_snapshot_service_module, "resolve_earnings_decision_relevance", _boom)
+
+    snapshot, error = build_stock_snapshot(providers, _STOCK_CODE, _NOW, _CFG)
+
+    assert error is None
+    assert snapshot is not None
+    assert spy.earnings_surprise_history_call_count == 1

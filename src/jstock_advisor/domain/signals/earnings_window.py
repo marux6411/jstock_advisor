@@ -1,0 +1,255 @@
+"""決算直前・直後ルール(要求仕様14節)。
+
+決算発表直前は情報の陳腐化リスクが高く、発表直後は最新の実績が判定に
+反映されていない可能性があるため、通常の判定に対して特別な扱いをする。
+
+RECENTLY_REPORTEDの判定は、実際の決算発表日ではなく取得できた直近四半期の
+期末日(fiscal_period_end)を代理指標として用いた近似である。yfinance/EDINET
+いずれも決算発表日そのものは提供しないため、これが取得可能な最良の代替指標
+である(推測で補完しない、という既存方針の範囲内での近似)。
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+import logging
+from dataclasses import dataclass
+
+from jstock_advisor.config.models import EarningsWindowRulesConfig
+from jstock_advisor.domain.business_calendar import BusinessCalendar
+from jstock_advisor.domain.entities.enums import (
+    EarningsDateStatus,
+    EarningsDecisionRelevance,
+    EarningsReleaseConfirmationState,
+    EarningsWindowStatus,
+    FinancialPeriodEndSource,
+    RecentPeriodsSource,
+    RecommendationType,
+)
+from jstock_advisor.domain.jst import JST, require_timezone_aware, to_jst
+from jstock_advisor.interfaces.types import FinancialSummary
+
+logger = logging.getLogger(__name__)
+
+_BUY_LIKE = (RecommendationType.BUY, RecommendationType.WATCH_BUY)
+_PROFIT_TAKE_LIKE = (RecommendationType.PARTIAL_PROFIT_TAKE, RecommendationType.FULL_PROFIT_TAKE)
+_REVIEW_ELIGIBLE = (RecommendationType.HOLD, RecommendationType.WATCH)
+
+
+@dataclass(frozen=True)
+class EarningsWindowEvaluation:
+    status: EarningsWindowStatus
+    business_days_to_next_earnings: int | None
+    days_since_latest_quarter_end: int | None
+
+
+def evaluate_earnings_window(
+    as_of: dt.date,
+    calendar: BusinessCalendar,
+    config: EarningsWindowRulesConfig,
+    next_earnings_date: dt.date | None = None,
+    latest_quarter_end: dt.date | None = None,
+) -> EarningsWindowEvaluation:
+    business_days_to_next_earnings = None
+    if next_earnings_date is not None and next_earnings_date >= as_of:
+        business_days_to_next_earnings = calendar.business_days_between(as_of, next_earnings_date)
+
+    days_since_latest_quarter_end = None
+    if latest_quarter_end is not None and latest_quarter_end <= as_of:
+        days_since_latest_quarter_end = (as_of - latest_quarter_end).days
+
+    if (
+        business_days_to_next_earnings is not None
+        and business_days_to_next_earnings <= config.approaching_window_business_days
+    ):
+        status = EarningsWindowStatus.APPROACHING_EARNINGS
+    elif (
+        days_since_latest_quarter_end is not None
+        and days_since_latest_quarter_end <= config.recently_reported_calendar_days
+    ):
+        status = EarningsWindowStatus.RECENTLY_REPORTED
+    else:
+        status = EarningsWindowStatus.NONE
+
+    return EarningsWindowEvaluation(
+        status=status,
+        business_days_to_next_earnings=business_days_to_next_earnings,
+        days_since_latest_quarter_end=days_since_latest_quarter_end,
+    )
+
+
+def recommend_earnings_aware_action(
+    base_recommendation: RecommendationType,
+    window: EarningsWindowEvaluation,
+) -> RecommendationType:
+    """決算直前・直後であることを理由に、通常の判定を必要な範囲でのみ上書きする。
+
+    投資前提の悪化を根拠とするSELL/URGENT_REVIEWは、決算直前であっても
+    タイミングを理由に抑制しない(悪化は既に確認済みの事実であり、決算を
+    待つこと自体がリスクになりうるため)。
+    """
+    if window.status == EarningsWindowStatus.APPROACHING_EARNINGS:
+        if base_recommendation in _BUY_LIKE:
+            return RecommendationType.WATCH_BEFORE_EARNINGS
+        if base_recommendation in _PROFIT_TAKE_LIKE:
+            return RecommendationType.PARTIAL_RISK_REDUCTION
+        return base_recommendation
+    if window.status == EarningsWindowStatus.RECENTLY_REPORTED:
+        if base_recommendation in _REVIEW_ELIGIBLE:
+            return RecommendationType.REVIEW_AFTER_EARNINGS
+        return base_recommendation
+    return base_recommendation
+
+
+@dataclass(frozen=True)
+class ResolvedFinancialPeriodEnd:
+    """決算反映確認に使う最新財務期間末の解決結果(デプロイ前対応)。"""
+
+    period_end: dt.date | None
+    source: FinancialPeriodEndSource
+
+
+def resolve_latest_financial_period_end(
+    financial: FinancialSummary,
+    evaluation_date: dt.date,
+) -> ResolvedFinancialPeriodEnd:
+    """決算反映確認に使う最新の財務期間末を解決する(デプロイ前対応)。
+
+    FinancialSummary.fiscal_period_endは年次決算期末を表す(interfaces/types.py
+    参照)。四半期ごとの決算発表の反映確認にはrecent_quarters内の実際の期末日の
+    うち最新のものを優先する。recent_quartersが取得できない場合のみ年次期末
+    (fiscal_period_end)へフォールバックする(この場合、年次決算より後に発表
+    された四半期決算の反映は検知できない制約がある。QuarterlyFinancialsに
+    四半期/年次を区別するフィールドは無いため、この関数のフォールバック規則が
+    その代替となる)。
+
+    Provider異常・yfinanceレスポンス変更等で評価日より未来のperiod_endが
+    混入した場合に、それを決算反映済みの証拠として採用しないよう、評価日
+    (JST)以前の値のみを候補とする。
+
+    --- 由来精緻化対応で追加 ---
+    recent_quartersが四半期実績由来なのか年次フォールバック由来なのかを
+    financial.recent_periods_sourceで判別し、RECENT_QUARTERLY_PERIOD/
+    RECENT_ANNUAL_FALLBACKとして区別する(監査ログでの誤認防止。従来の単一の
+    RECENT_PERIODSは廃止)。recent_quartersに有効値があるのに
+    recent_periods_source=UNAVAILABLEというデータ不整合が発生した場合は、
+    period_end自体は引き続き有効な最大値を使いつつ(DATA_UPDATED判定条件は
+    変更しない)、由来ラベルのみ安全側のUNKNOWNとする。このデータ不整合は
+    通常運用では発生しないはずのため、監査ログとは別にwarningログを出す
+    (運用監視対応)。
+    """
+    valid_quarter_ends = [
+        q.quarter_end for q in financial.recent_quarters if q.quarter_end <= evaluation_date
+    ]
+    if valid_quarter_ends:
+        if financial.recent_periods_source == RecentPeriodsSource.QUARTERLY:
+            source = FinancialPeriodEndSource.RECENT_QUARTERLY_PERIOD
+        elif financial.recent_periods_source == RecentPeriodsSource.ANNUAL_FALLBACK:
+            source = FinancialPeriodEndSource.RECENT_ANNUAL_FALLBACK
+        else:
+            # 通常運用では発生しない内部データ不整合(recent_quartersに有効値が
+            # あるのに由来がQUARTERLY/ANNUAL_FALLBACKのいずれでもない)。
+            # period_end自体は引き続き有効な最大値を使い判定は継続する
+            # (raiseしない)が、CloudWatch等から能動的に検知できるようwarningを
+            # 残す(監査ログのfinancial_period_end_source=UNKNOWNとは別目的)。
+            source = FinancialPeriodEndSource.UNKNOWN
+            logger.warning(
+                "financial_period_source_inconsistent: stock_code=%s "
+                "recent_periods_source=%s recent_periods_count=%d "
+                "resolved_period_end=%s evaluation_date=%s",
+                financial.stock_code,
+                financial.recent_periods_source.value,
+                len(financial.recent_quarters),
+                max(valid_quarter_ends).isoformat(),
+                evaluation_date.isoformat(),
+            )
+        return ResolvedFinancialPeriodEnd(period_end=max(valid_quarter_ends), source=source)
+    if financial.fiscal_period_end is not None and financial.fiscal_period_end <= evaluation_date:
+        return ResolvedFinancialPeriodEnd(
+            period_end=financial.fiscal_period_end,
+            source=FinancialPeriodEndSource.ANNUAL_FISCAL_PERIOD_END,
+        )
+    return ResolvedFinancialPeriodEnd(period_end=None, source=FinancialPeriodEndSource.UNAVAILABLE)
+
+
+def resolve_earnings_release_confirmation(
+    earnings_date_status: EarningsDateStatus,
+    earnings_date_raw: dt.date | None,
+    latest_financial_period_end: dt.date | None,
+    financial_fetched_at: dt.datetime,
+    now: dt.datetime,
+    config: EarningsWindowRulesConfig,
+) -> EarningsReleaseConfirmationState:
+    """決算予定日を経過した後、無償データで発表実績を確認できない期間の状態を
+    判定する(コードレビュー対応: 明治ホールディングス(2269)事例)。
+
+    予定日前(CONFIRMED)・取得不能(UNAVAILABLE)はNOT_APPLICABLEとする
+    (前者は既存のapproaching_window/profit_taking_suppressionロジックが
+    別途担当、後者は判断材料が無いため安全側で通常判定を止めない)。
+
+    「財務データが決算発表を反映したか」は、latest_financial_period_endが決算予定日
+    (earnings_date_raw)からの想定報告ラグ(fiscal_period_reporting_lag_days)
+    以内かどうかで近似する。EarningsWindowStatus.RECENTLY_REPORTEDと同種の
+    近似判定であり、決算発表日そのものの厳密な突合ではない。
+    latest_financial_period_endはresolve_latest_financial_period_end()の
+    戻り値(.period_end)を渡すこと(四半期実績を優先した解決済みの値。
+    FinancialSummary.fiscal_period_end(年次)をそのまま渡さない)。
+
+    --- デプロイ前対応で追加 ---
+    financial_fetched_at(財務データ取得元のfetched_at)は、無償Provider
+    (yfinance)ではAPI呼び出し時刻でしかなく、決算発表が実際に反映された
+    証拠にはならない(前回値を永続化して比較する仕組みも今回は追加しない)。
+    そのため、決算予定日より前に取得したデータのlatest_financial_period_endが
+    たまたま報告ラグ条件を満たしていても、それだけではDATA_UPDATEDとしない
+    (=決算予定日以後に取得したデータであることを最低条件として追加する)。
+    """
+    if earnings_date_status != EarningsDateStatus.STALE_PAST_DATE or earnings_date_raw is None:
+        return EarningsReleaseConfirmationState.NOT_APPLICABLE
+    require_timezone_aware(now)
+    require_timezone_aware(financial_fetched_at)
+
+    lag = dt.timedelta(days=config.fiscal_period_reporting_lag_days)
+    fetched_after_earnings_date = to_jst(financial_fetched_at).date() >= earnings_date_raw
+    if (
+        latest_financial_period_end is not None
+        and latest_financial_period_end >= earnings_date_raw - lag
+        and fetched_after_earnings_date
+    ):
+        return EarningsReleaseConfirmationState.DATA_UPDATED
+
+    # 確認待ちの起点は決算予定日の翌日JST 00:00とする(予定日当日はまだ
+    # STALE_PAST_DATEにならず、この関数自体が呼ばれないため自然と除外される)。
+    awaiting_started_at = dt.datetime.combine(
+        earnings_date_raw + dt.timedelta(days=1), dt.time.min, tzinfo=JST
+    )
+    hours_since = (now - awaiting_started_at).total_seconds() / 3600
+    if hours_since >= config.maximum_data_reflection_wait_hours:
+        return EarningsReleaseConfirmationState.DELAYED
+    return EarningsReleaseConfirmationState.AWAITING_CONFIRMATION
+
+
+def resolve_earnings_decision_relevance(
+    earnings_date_status: EarningsDateStatus,
+    earnings_date_raw: dt.date | None,
+    release_confirmation_state: EarningsReleaseConfirmationState,
+    evaluation_date: dt.date,
+    config: EarningsWindowRulesConfig,
+) -> EarningsDecisionRelevance:
+    """古い過去の決算予定日で通常判定を無期限に止めないための関連性判定
+    (デプロイ前対応)。
+
+    Providerが何か月も前の過去日を返し続けた場合、release_confirmation_stateが
+    AWAITING_CONFIRMATION/DELAYEDのまま無期限に居座る可能性がある。過去決算日
+    からの経過日数がstale_earnings_relevance_days以内、または財務データが
+    既に決算後まで進んでいる(DATA_UPDATED)場合のみ現在の判断に関連するとみなし、
+    それ以外(経過日数が大きく、かつ財務データの更新も確認できない)はUNKNOWNとして
+    通常判定へ復帰させる(安全側: 判定不能を理由に永久停止しない)。
+    """
+    if earnings_date_status != EarningsDateStatus.STALE_PAST_DATE or earnings_date_raw is None:
+        return EarningsDecisionRelevance.NOT_RELEVANT
+    if release_confirmation_state == EarningsReleaseConfirmationState.DATA_UPDATED:
+        return EarningsDecisionRelevance.NOT_RELEVANT
+    days_since = (evaluation_date - earnings_date_raw).days
+    if days_since <= config.stale_earnings_relevance_days:
+        return EarningsDecisionRelevance.RELEVANT
+    return EarningsDecisionRelevance.UNKNOWN

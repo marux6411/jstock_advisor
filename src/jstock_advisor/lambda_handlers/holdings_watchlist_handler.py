@@ -1,0 +1,2218 @@
+"""保有銘柄分析Lambda(schedule.yaml daily_holdings_watchlist_analysis、平日08:00)。
+
+【実行時刻の変更について(2026-07-31改訂)】
+以前は平日16:30(当日終値)に実行していたが、買い候補分析(buy_candidates_handler.py、
+平日08:00)と処理条件・通知タイミングを揃えるため08:00へ変更した。両ジョブとも
+実行時点で取得できる最新の終値(前営業日終値)を基準に評価する。
+
+CLIの`jstock analyze holdings --source real --notify`と同じロジックを
+EventBridge Scheduler経由で自動実行する薄いアダプタ。
+
+【統合BUY候補パイプライン(2026-07)への移行について】
+以前はウォッチリスト銘柄の買いシグナル評価(task="watchlist")もこのハンドラが
+別経路(recommendation_type=WATCH_BUY、ランキングなしの個別即時通知)として
+実施していたが、`buy_candidates_handler.py`の統合BUY候補パイプラインへ
+吸収・一本化したため、この経路(および対応するdispatch)は廃止した。
+本ハンドラが担うのは保有銘柄の**売却・利確判定**(task="holding")のみで、
+ウォッチリストのCRUD(services/watchlist_service.py)・保有銘柄の**買い増し判定**
+(buy_candidates_handler.py側)には一切影響しない。`RecommendationType.WATCH_BUY`/
+`NotificationType.WATCHLIST_BUY_SIGNAL`のenum値自体は過去データとの後方互換の
+ため残しているが、新規発行はもう行われない。
+
+銘柄単位のファンアウト(_fanout.py)を採用しており、通常のスケジュール起動では
+保有銘柄一覧を取得して銘柄ごとに自分自身を非同期再帰呼び出しするだけで即座に戻る。
+実際のデータ取得・判定・通知は、"task"付きで再帰呼び出しされた各インスタンスが
+1銘柄のみを担当して行う。
+
+個別のデータ取得エラー・データ品質アラートはLINEへ配信せず、全銘柄の処理が
+完了した時点で全体件数・区分別内訳のサマリーを1通だけ送信する
+(batch_tracker.pyのDynamoDB原子カウンタで完了を検知する。要求仕様§12・§13)。
+
+保有銘柄の集中リスク判定(要求仕様§14)のため、ディスパッチ元でポートフォリオ
+全体の時価総額・取得価格総額を軽量な価格取得(get_latest_price、フルスナップショットは
+取得しない)で概算し、各銘柄ワーカーへ渡す。
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+import logging
+import os
+import uuid
+from dataclasses import dataclass
+from decimal import Decimal
+from typing import Any
+
+from jstock_advisor.config.loader import load_config
+from jstock_advisor.config.models import AppConfig
+from jstock_advisor.domain.business_calendar import BusinessCalendar
+from jstock_advisor.domain.classification.financial_industry import classify_industry
+from jstock_advisor.domain.entities.common import DataSourceReference
+from jstock_advisor.domain.entities.enums import (
+    ConfidenceLevel,
+    DecisionType,
+    EvaluationStatus,
+    HoldingSummaryAction,
+    NotificationCategory,
+    NotificationIntent,
+    NotificationStatus,
+    PriceRangeEvaluationState,
+    RecommendationScope,
+    RecommendationType,
+    resolve_holding_summary_action,
+)
+from jstock_advisor.domain.entities.evaluation_audit import HoldingEvaluationAudit, summary_category
+from jstock_advisor.domain.entities.execution_context import ExecutionContext
+from jstock_advisor.domain.entities.exit_price_range import ExitPriceRangeResult
+from jstock_advisor.domain.entities.holding import Holding
+from jstock_advisor.domain.entities.holding_decision import HoldingDecisionResult
+from jstock_advisor.domain.entities.holding_evaluation_record import (
+    HoldingEvaluationRecord,
+    build_holding_evaluation_id,
+)
+from jstock_advisor.domain.entities.owner import log_ref
+from jstock_advisor.domain.entities.recommendation import Recommendation
+from jstock_advisor.domain.jst import evaluation_date_jst
+from jstock_advisor.domain.notification.notification_category import (
+    resolve_attention_origin_for_recommendation,
+    resolve_notification_category,
+)
+from jstock_advisor.domain.price_freshness import (
+    PriceFreshnessVerdict,
+    evaluate_holdings_price_freshness,
+)
+from jstock_advisor.domain.shadow_observation import isolated_shadow_computation
+from jstock_advisor.domain.signals.exit_price_range import evaluate_exit_price_range
+from jstock_advisor.domain.signals.holding_decision_execution_plan import (
+    resolve_execution_plan,
+    resolve_financial_deferred_policy,
+)
+from jstock_advisor.domain.signals.portfolio_concentration import evaluate_portfolio_concentration
+from jstock_advisor.infrastructure.aws.batch_tracker import (
+    DISPATCH_MODE_LEGACY,
+    DISPATCH_MODE_SQS,
+    BatchFamily,
+    BatchProgress,
+    CompletionBatchRecord,
+    mark_completion_finalize_completed,
+    mark_completion_finalize_failed,
+    record_result,
+    start_batch,
+    try_acquire_completion_finalize,
+)
+from jstock_advisor.infrastructure.line.client import build_line_client_for_run
+from jstock_advisor.infrastructure.local_repository.decision_snapshot_repository import (
+    DecisionSnapshotRepository,
+)
+from jstock_advisor.infrastructure.local_repository.holding_decision_result_repository import (
+    HoldingDecisionResultRepository,
+)
+from jstock_advisor.infrastructure.local_repository.holding_evaluation_record_repository import (
+    HoldingEvaluationRecordRepository,
+)
+from jstock_advisor.infrastructure.local_repository.holding_repository import HoldingRepository
+from jstock_advisor.infrastructure.local_repository.notification_claim_repository import (
+    NotificationClaimRepository,
+)
+from jstock_advisor.infrastructure.local_repository.notification_log_repository import (
+    NotificationLogRepository,
+)
+from jstock_advisor.infrastructure.local_repository.recommendation_repository import (
+    RecommendationRepository,
+)
+from jstock_advisor.lambda_handlers._execution_mode import resolve_execution_context
+from jstock_advisor.lambda_handlers._fanout import (
+    dispatch_async,
+    dispatch_sqs,
+    holdings_watchlist_sqs_dispatch_enabled,
+    resolve_function_name,
+)
+from jstock_advisor.lambda_handlers._finalize_recovery import (
+    is_recovery_event,
+    resolve_finalize_only_request,
+)
+from jstock_advisor.lambda_handlers._market_holiday import (
+    SKIP_REASON,
+    should_skip_for_market_closed,
+)
+from jstock_advisor.lambda_handlers._scheduling import derive_scheduled_batch_id
+from jstock_advisor.services.buy_signal_service import RULE_VERSION_PLACEHOLDER
+from jstock_advisor.services.decision_snapshot_service import save_decision_snapshot_safely
+from jstock_advisor.services.holding_decision_notification_builder import (
+    build_holding_decision_recommendation,
+)
+from jstock_advisor.services.holding_decision_runtime_config_service import (
+    HoldingDecisionRuntimeConfigService,
+)
+from jstock_advisor.services.holding_decision_service import HoldingDecisionService
+from jstock_advisor.services.incident_envelope_publisher import publish_incident_envelope
+from jstock_advisor.services.judgment_safety_shadow_service import (
+    ENGINE_HOLDINGS_PROFIT_TAKING,
+    observe_judgment_safety_shadow,
+)
+from jstock_advisor.services.line_notification_service import (
+    LineNotificationService,
+    NotificationOutcome,
+    resolve_notification_intent_for_recommendation,
+)
+from jstock_advisor.services.portfolio_service import PortfolioService
+from jstock_advisor.services.price_regime_shadow_service import observe_price_regime_shadow
+from jstock_advisor.services.profit_taking_service import (
+    ProfitTakingOutcome,
+    ProfitTakingService,
+)
+from jstock_advisor.services.provider_bundle import ProviderBundle
+from jstock_advisor.services.provider_factory import build_real_provider_bundle
+from jstock_advisor.services.rule_version_service import RuleVersionService
+from jstock_advisor.services.sell_signal_service import SellSignalService
+from jstock_advisor.services.shareholder_benefit_registry_service import (
+    check_registry_coverage,
+    check_registry_health,
+)
+from jstock_advisor.services.stock_snapshot_service import StockSnapshot, build_stock_snapshot
+from jstock_advisor.services.trade_cooldown_service import TradeCooldownService
+from jstock_advisor.services.watch_state_service import WatchStateService
+from jstock_advisor.services.yfinance_rate_limit import call_with_rate_limit_retry
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+
+_PROCESS_NAME = "保有銘柄分析"
+# handler()は常に明示的にexecution_contextを渡す(NORMAL/VALIDATIONを問わず)。
+# このデフォルトは内部関数を直接呼ぶ既存テストコード(白箱テスト)向けの
+# 後方互換専用で、本番の呼び出し経路では使われない。
+_DEFAULT_EXECUTION_CONTEXT = ExecutionContext.normal()
+
+# Issue #668(HF-3): HANDLED_FAILURE通知のsource/job_name。job_nameは
+# incident_message.py::_INTERNAL_NAME_TO_JOB(`"holdings-watchlist"`)がそのまま
+# resolve_incident_job()で解決できる既存の値を使う(buy_candidates_handler.pyの
+# #667と同型の設計)。
+_INCIDENT_SOURCE_HOLDINGS_WATCHLIST = "holdings_watchlist"
+_INCIDENT_JOB_NAME_HOLDINGS_WATCHLIST = "holdings-watchlist"
+
+
+def _scoped_failure_stage(failure_stage: str, batch_id: str | None) -> str:
+    """Issue #717 MUST-1是正: fingerprintをbatch単位で区別するため、batch_idを
+    `failure_stage`へ埋め込む(buy_candidates_handler.py::_scoped_failure_stage()
+    と同型)。
+
+    incident_fingerprint.pyのcompute_fingerprint()は、`error_type`/`error_message`
+    のみをnormalize_error_signature()で正規化し(UUID/ISO8601/16進数/連続する
+    数字を`<ID>`/`<TS>`/`<HEX>`/`<N>`へ置換)、`job_name`/`failure_stage`/
+    `failure_type`は生の値をそのままハッシュする。そのためbatch_idを
+    `failure_stage`へ埋め込めば、正規化で消えずにfingerprintへ反映される。
+
+    30分の時間窓fingerprint dedupは「同一batch内の複数failureをまとめる」
+    目的には有効だが、「別batchのfailureをそれぞれ独立して観測できる」ことは
+    保証しない(時間窓が重なれば別batchのfailureも同一fingerprintに畳み込まれる
+    ため)。batch_idをfailure_stageへ含めることで、fingerprintがbatch単位で
+    区別され、以下の3つの不変条件を満たす:
+      - SAME_BATCH_MULTIPLE_FAILURES → 同一fingerprint → 通知1件まで
+      - DIFFERENT_BATCH_FAILURES    → 異なるfingerprint → 独立して観測できる
+      - SUCCESS_BATCH               → 追加通知0件(変更なし)
+
+    batch_idがNone(白箱テスト等、fan-out経路を使わない呼び出し元)の場合は
+    従来どおりfailure_stageをそのまま返す(挙動不変)。failure_stage/
+    error_message/reason_codeはLINE本文の組み立てに使われないため(incident_
+    message.py::_send_line()参照)、ここへbatch_idを埋め込んでもH-30の
+    PII/識別子除外allowlistに抵触しない。
+    """
+    if batch_id is None:
+        return failure_stage
+    return f"{failure_stage}#{batch_id}"
+
+
+def _notify_handled_failure(
+    failure_stage: str, reason_code: str, now: dt.datetime, batch_id: str | None
+) -> None:
+    """Issue #668(HF-3): catchされた技術的部分失敗をHF-0契約(#665)でUSER通知する。
+
+    buy_candidates_handler.py::_notify_handled_failure()(#667)と同型。
+    Issue #717 MUST-1是正: batch単位の集約は、`_scoped_failure_stage()`で
+    failure_stageへbatch_idを埋め込むことでfingerprintをbatch単位に区別し、
+    incident_notifier_handler.py側の既存dedup(claim window)と組み合わせて
+    実現する(新しい永続カウンタは追加しない)。
+    """
+    envelope = {
+        "source": _INCIDENT_SOURCE_HOLDINGS_WATCHLIST,
+        "job_name": _INCIDENT_JOB_NAME_HOLDINGS_WATCHLIST,
+        "failure_stage": _scoped_failure_stage(failure_stage, batch_id),
+        "failure_type": "UNEXPECTED_EXCEPTION",
+        "reason_code": reason_code,
+        "occurred_at": now.isoformat(),
+        "failure_class": "HANDLED_FAILURE",
+    }
+    publish_incident_envelope(envelope)
+
+
+def _notify_handled_failure_safely(
+    failure_stage: str, reason_code: str, now: dt.datetime, batch_id: str | None
+) -> None:
+    """`_notify_handled_failure()`の失敗が既存処理を絶対にブロックしないための
+    ラッパー(buy_candidates_handler.pyの同名関数と同型)。"""
+    try:
+        _notify_handled_failure(failure_stage, reason_code, now, batch_id)
+    except Exception:  # noqa: BLE001 - HANDLED_FAILURE通知自体の失敗で本処理を止めない
+        logger.warning(
+            "holdings_watchlist_handler: failed to publish HANDLED_FAILURE envelope "
+            "failure_stage=%s",
+            failure_stage,
+        )
+
+
+# Issue #528(#71 F-D2/F-C8のD2/D3分。D1〔buy_candidates_handler.py〕で確立済みの
+# パターンをそのまま横展開する): 非同期fan-outの再試行・二重配信・部分失敗後の
+# 再配信で、Recommendation/HoldingDecisionResultが複製保存されないようにする。
+# batch_idが確定している(=通常のfan-out経路)場合のみIDを決定的にする。
+# batch_id=Noneの呼び出し元(白箱テスト等)は対象外とし、従来どおりuuid4のまま
+# にする(挙動不変)。LEGACY_SELL/PROFIT_TAKING/HOLDING_DECISIONの3 engineは
+# 互いに排他的にしか発火しないが(:843節「新旧エンジンの排他制御」)、engine名を
+# IDの入力へ含めることで、将来この排他性が変わっても衝突しない(USER決定)。
+_DETERMINISTIC_ID_NAMESPACE = uuid.UUID("8a2f1c3d-5e6b-4a7c-9d8e-1f2a3b4c5d6e")
+
+
+def _deterministic_recommendation_id(batch_id: str, holding_id: str, engine: str) -> str:
+    return str(
+        uuid.uuid5(_DETERMINISTIC_ID_NAMESPACE, f"recommendation:{batch_id}:{holding_id}:{engine}")
+    )
+
+
+def _deterministic_holding_decision_result_id(batch_id: str, holding_id: str) -> str:
+    """HOLDING_DECISION_SCORE engineのみがHoldingDecisionResultを生成するため、
+    engine名は不要(recommendation_idとは別のprefixを使い、値空間が
+    絶対に重ならないようにする)。"""
+    return str(
+        uuid.uuid5(_DETERMINISTIC_ID_NAMESPACE, f"holding_decision_result:{batch_id}:{holding_id}")
+    )
+
+
+@dataclass(frozen=True)
+class _HoldingResult:
+    recommended: bool
+    notified: bool
+    succeeded: bool
+    category: str
+    audit: HoldingEvaluationAudit
+    # コードレビュー対応(2026-08、LINE通知アクション限定化): バッチサマリーの
+    # 送信済みアクション3分類(一部売却/全部売却/売却)集計向け。実際に通知が
+    # 送信された場合のみ値を持つ。WATCH/MANUAL_REVIEWはNON_ACTIONABLEとして
+    # ここへ到達する前にゲートされるため、送信済みならこの2つにはならない。
+    notification_category: NotificationCategory | None = None
+    # NotificationCategory.SELLはFULL_PROFIT_TAKEとSELL/SELL_CONSIDERATION等を
+    # 区別しない表示用の分類のため、「一部売却/全部売却/売却」を分離集計する
+    # にはrecommendation_type自体が必要(§13)。
+    # 再コードレビュー対応(2026-08、detected/sent一元化): この値は「実際に
+    # LINE個別通知が送信された」場合のみ設定する(sent集計・CloudWatch Logs用の
+    # 内部監査値。ユーザー向けサマリーの表示にはdetected_recommendation_typeを
+    # 使う、下記)。
+    recommendation_type_at_send: RecommendationType | None = None
+    # 再コードレビュー対応(2026-08、detected/sent一元化・追加修正1): 「有効な
+    # アクション検出」の唯一の判定基準。DataQuality安全ゲートでブロックされな
+    # かった(outcome.data_quality_blocked=False)場合のみ、送信結果(outcome.sent)
+    # に関わらずrecommendation.recommendation_typeを設定する。TradeCooldown・
+    # CrossPipelinePriority・resend/event dedup・kill switchによる個別通知抑止は
+    # この値を減らさない。DataQuality BLOCKED時はNoneのままとし、既存の
+    # summary_category()による「要確認」区分側の集計に委ねる(二重計上しない)。
+    detected_recommendation_type: RecommendationType | None = None
+    # 通知意図3段階化(2026-08)。Profit Protection ATTENTIONとして検出された
+    # 銘柄か(上記detected_recommendation_typeと同じDataQuality境界を適用する)。
+    attention_detected: bool = False
+    # 再コードレビュー対応(2026-08、追加修正2): ATTENTIONが実際にLINE個別送信
+    # できた場合のみTrue(attention_detectedとは別に明示的に保持し、将来別の
+    # WATCH系通知が追加されてもRecommendationType.WATCHからの推測に依存しない)。
+    attention_sent: bool = False
+    # Phase 2-B「銘柄分析」向け(2026-08): HoldingEvaluationRecordのauthoritative_
+    # recommendation_idへそのまま渡すための、この結果を生んだRecommendationのID。
+    # 通知の有無に関わらず、Recommendationが作成された場合のみ設定する。
+    recommendation_id: str | None = None
+
+
+_KILL_SWITCH_SUPPRESSED_OUTCOME = NotificationOutcome(
+    status=NotificationStatus.KILL_SWITCH_SUPPRESSED, sent=False, data_quality_blocked=False
+)
+
+
+def _send_or_suppress_notification(
+    recommendation: Recommendation,
+    notification_enabled: bool,
+    notification_service: LineNotificationService,
+    now: dt.datetime,
+) -> NotificationOutcome:
+    """notification_enabled=False(kill switch)。Recommendationの生成・保存は
+    notification_enabledの値に関わらず常に継続する(呼び出し側で保証する)。
+    この関数はLINE送信の可否のみを制御する。旧売却・新保有判断・利確・ポートフォリオ
+    集中リスクの4経路すべてがこの1関数を経由することで、抑止結果
+    (KILL_SWITCH_SUPPRESSED)を統一する。
+
+    再コードレビュー対応(2026-08、追加修正1): notification_enabled=Falseの間も
+    LINE送信は一切行わないが、ユーザー向けサマリーの「検出」件数(detected_
+    recommendation_type/attention_detected)に使うDataQuality判定(整合性検証・
+    異常値検知)だけは、対象がACTIONABLE/ATTENTION(=保有株サマリーの一部売却・
+    全部売却・売却・緊急確認・利益保全注意のいずれかとして計上され得る)の場合に
+    限り、副作用の無い読み取り専用メソッドcheck_data_quality_eligibility()
+    (BUY候補パイプラインで既に実運用されている、manual review LINE送信を
+    一切発生させない判定専用メソッド)で行う。INTERNAL_ONLY(通常WATCH・決算待ち・
+    ポートフォリオ集中レビュー等)はそもそも上記のどのサマリー分類の対象にもならない
+    ため、detected判定目的でDataQuality評価を行う必要が無い(data_quality_blocked=
+    Falseのまま、既存のNON_ACTIONABLE時のAudit上の意味は変更しない)。
+    """
+    if not notification_enabled:
+        logger.info(
+            "notification_disabled_suppressed: stock_code=%s recommendation_id=%s "
+            "recommendation_type=%s notification_enabled=False",
+            recommendation.stock_code,
+            recommendation.recommendation_id,
+            recommendation.recommendation_type.value,
+        )
+        intent = resolve_notification_intent_for_recommendation(recommendation)
+        if intent is NotificationIntent.INTERNAL_ONLY:
+            return _KILL_SWITCH_SUPPRESSED_OUTCOME
+        eligibility = notification_service.check_data_quality_eligibility(recommendation, now)
+        return NotificationOutcome(
+            status=NotificationStatus.KILL_SWITCH_SUPPRESSED,
+            sent=False,
+            data_quality_blocked=not eligibility.eligible,
+        )
+    return notification_service.notify_recommendation_with_status(recommendation, now)
+
+
+def _resolve_suppression_reason(outcome: NotificationOutcome) -> str | None:
+    """監査用のnotification_suppression_reasonを、可能な限り具体的な理由で
+    解決する(コードレビュー対応2026-08、指摘2)。
+
+    優先順位: 1. block_reason(TRADE_COOLDOWN/TRADE_DETECTION_IN_PROGRESS/
+    LOW_PRIORITY/DUPLICATE_STOCK_NOTIFICATION等、check_*_eligibility()由来の
+    具体的な理由) 2. block_category.value(block_reasonが無い場合の分類名)
+    3. status.value(具体的理由が無い通常のNOT_REQUIRED等)。送信済みの場合は
+    Noneを返す(既存動作どおり)。BUY候補側の監査(_record_notification_
+    outcome_audit)がblock_reasonを最優先で使うのと意味を揃えている。
+    """
+    if outcome.sent:
+        return None
+    if outcome.block_reason:
+        return outcome.block_reason
+    if outcome.block_category is not None:
+        return outcome.block_category.value
+    return outcome.status.value
+
+
+def evaluate_household_concentration_and_notify(
+    holdings: list[Holding],
+    providers: ProviderBundle,
+    config: AppConfig,
+    recommendation_repo: RecommendationRepository,
+    notification_service: LineNotificationService,
+    rule_version_service: RuleVersionService,
+    now: dt.datetime,
+    notification_enabled: bool,
+    execution_context: ExecutionContext = _DEFAULT_EXECUTION_CONTEXT,
+) -> None:
+    """企業価値判断とは独立に、家計全体での銘柄集中を別途通知する(要求仕様§14)。
+
+    銘柄単体の判定結果には影響しない(常に別のRecommendationとして扱う)。
+    kill switch(notification_enabled=False)中でもRecommendationの生成・保存は継続し、
+    LINE送信のみを止める(コードレビュー対応)。
+
+    --- Issue #64 F-A3(2026-09-11)で是正 ---
+    従来は**子Lambda(holding単位)**がこの判定を行い、分子に自分のholding 1件の値を、
+    分母に全ownerの合計を使っていた。分子と分母のscopeが揃っておらず、
+    **ownerごとに見ても家計全体で見ても過小**になっていた(#64 issuecomment-5629210621)。
+
+    USER判断(#64 issuecomment-5629242431)により基準を**家計全体**とし、分子を
+    全ownerの同一銘柄合算へ揃える。あわせて判定自体を**親Lambdaの銘柄単位**へ移した。
+    子(holding単位)のまま合算比率を判定すると、同一銘柄を2ownerが持つ場合に
+    **同じ事実に対してRecommendationが2件**作られるためである(構造的に防ぐ)。
+
+    Issue #64 F-A2: owner / holding_id / raw_recommendation_type を保存する。
+    家計全体基準では「どのholdingか」が一意でないため、寄与が1件のときだけ
+    owner / holding_id を入れ、2件以上は**一覧**をconfig_values_usedへ残す。
+    代表1件を選ぶと「その人の話」と読めてしまい、事実と異なるため。
+
+    Issue #67 F-I3: 判定に使った価格のsource・閾値・対象scopeを保存する。
+    **保存のために価格を取り直さない**。財務snapshotは消費しないため、
+    financial_input_provenanceは**入れない**(捏造しない)。
+
+    ★本判定は従来どおりINTERNAL_ONLY(LINE送信対象ではない)である。本是正で
+    通知の宛先・文面は変更していない。閾値も変更していない(保存するだけ)。
+    """
+    total_market_value, total_acquisition_cost, positions, price_fetch_failed_count = (
+        _estimate_portfolio_totals(holdings, providers)
+    )
+    if price_fetch_failed_count > 0:
+        # Issue #692: 技術的failureのみを対象とする(業務上の「価格データなし」とは
+        # 区別する。get_latest_price()が例外を投げずNoneを返す経路はここに現れない)。
+        # Issue #717 MUST-1: この判定は親Lambdaの1回のLambda実行内で1回だけ
+        # 行われ(#667/#668のようなholding単位fan-out workerの集約ではない)、
+        # ChatGPTレビューでも#692はcross-worker集約を必要としないためMUST-1の
+        # 対象外と確認済み。batch_id相当の単位が無いため明示的にNoneを渡す
+        # (_scoped_failure_stage()はNone時に従来どおりfailure_stageをそのまま
+        # 使う)。
+        _notify_handled_failure_safely(
+            "PORTFOLIO_TOTAL_ESTIMATION",
+            "HOLDINGS_WATCHLIST_PORTFOLIO_PRICE_FETCH_FAILED",
+            now,
+            None,
+        )
+    threshold = config.portfolio_concentration.single_stock_weight_threshold_pct
+    # Issue #348: 発火件数を数える手段が無く、#329の本番検証観測が構造的に
+    # 未了になっていた。銘柄コード等は出さず件数のみをループ終了後に1回集計する
+    # (0件の日も出力自体は必ず行い、「出力が無い」と「0件」を区別できるようにする)。
+    evaluated_count = len(positions)
+    triggered_count = 0
+    unjudgeable_count = 0
+    for position in positions:
+        # 分母不明(価格が1件でも欠けた)なら時価ベースは**判定しない**。ゼロや部分
+        # 合計で強い判定を作らない(Issue #64 F-A3 M-1)。取得価格ベースは価格に
+        # 依存せず確定できるため**引き続き判定する**。ここを止めると「価格取得に
+        # 失敗した日は集中リスクを見ない」というfail-openになる。
+        market_value_basis_available = (
+            position.market_value is not None
+            and total_market_value is not None
+            and total_market_value > 0
+        )
+        portfolio_weight_pct = (
+            float(position.market_value / total_market_value * 100)  # type: ignore[operator]
+            if market_value_basis_available
+            else None
+        )
+        acquisition_cost_weight_pct = (
+            float(position.total_purchase_amount / total_acquisition_cost * 100)
+            if total_acquisition_cost and total_acquisition_cost > 0
+            else None
+        )
+        result = evaluate_portfolio_concentration(
+            portfolio_weight_pct, acquisition_cost_weight_pct, threshold
+        )
+        if not result.is_concentrated:
+            continue
+
+        if position.close_price is None:
+            # その銘柄自身の株価が取れなかった場合、Recommendationの必須項目
+            # price_at_recommendation(Decimal、null不可)を**事実で埋められない**。
+            # 取得単価で代用すると「判定時点の株価」という項目の意味が壊れるため、
+            # **記録を作らず、判定しなかったことをログに残す**(捏造しない)。
+            # ★ 銘柄コードは出さない(Issue #135)。件数として可視化する。
+            # ★ Issue #135: logger の書式引数へ holding_id 由来の式を渡さない
+            #   (件数であっても、式に holding_id が現れる形を静的検査が弾く)。
+            #   中立な名前の局所変数へ取り出してから渡す。
+            contributing_count = len(position.holding_ids)
+            logger.warning(
+                "portfolio concentration not evaluated: latest price unavailable "
+                "(contributing_holdings=%d)",
+                contributing_count,
+            )
+            unjudgeable_count += 1
+            continue
+
+        triggered_count += 1
+        single_contributor = len(position.holding_ids) == 1
+        recommendation = Recommendation(
+            recommendation_id=str(uuid.uuid4()),
+            # Issue #580: 寄与する保有が1件なら SINGLE_HOLDING、2件以上なら HOUSEHOLD_AGGREGATE
+            # (家計内の複数の保有を合算した推奨。owner・holding_id は None のまま)。
+            scope_type=(
+                RecommendationScope.SINGLE_HOLDING
+                if single_contributor
+                else RecommendationScope.HOUSEHOLD_AGGREGATE
+            ),
+            # Issue #64 F-A2: 寄与が1件なら確定できるので入れる。2件以上は一意に
+            # 定まらないためNoneとし、一覧をconfig_values_usedへ残す。
+            owner=position.owners[0] if single_contributor else None,
+            holding_id=position.holding_ids[0] if single_contributor else None,
+            stock_code=position.stock_code,
+            stock_name=position.stock_name,
+            recommended_at=now,
+            recommendation_type=RecommendationType.PORTFOLIO_CONCENTRATION_REVIEW,
+            # Issue #64 F-A2: 生成時のTypeと整合させる(後段で書き換えていない事実を残す)。
+            raw_recommendation_type=RecommendationType.PORTFOLIO_CONCENTRATION_REVIEW,
+            price_at_recommendation=position.close_price,
+            shares_at_recommendation=position.shares,
+            average_purchase_price_at_recommendation=(
+                position.total_purchase_amount / position.shares if position.shares else None
+            ),
+            reasons=result.reasons,
+            # 保有比率自体は直接計算できる事実値であり、モデル推定を伴わないためHIGHとする。
+            confidence=ConfidenceLevel.HIGH,
+            rule_version=rule_version_service.get_active_version_or(RULE_VERSION_PLACEHOLDER),
+            portfolio_weight_pct=result.portfolio_weight_pct,
+            portfolio_acquisition_cost_weight_pct=result.acquisition_cost_weight_pct,
+            # Issue #67 F-I3: 判定に使った価格の出所と取得時刻。再取得していない。
+            data_sources=list(position.price_sources),
+            config_values_used={
+                "single_stock_weight_threshold_pct": threshold,
+                "concentration_scope": "HOUSEHOLD",
+                "denominator_scope": "ALL_OWNERS",
+                "market_value_basis_available": market_value_basis_available,
+                "contributing_holding_ids": list(position.holding_ids),
+                "contributing_owner_count": len(position.owners),
+            },
+        )
+        # 通知検証モード機能(2026-08追加): VALIDATIONでは通常運用の判定履歴を
+        # 汚さないため保存自体をスキップする(kill switchとは独立した別の抑止軸)。
+        if not execution_context.is_validation:
+            recommendation_repo.save(recommendation)
+        _send_or_suppress_notification(
+            recommendation, notification_enabled, notification_service, now
+        )
+
+    # Issue #348: 発火0件の日も必ず1回出す(「出力が無い」と「0件」を区別できる
+    # ようにするため)。銘柄コード・owner・holding_id・数量・単価・評価額は含めない。
+    logger.info(
+        "portfolio concentration summary: evaluated=%d triggered=%d unjudgeable=%d",
+        evaluated_count,
+        triggered_count,
+        unjudgeable_count,
+    )
+
+
+def _notify_legacy_sell_and_build_result(
+    holding: Holding,
+    now: dt.datetime,
+    recommendation: Recommendation,
+    recommendation_repo: RecommendationRepository,
+    notification_service: LineNotificationService,
+    notification_enabled: bool,
+    execution_context: ExecutionContext = _DEFAULT_EXECUTION_CONTEXT,
+    batch_id: str | None = None,
+) -> _HoldingResult:
+    """Recommendation保存はkill switchの影響を受けず常に行う(コードレビュー対応)。
+    LINE送信のみ`notification_enabled`で制御する。通知検証モード機能(2026-08追加)
+    ではkill switchとは独立に、Recommendation/DecisionSnapshot保存自体をスキップする。
+
+    Issue #528: `recommendation`は呼び出し元(`_analyze_one_holding`)で
+    batch_id確定時のみ決定的IDへ既に上書きされている。ここでは
+    `insert_if_absent()`(D1と同じ既存プリミティブ)で原子的に保存し、
+    非同期fan-outの再試行等による重複配信時は再保存をスキップする。
+    """
+    if not execution_context.is_validation:
+        is_new_recommendation = recommendation_repo.insert_if_absent(recommendation)
+        if not is_new_recommendation:
+            logger.info(
+                "holdings legacy sell: duplicate delivery skipped (recommendation "
+                "already exists) recommendation_id=%s",
+                recommendation.recommendation_id,
+            )
+        # 判定精度向上機能Phase A: DecisionSnapshotを記録する(スコア項目はPhase Bまで
+        # 全てNone)。失敗しても既存の通知・戻り値には一切影響しない。
+        # Issue #528: 重複配信でRecommendationが既に存在した場合はスキップする
+        # (decision_idはrecommendation_idの決定的関数のため再実行しても安全だが、
+        # 判定に使ったsnapshotの時刻等がリトライごとに変わり得ることに起因する
+        # 不要な内容比較・警告ログを避ける。D1と同じ理由)。
+        if is_new_recommendation:
+            decision_snapshot_saved = save_decision_snapshot_safely(
+                DecisionSnapshotRepository(), recommendation, DecisionType.SELL, logger
+            )
+            if not decision_snapshot_saved:
+                # Issue #672(HF-7): 保存失敗をUSERへ通知する(判定・通知・戻り値は変えない)。
+                _notify_handled_failure_safely(
+                    "DECISION_SNAPSHOT_SAVE",
+                    "HOLDINGS_WATCHLIST_DECISION_SNAPSHOT_SAVE_FAILED",
+                    now,
+                    batch_id,
+                )
+    outcome = _send_or_suppress_notification(
+        recommendation, notification_enabled, notification_service, now
+    )
+    audit = HoldingEvaluationAudit(
+        stock_code=holding.stock_code,
+        evaluated_at=now,
+        evaluation_status=(
+            EvaluationStatus.DATA_QUALITY_BLOCKED
+            if outcome.data_quality_blocked
+            else EvaluationStatus.COMPLETED
+        ),
+        raw_sell_recommendation_type=recommendation.raw_recommendation_type,
+        raw_profit_recommendation_type=None,
+        final_recommendation_type=recommendation.recommendation_type,
+        notification_status=outcome.status,
+        notification_suppression_reason=_resolve_suppression_reason(outcome),
+        sell_signal_status="TRIGGERED",
+        profit_taking_status="NOT_EVALUATED",
+        fair_value_status="NOT_AVAILABLE",
+        data_quality_status="BLOCKED" if outcome.data_quality_blocked else "OK",
+        confidence=recommendation.confidence,
+        error_code=None,
+    )
+    return _HoldingResult(
+        recommended=True,
+        notified=outcome.sent,
+        succeeded=True,
+        category=summary_category(audit),
+        audit=audit,
+        notification_category=(
+            resolve_notification_category(recommendation) if outcome.sent else None
+        ),
+        recommendation_type_at_send=(
+            recommendation.recommendation_type
+            if outcome.sent and not outcome.data_quality_blocked
+            else None
+        ),
+        detected_recommendation_type=(
+            recommendation.recommendation_type if not outcome.data_quality_blocked else None
+        ),
+        recommendation_id=recommendation.recommendation_id,
+    )
+
+
+def _notify_holding_decision_and_build_result(
+    holding: Holding,
+    now: dt.datetime,
+    result: HoldingDecisionResult,
+    snapshot: StockSnapshot,
+    config: AppConfig,
+    holding_decision_result_repo: HoldingDecisionResultRepository,
+    recommendation_repo: RecommendationRepository,
+    notification_service: LineNotificationService,
+    notification_enabled: bool,
+    rule_version_service: RuleVersionService,
+    batch_id: str | None,
+    execution_context: ExecutionContext = _DEFAULT_EXECUTION_CONTEXT,
+    gate_confirmations: tuple[tuple[str, str], ...] = (),
+) -> tuple[_HoldingResult, HoldingDecisionResult]:
+    """保有判断スコアの通知を行う。
+
+    gate_confirmations(Issue #890 PR-2)は、評価が返した hard gate の理由コードごとの確認状態。
+    再通知の比較に使う記録(hd_renotify_state)を作る builder へ渡すだけで、この関数の判定・
+    通知・保存の挙動は変えない。
+
+    戻り値は(_HoldingResult, 保存用に更新したHoldingDecisionResult)。
+    Recommendation生成・保存・recommendation_id設定はkill switchの影響を受けず常に行う
+    (コードレビュー対応)。LINE送信のみ`notification_enabled`で制御する。
+
+    Issue #528: batch_idが確定している場合はrecommendation_idを決定的にし、
+    `insert_if_absent()`で原子的に保存する(D1と同じパターン)。batch_id=None
+    (白箱テスト等)は従来どおりuuid4のまま(挙動不変)。
+    """
+    recommendation_id = (
+        _deterministic_recommendation_id(batch_id, holding.holding_id, "HOLDING_DECISION")
+        if batch_id is not None
+        else str(uuid.uuid4())
+    )
+    # 判定精度向上機能次フェーズSTEP2: Exit Price Range(Shadow計測)。
+    # HoldingDecisionパイプラインではここ(holdingとsnapshotが揃う唯一の
+    # 箇所)で1回だけ計算し、Builderへ渡す(Builder自身は算出しない)。
+    # Issue #384 PR-4: v1判定へ非接続のShadow計測が例外を出すと、本関数
+    # (ひいてはholding 1件のHoldingDecision通知全体)が失われるリスクが
+    # あったため、isolated_shadow_computation()で隔離する(#384本体・
+    # #22 C2・#371と同型のリスクパターン)。
+    exit_price_range = isolated_shadow_computation(
+        "exit_price_range",
+        lambda: evaluate_exit_price_range(
+            snapshot.fair_value_range,
+            snapshot.historical_valuation,
+            snapshot.timing,
+            holding.average_purchase_price,
+            snapshot.current_price,
+            now,
+            config.entry_exit_price.exit,
+        ),
+        lambda exc: ExitPriceRangeResult(
+            state=PriceRangeEvaluationState.NOT_EVALUATED,
+            current_price=snapshot.current_price,
+            reason_codes=(f"SHADOW_COMPUTATION_FAILED:{type(exc).__name__}",),
+            evaluated_at=now,
+            model_version=config.entry_exit_price.exit.model_version,
+        ),
+    )
+    recommendation = build_holding_decision_recommendation(
+        holding,
+        result,
+        snapshot,
+        # Issue #67 F-I6: rule_versionへ判定に使った「ルール版」を渡す
+        # (RuleVersionServiceが管理する既存概念。他9箇所と同じ既存パターン)。
+        # scoring_model_versionは別の版概念であり、rule_versionへ混在させず
+        # config_values_used(builder側)へ明示キーとして保存する。
+        rule_version_service.get_active_version_or(RULE_VERSION_PLACEHOLDER),
+        config,
+        exit_price_range,
+        recommendation_id=recommendation_id,
+        gate_confirmations=gate_confirmations,
+    )
+    linked_result = result.model_copy(update={"recommendation_id": recommendation_id})
+    # 通知検証モード機能(2026-08追加): kill switchとは独立に、VALIDATIONでは
+    # Recommendation/DecisionSnapshot保存自体をスキップする。
+    if not execution_context.is_validation:
+        is_new_recommendation = recommendation_repo.insert_if_absent(recommendation)
+        if not is_new_recommendation:
+            logger.info(
+                "holdings holding_decision: duplicate delivery skipped (recommendation "
+                "already exists) recommendation_id=%s",
+                recommendation.recommendation_id,
+            )
+        # 判定精度向上機能Phase A: DecisionSnapshotを記録する(スコア項目はPhase Bまで
+        # 全てNone)。失敗しても既存の通知・戻り値には一切影響しない。
+        # Issue #528: 重複配信時はスキップする(D1と同じ理由)。
+        if is_new_recommendation:
+            decision_snapshot_saved = save_decision_snapshot_safely(
+                DecisionSnapshotRepository(), recommendation, DecisionType.HOLDING_DECISION, logger
+            )
+            if not decision_snapshot_saved:
+                # Issue #672(HF-7): 保存失敗をUSERへ通知する(判定・通知・戻り値は変えない)。
+                _notify_handled_failure_safely(
+                    "DECISION_SNAPSHOT_SAVE",
+                    "HOLDINGS_WATCHLIST_DECISION_SNAPSHOT_SAVE_FAILED",
+                    now,
+                    batch_id,
+                )
+    outcome = _send_or_suppress_notification(
+        recommendation, notification_enabled, notification_service, now
+    )
+    audit = HoldingEvaluationAudit(
+        stock_code=holding.stock_code,
+        evaluated_at=now,
+        evaluation_status=(
+            EvaluationStatus.DATA_QUALITY_BLOCKED
+            if outcome.data_quality_blocked
+            else EvaluationStatus.COMPLETED
+        ),
+        raw_sell_recommendation_type=None,
+        raw_profit_recommendation_type=None,
+        final_recommendation_type=recommendation.recommendation_type,
+        notification_status=outcome.status,
+        notification_suppression_reason=_resolve_suppression_reason(outcome),
+        sell_signal_status="TRIGGERED",
+        profit_taking_status="NOT_EVALUATED",
+        fair_value_status="NOT_AVAILABLE",
+        data_quality_status="BLOCKED" if outcome.data_quality_blocked else "OK",
+        confidence=recommendation.confidence,
+        error_code=None,
+    )
+    holding_result = _HoldingResult(
+        recommended=True,
+        notified=outcome.sent,
+        succeeded=True,
+        category=summary_category(audit),
+        audit=audit,
+        notification_category=(
+            resolve_notification_category(recommendation) if outcome.sent else None
+        ),
+        recommendation_type_at_send=(
+            recommendation.recommendation_type
+            if outcome.sent and not outcome.data_quality_blocked
+            else None
+        ),
+        detected_recommendation_type=(
+            recommendation.recommendation_type if not outcome.data_quality_blocked else None
+        ),
+        recommendation_id=recommendation.recommendation_id,
+    )
+    return holding_result, linked_result
+
+
+def _persist_holding_evaluation_record(
+    holding_evaluation_record_repo: HoldingEvaluationRecordRepository,
+    holding: Holding,
+    now: dt.datetime,
+    execution_context: ExecutionContext,
+    rule_version: str,
+    batch_id: str | None,
+    *,
+    execution_plan_mode: str | None,
+    execution_plan_reason: str | None,
+    notification_enabled: bool | None,
+    authoritative_engine: str | None,
+    authoritative_outcome_category: str,
+    authoritative_recommendation_id: str | None,
+    authoritative_audit_log_id: str | None = None,
+    authoritative_notification_sent: bool,
+    legacy_sell_ran: bool,
+    legacy_sell_recommendation_id: str | None,
+    profit_taking_ran: bool,
+    profit_taking_recommendation_id: str | None,
+    profit_taking_audit_log_id: str | None = None,
+    holding_decision_ran: bool,
+    holding_decision_result_id: str | None,
+    holding_decision_notified: bool,
+) -> None:
+    """Phase 2-B「銘柄分析」向け(2026-08): 呼び出し側で評価本体の結果を一旦
+    構造化した(このキーワード引数群)うえで、HoldingEvaluationRecordとして
+    1件記録する。_analyze_one_holding()の全ての戻り経路(データ取得失敗・
+    整合性エラー・各エンジンの通知確定・利確判定・純粋なHOLDの全て)から
+    呼ばれ、必ず1件のレコードが残る。VALIDATIONでは既存のRecommendation等と
+    同様、判定履歴を汚さないため保存自体をスキップする。参照用の補助レコード
+    のため、保存に失敗しても既存の通知・戻り値には一切影響させない
+    (save_decision_snapshot_safelyと同じfire-and-forget方針)。
+    """
+    if execution_context.is_validation:
+        return
+    record = HoldingEvaluationRecord(
+        holding_evaluation_id=build_holding_evaluation_id(holding.holding_id, now),
+        holding_id=holding.holding_id,
+        owner=holding.owner,
+        stock_code=holding.stock_code,
+        evaluated_at=now,
+        rule_version=rule_version,
+        execution_plan_mode=execution_plan_mode,
+        execution_plan_reason=execution_plan_reason,
+        notification_enabled=notification_enabled,
+        authoritative_engine=authoritative_engine,
+        authoritative_outcome_category=authoritative_outcome_category,
+        authoritative_recommendation_id=authoritative_recommendation_id,
+        authoritative_audit_log_id=authoritative_audit_log_id,
+        authoritative_notification_sent=authoritative_notification_sent,
+        legacy_sell_ran=legacy_sell_ran,
+        legacy_sell_recommendation_id=legacy_sell_recommendation_id,
+        profit_taking_ran=profit_taking_ran,
+        profit_taking_recommendation_id=profit_taking_recommendation_id,
+        profit_taking_audit_log_id=profit_taking_audit_log_id,
+        holding_decision_ran=holding_decision_ran,
+        holding_decision_result_id=holding_decision_result_id,
+        holding_decision_notified=holding_decision_notified,
+    )
+    try:
+        holding_evaluation_record_repo.save(record)
+    except Exception:  # noqa: BLE001 - 記録失敗で既存の通知・戻り値に影響させない
+        logger.exception(
+            "holding_evaluation_record_save_failed holding_ref=%s", log_ref(holding.holding_id)
+        )
+        # Issue #668(HF-3 B2)
+        _notify_handled_failure_safely(
+            "EVALUATION_RECORD_SAVE",
+            "HOLDINGS_WATCHLIST_EVALUATION_RECORD_SAVE_FAILED",
+            now,
+            batch_id,
+        )
+
+
+def _resolve_mode_designated_engine(
+    mode_plan: Any,
+) -> str | None:
+    """kill switchの影響を受けないmode_plan(notification_enabled=True相当)を
+    基準に「本来の判定担当」エンジンを決定する(コードレビュー対応: authoritative_
+    engineはkill switch適用後のplan.allow_*_notificationだけから決定しない)。
+    """
+    if mode_plan.allow_legacy_sell_notification:
+        return "LEGACY_SELL"
+    if mode_plan.allow_holding_decision_notification:
+        return "HOLDING_DECISION_SCORE"
+    return None
+
+
+def _observe_price_regime_shadow_safely(pt_outcome: ProfitTakingOutcome) -> None:
+    """価格の経路の Shadow の受け手を呼ぶ(Issue #877 PR-2b-ii)。★ 例外なし・戻り値を使わない ★。
+
+    呼び出しは、保存・通知・保有の評価記録がすべて終わった後(`return result` の直前)に置く。
+    受け手自身も例外を送出しない契約だが、本流を守る二重の網としてここでも隔離する。
+    閾値が供給されない間(PR-2b では常に)、受け手は何も組み立てずに戻る(判定・通知・保存なし)。
+    """
+    try:
+        observe_price_regime_shadow(pt_outcome)
+    except Exception as error:  # noqa: BLE001 - shadowの失敗を本流へ伝播させない
+        logger.warning("price regime shadow failed: error_type=%s", type(error).__name__)
+
+
+def _analyze_one_holding(
+    holding: Holding,
+    now: dt.datetime,
+    providers: ProviderBundle,
+    config: AppConfig,
+    profit_service: ProfitTakingService,
+    sell_service: SellSignalService,
+    holding_decision_service: HoldingDecisionService,
+    runtime_config_service: HoldingDecisionRuntimeConfigService,
+    holding_decision_result_repo: HoldingDecisionResultRepository,
+    holding_evaluation_record_repo: HoldingEvaluationRecordRepository,
+    recommendation_repo: RecommendationRepository,
+    notification_service: LineNotificationService,
+    rule_version_service: RuleVersionService,
+    batch_id: str | None = None,
+    execution_context: ExecutionContext = _DEFAULT_EXECUTION_CONTEXT,
+) -> _HoldingResult:
+    """1銘柄を判定・通知する。
+
+    `batch_id`(Issue #528): 確定している場合、Recommendation/HoldingDecisionResultの
+    IDを決定的にし、非同期fan-outの再試行・二重配信での複製保存を防ぐ(D1と同じ
+    パターン)。Noneの場合(白箱テスト等)は従来どおりuuid4のまま(挙動不変)。
+
+    sell_signal/profit_takingは同一銘柄のデータを必要とするため、
+    stock_snapshotを一度だけ取得して両方に渡す(実データ取得の重複を避ける)。
+    """
+    # Issue #59 Phase B1: BUY経路と同じ理由で再試行ヘルパーで包む。再試行しても
+    # 回復しない場合のみ例外が伝播し、呼び出し元の銘柄単位exceptで
+    # EvaluationStatus.ANALYSIS_FAILEDとして記録される(取得失敗と
+    # DATA_INSUFFICIENTを混同しない)。
+    retry_result = call_with_rate_limit_retry(
+        lambda: build_stock_snapshot(providers, holding.stock_code, now, config)
+    )
+    if retry_result.error is not None:
+        raise retry_result.error
+    assert retry_result.value is not None
+    snapshot, error = retry_result.value
+    if snapshot is None:
+        notification_service.notify_data_error(
+            holding.stock_code, error or "データ取得エラー", now, stock_name=holding.stock_name
+        )
+        audit = HoldingEvaluationAudit(
+            stock_code=holding.stock_code,
+            evaluated_at=now,
+            evaluation_status=EvaluationStatus.DATA_INSUFFICIENT,
+            raw_sell_recommendation_type=None,
+            raw_profit_recommendation_type=None,
+            final_recommendation_type=None,
+            notification_status=NotificationStatus.DATA_INSUFFICIENT,
+            notification_suppression_reason=error,
+            sell_signal_status="NOT_EVALUATED",
+            profit_taking_status="NOT_EVALUATED",
+            fair_value_status="NOT_AVAILABLE",
+            data_quality_status="NOT_EVALUATED",
+            confidence=None,
+            error_code="DATA_FETCH_FAILED",
+        )
+        result = _HoldingResult(
+            recommended=False,
+            notified=False,
+            succeeded=False,
+            category="data_insufficient",
+            audit=audit,
+        )
+        _persist_holding_evaluation_record(
+            holding_evaluation_record_repo,
+            holding,
+            now,
+            execution_context,
+            rule_version_service.get_active_version_or(RULE_VERSION_PLACEHOLDER),
+            batch_id,
+            execution_plan_mode=None,
+            execution_plan_reason=None,
+            notification_enabled=None,
+            authoritative_engine=None,
+            authoritative_outcome_category=result.category,
+            authoritative_recommendation_id=None,
+            authoritative_notification_sent=False,
+            legacy_sell_ran=False,
+            legacy_sell_recommendation_id=None,
+            profit_taking_ran=False,
+            profit_taking_recommendation_id=None,
+            holding_decision_ran=False,
+            holding_decision_result_id=None,
+            holding_decision_notified=False,
+        )
+        return result
+
+    # Issue #52 Phase B2: 価格の基準日が古い場合、保有銘柄の判定を確定させない。
+    #
+    # BUYは「買わない」で済むが、保有側の誤りは実損に直結する
+    # (古い価格で損切りが発火する / 既に暴落しているのに売らない)。
+    # そのため1取引セッションでも取りこぼしていればDATA_INSUFFICIENTとする
+    # (閾値はdomain/price_freshness.pyへ集約。人間確定値)。
+    #
+    # **当該銘柄を判定不能とするだけであり、バッチ全体は止めない。**
+    # 上のsnapshot取得失敗時と同じ_HoldingResult経路へ合流させ、
+    # 呼び出し元の銘柄単位ループがそのまま次の銘柄へ進む。
+    price_freshness, price_freshness_reason = evaluate_holdings_price_freshness(
+        snapshot.price_as_of_date,
+        now,
+        BusinessCalendar.from_config(config.holiday_calendar),
+    )
+    if price_freshness is PriceFreshnessVerdict.DATA_INSUFFICIENT:
+        reason = price_freshness_reason or "最新の株価を確認できないため判定できません"
+        notification_service.notify_data_error(
+            holding.stock_code, reason, now, stock_name=holding.stock_name
+        )
+        audit = HoldingEvaluationAudit(
+            stock_code=holding.stock_code,
+            evaluated_at=now,
+            evaluation_status=EvaluationStatus.DATA_INSUFFICIENT,
+            raw_sell_recommendation_type=None,
+            raw_profit_recommendation_type=None,
+            final_recommendation_type=None,
+            notification_status=NotificationStatus.DATA_INSUFFICIENT,
+            notification_suppression_reason=reason,
+            sell_signal_status="NOT_EVALUATED",
+            profit_taking_status="NOT_EVALUATED",
+            fair_value_status="NOT_AVAILABLE",
+            data_quality_status="NOT_EVALUATED",
+            confidence=None,
+            error_code="PRICE_STALE",
+        )
+        result = _HoldingResult(
+            recommended=False,
+            notified=False,
+            succeeded=False,
+            category="data_insufficient",
+            audit=audit,
+        )
+        _persist_holding_evaluation_record(
+            holding_evaluation_record_repo,
+            holding,
+            now,
+            execution_context,
+            rule_version_service.get_active_version_or(RULE_VERSION_PLACEHOLDER),
+            batch_id,
+            execution_plan_mode=None,
+            execution_plan_reason=None,
+            notification_enabled=None,
+            authoritative_engine=None,
+            authoritative_outcome_category=result.category,
+            authoritative_recommendation_id=None,
+            authoritative_notification_sent=False,
+            legacy_sell_ran=False,
+            legacy_sell_recommendation_id=None,
+            profit_taking_ran=False,
+            profit_taking_recommendation_id=None,
+            holding_decision_ran=False,
+            holding_decision_result_id=None,
+            holding_decision_notified=False,
+        )
+        return result
+
+    # kill switchは緊急停止用途のため、mode等のTTLキャッシュを経由せず毎回
+    # 最新値を取得する(実装プラン修正2)。このサイクル内のすべての通知経路
+    # (旧売却・新保有判断・利確)へ同一の値を渡す(コードレビュー対応: kill switchの
+    # 適用範囲を保有銘柄分析の全通知経路へ拡張する)。
+    #
+    # Issue #64 F-A3: ポートフォリオ集中リスクの判定は**ここでは行わない**。
+    # 家計全体(全ownerの同一銘柄合算)を分子とする銘柄単位の判定であり、
+    # holding単位のこの経路で行うと同一銘柄で重複して発火するため、
+    # 親Lambda側のevaluate_household_concentration_and_notify()へ移した。
+    notification_enabled = runtime_config_service.get_notification_enabled()
+
+    # --- 新旧エンジンの排他制御(実装プラン11節) ---------------------------
+    runtime_lookup = runtime_config_service.get_config(now)
+    industry = classify_industry(snapshot.financial.sector, snapshot.financial.industry)
+    financial_deferred_policy = resolve_financial_deferred_policy(
+        runtime_lookup.config, config.industry_scoring_policy.financial_industry_policy
+    )
+    plan = resolve_execution_plan(
+        runtime_lookup.config.mode,
+        industry.classification,
+        industry.financial_category,
+        financial_deferred_policy,
+        notification_enabled=notification_enabled,
+    )
+    # kill switchの影響を受けない「modeが今回の通知担当をどちらに割り当てたか」を得る
+    # (コードレビュー対応: kill switch中でもRecommendationの生成・保存自体は継続する
+    # ため、その要否判定はkill switch適用前の値で行う。notification_enabled=Trueの
+    # 場合はplanと完全に同一になる)。run_*/execution_reasonはnotification_enabledの
+    # 値に関わらず同一のためplan側を使い続ける。
+    mode_plan = resolve_execution_plan(
+        runtime_lookup.config.mode,
+        industry.classification,
+        industry.financial_category,
+        financial_deferred_policy,
+        notification_enabled=True,
+    )
+
+    legacy_result: _HoldingResult | None = None
+    legacy_reason_codes: tuple[str, ...] = ()
+    if plan.run_legacy_sell_evaluation:
+        sell_outcome = sell_service.analyze(holding, now, snapshot=snapshot)
+        legacy_reason_codes = sell_outcome.triggered_rule_names
+        if sell_outcome.recommendation is not None and mode_plan.allow_legacy_sell_notification:
+            # Issue #528: batch_id確定時はrecommendation_idを決定的にする
+            # (_notify_legacy_sell_and_build_result側でinsert_if_absent()を使う)。
+            sell_recommendation = sell_outcome.recommendation
+            if batch_id is not None:
+                sell_recommendation = sell_recommendation.model_copy(
+                    update={
+                        "recommendation_id": _deterministic_recommendation_id(
+                            batch_id, holding.holding_id, "LEGACY_SELL"
+                        )
+                    }
+                )
+            legacy_result = _notify_legacy_sell_and_build_result(
+                holding,
+                now,
+                sell_recommendation,
+                recommendation_repo,
+                notification_service,
+                notification_enabled,
+                execution_context,
+                batch_id,
+            )
+
+    holding_decision_result_notified: _HoldingResult | None = None
+    if plan.run_holding_decision_evaluation:
+        hd_outcome = holding_decision_service.evaluate(
+            holding,
+            now,
+            plan.execution_reason,
+            snapshot=snapshot,
+            runtime_config_version=runtime_lookup.effective_runtime_config_version,
+            legacy_reason_codes=legacy_reason_codes,
+            financial_model_version_used=(
+                config.industry_scoring_policy.financial_industry_policy.financial_model_version
+            ),
+        )
+        if hd_outcome.integrity_error:
+            integrity_audit = HoldingEvaluationAudit(
+                stock_code=holding.stock_code,
+                evaluated_at=now,
+                evaluation_status=EvaluationStatus.ANALYSIS_FAILED,
+                raw_sell_recommendation_type=None,
+                raw_profit_recommendation_type=None,
+                final_recommendation_type=None,
+                notification_status=NotificationStatus.ANALYSIS_FAILED,
+                notification_suppression_reason="DATA_INTEGRITY_ERROR",
+                sell_signal_status="NOT_EVALUATED",
+                profit_taking_status="NOT_EVALUATED",
+                fair_value_status="NOT_AVAILABLE",
+                data_quality_status="NOT_EVALUATED",
+                confidence=None,
+                error_code="DATA_INTEGRITY_ERROR",
+            )
+            if legacy_result is None:
+                result = _HoldingResult(
+                    recommended=False,
+                    notified=False,
+                    succeeded=False,
+                    category=summary_category(integrity_audit),
+                    audit=integrity_audit,
+                )
+                _persist_holding_evaluation_record(
+                    holding_evaluation_record_repo,
+                    holding,
+                    now,
+                    execution_context,
+                    rule_version_service.get_active_version_or(RULE_VERSION_PLACEHOLDER),
+                    batch_id,
+                    execution_plan_mode=runtime_lookup.config.mode.value,
+                    execution_plan_reason=plan.execution_reason.value,
+                    notification_enabled=notification_enabled,
+                    authoritative_engine="HOLDING_DECISION_SCORE",
+                    authoritative_outcome_category=result.category,
+                    authoritative_recommendation_id=None,
+                    authoritative_notification_sent=False,
+                    legacy_sell_ran=plan.run_legacy_sell_evaluation,
+                    legacy_sell_recommendation_id=None,
+                    profit_taking_ran=False,
+                    profit_taking_recommendation_id=None,
+                    holding_decision_ran=True,
+                    holding_decision_result_id=None,
+                    holding_decision_notified=False,
+                )
+                return result
+            # 旧エンジンが既にこのサイクルの通知を確定させている場合、新エンジン側の
+            # shadow計算失敗によってその成功結果を上書きしない(ログにのみ残す)。
+            logger.warning(
+                "holding_decision DATA_INTEGRITY_ERROR (shadow, legacy already notified) "
+                "stock_code=%s",
+                holding.stock_code,
+            )
+        elif hd_outcome.result is not None:
+            hd_result = hd_outcome.result
+            # Issue #528: batch_id確定時はholding_decision_result_idを決定的にする
+            # (recommendation_idの決定化はこの後の`_notify_holding_decision_and_
+            # build_result`呼び出しが別途行う。両者は別のprefixのため衝突しない)。
+            if batch_id is not None:
+                hd_result = hd_result.model_copy(
+                    update={
+                        "holding_decision_result_id": _deterministic_holding_decision_result_id(
+                            batch_id, holding.holding_id
+                        )
+                    }
+                )
+            if mode_plan.allow_holding_decision_notification and hd_result.should_notify:
+                notify_fn = _notify_holding_decision_and_build_result
+                holding_decision_result_notified, hd_result = notify_fn(
+                    holding,
+                    now,
+                    hd_result,
+                    snapshot,
+                    config,
+                    holding_decision_result_repo,
+                    recommendation_repo,
+                    notification_service,
+                    notification_enabled,
+                    rule_version_service,
+                    batch_id,
+                    execution_context,
+                    gate_confirmations=hd_outcome.gate_confirmations,
+                )
+            # 通知検証モード機能(2026-08追加): VALIDATIONでは通常運用の判定履歴を
+            # 汚さないため保存自体をスキップする。
+            # Issue #528: insert_if_absent()で原子的に保存する(非同期fan-outの
+            # 再試行・二重配信での複製保存を防ぐ)。
+            if not execution_context.is_validation:
+                is_new_result = holding_decision_result_repo.insert_if_absent(hd_result)
+                if not is_new_result:
+                    logger.info(
+                        "holdings holding_decision: duplicate delivery skipped "
+                        "(holding_decision_result already exists) "
+                        "holding_decision_result_id=%s",
+                        hd_result.holding_decision_result_id,
+                    )
+
+    if legacy_result is not None:
+        _persist_holding_evaluation_record(
+            holding_evaluation_record_repo,
+            holding,
+            now,
+            execution_context,
+            rule_version_service.get_active_version_or(RULE_VERSION_PLACEHOLDER),
+            batch_id,
+            execution_plan_mode=runtime_lookup.config.mode.value,
+            execution_plan_reason=plan.execution_reason.value,
+            notification_enabled=notification_enabled,
+            authoritative_engine="LEGACY_SELL",
+            authoritative_outcome_category=legacy_result.category,
+            authoritative_recommendation_id=legacy_result.recommendation_id,
+            authoritative_audit_log_id=sell_outcome.audit_id,
+            authoritative_notification_sent=legacy_result.notified,
+            legacy_sell_ran=True,
+            legacy_sell_recommendation_id=legacy_result.recommendation_id,
+            profit_taking_ran=False,
+            profit_taking_recommendation_id=None,
+            holding_decision_ran=plan.run_holding_decision_evaluation,
+            holding_decision_result_id=None,
+            holding_decision_notified=False,
+        )
+        return legacy_result
+    if holding_decision_result_notified is not None:
+        _persist_holding_evaluation_record(
+            holding_evaluation_record_repo,
+            holding,
+            now,
+            execution_context,
+            rule_version_service.get_active_version_or(RULE_VERSION_PLACEHOLDER),
+            batch_id,
+            execution_plan_mode=runtime_lookup.config.mode.value,
+            execution_plan_reason=plan.execution_reason.value,
+            notification_enabled=notification_enabled,
+            authoritative_engine="HOLDING_DECISION_SCORE",
+            authoritative_outcome_category=holding_decision_result_notified.category,
+            authoritative_recommendation_id=holding_decision_result_notified.recommendation_id,
+            authoritative_notification_sent=holding_decision_result_notified.notified,
+            legacy_sell_ran=plan.run_legacy_sell_evaluation,
+            legacy_sell_recommendation_id=None,
+            profit_taking_ran=False,
+            profit_taking_recommendation_id=None,
+            holding_decision_ran=True,
+            holding_decision_result_id=hd_result.holding_decision_result_id,
+            holding_decision_notified=True,
+        )
+        return holding_decision_result_notified
+
+    if not plan.run_profit_taking_when_no_sell_notification:
+        audit = HoldingEvaluationAudit(
+            stock_code=holding.stock_code,
+            evaluated_at=now,
+            evaluation_status=EvaluationStatus.COMPLETED,
+            raw_sell_recommendation_type=None,
+            raw_profit_recommendation_type=None,
+            final_recommendation_type=None,
+            notification_status=NotificationStatus.NOT_REQUIRED,
+            notification_suppression_reason=None,
+            sell_signal_status="NO_SIGNAL",
+            profit_taking_status="NOT_EVALUATED",
+            fair_value_status="NOT_AVAILABLE",
+            data_quality_status="OK",
+            confidence=None,
+            error_code=None,
+        )
+        result = _HoldingResult(
+            recommended=False, notified=False, succeeded=True, category="hold", audit=audit
+        )
+        mode_designated_engine = _resolve_mode_designated_engine(mode_plan)
+        _persist_holding_evaluation_record(
+            holding_evaluation_record_repo,
+            holding,
+            now,
+            execution_context,
+            rule_version_service.get_active_version_or(RULE_VERSION_PLACEHOLDER),
+            batch_id,
+            execution_plan_mode=runtime_lookup.config.mode.value,
+            execution_plan_reason=plan.execution_reason.value,
+            notification_enabled=notification_enabled,
+            authoritative_engine=mode_designated_engine,
+            authoritative_outcome_category=result.category,
+            authoritative_recommendation_id=None,
+            authoritative_audit_log_id=(
+                sell_outcome.audit_id
+                if mode_designated_engine == "LEGACY_SELL" and plan.run_legacy_sell_evaluation
+                else None
+            ),
+            authoritative_notification_sent=False,
+            legacy_sell_ran=plan.run_legacy_sell_evaluation,
+            legacy_sell_recommendation_id=None,
+            profit_taking_ran=False,
+            profit_taking_recommendation_id=None,
+            holding_decision_ran=plan.run_holding_decision_evaluation,
+            holding_decision_result_id=None,
+            holding_decision_notified=False,
+        )
+        return result
+
+    pt_outcome = profit_service.analyze(holding, now, snapshot=snapshot)
+    # Issue #528: batch_id確定時はrecommendation_idを決定的にする(insert_if_absent()
+    # と組み合わせて非同期fan-outの再試行・二重配信での複製保存を防ぐ。D1と同じ
+    # パターン)。`pt_outcome`自体は変更せず(白箱テストがduck-typeの代替
+    # 実装を返す場合があり、dataclasses.replace()が使えないため)、以降はこの
+    # ローカル変数`pt_recommendation`を使う。
+    pt_recommendation = pt_outcome.recommendation
+    if batch_id is not None and pt_recommendation is not None:
+        pt_recommendation = pt_recommendation.model_copy(
+            update={
+                "recommendation_id": _deterministic_recommendation_id(
+                    batch_id, holding.holding_id, "PROFIT_TAKING"
+                )
+            }
+        )
+    if pt_recommendation is not None:
+        # 通知検証モード機能(2026-08追加): kill switchとは独立に、VALIDATIONでは
+        # Recommendation/DecisionSnapshot保存自体をスキップする。
+        if not execution_context.is_validation:
+            is_new_recommendation = recommendation_repo.insert_if_absent(pt_recommendation)
+            if not is_new_recommendation:
+                logger.info(
+                    "holdings profit_taking: duplicate delivery skipped (recommendation "
+                    "already exists) recommendation_id=%s",
+                    pt_recommendation.recommendation_id,
+                )
+            # 判定精度向上機能Phase A: DecisionSnapshotを記録する(スコア項目は
+            # Phase Bまで全てNone)。失敗しても既存の通知・戻り値には一切影響しない。
+            # Issue #528: 重複配信時はスキップする(D1と同じ理由)。
+            if is_new_recommendation:
+                decision_snapshot_saved = save_decision_snapshot_safely(
+                    DecisionSnapshotRepository(),
+                    pt_recommendation,
+                    DecisionType.PROFIT_TAKING,
+                    logger,
+                )
+                if not decision_snapshot_saved:
+                    # Issue #672(HF-7): 保存失敗をUSERへ通知する(判定・通知・戻り値は変えない)。
+                    _notify_handled_failure_safely(
+                        "DECISION_SNAPSHOT_SAVE",
+                        "HOLDINGS_WATCHLIST_DECISION_SNAPSHOT_SAVE_FAILED",
+                        now,
+                        batch_id,
+                    )
+                # Issue #160 / #457(PR-3): 判断の安全条件(G1〜G4)のshadow計測。**保存が完了した
+                # 後・通知の前**に置くため、Recommendation・DecisionSnapshot・通知・戻り値を
+                # 変えられない。
+                # shadowがOFF(既定)なら何もしない。SHADOWでも評価・記録の失敗は隔離される。
+                # VALIDATIONは上のifが既に除外している(shadowを実行しない)。
+                observe_judgment_safety_shadow(
+                    pt_recommendation,
+                    pt_outcome,
+                    ENGINE_HOLDINGS_PROFIT_TAKING,
+                    now,
+                    execution_context=execution_context,
+                )
+        outcome = _send_or_suppress_notification(
+            pt_recommendation, notification_enabled, notification_service, now
+        )
+        # 通知意図3段階化(2026-08): _send_or_suppress_notification()が返す
+        # outcome.notification_intentは設定されないため(値を使わない設計、
+        # 上記関数のdocstring参照)、「検出」件数(attention_detected_count、
+        # 個別送信の成否を問わない)の対象判定はRecommendationから直接再計算する。
+        # 実送信経路(evaluate_notification_status内)と同じ唯一の正本
+        # (resolve_notification_intent_for_recommendation)を使うため判定基準の
+        # 重複は生じない。
+        detected_intent = resolve_notification_intent_for_recommendation(pt_recommendation)
+        attention_origin = (
+            resolve_attention_origin_for_recommendation(pt_recommendation)
+            if detected_intent is NotificationIntent.ATTENTION
+            else None
+        )
+        audit = HoldingEvaluationAudit(
+            stock_code=holding.stock_code,
+            evaluated_at=now,
+            evaluation_status=(
+                EvaluationStatus.DATA_QUALITY_BLOCKED
+                if outcome.data_quality_blocked
+                else EvaluationStatus.COMPLETED
+            ),
+            raw_sell_recommendation_type=None,
+            raw_profit_recommendation_type=pt_recommendation.raw_recommendation_type,
+            final_recommendation_type=pt_recommendation.recommendation_type,
+            notification_status=outcome.status,
+            notification_suppression_reason=_resolve_suppression_reason(outcome),
+            sell_signal_status="NO_SIGNAL",
+            profit_taking_status="TRIGGERED",
+            fair_value_status=(
+                pt_recommendation.fair_value_overall_confidence.value
+                if pt_recommendation.fair_value_overall_confidence
+                else "NOT_AVAILABLE"
+            ),
+            data_quality_status="BLOCKED" if outcome.data_quality_blocked else "OK",
+            confidence=pt_recommendation.confidence,
+            error_code=None,
+            notification_intent=detected_intent,
+            attention_origin=attention_origin,
+        )
+        # 再コードレビュー対応(2026-08、追加修正1): 「有効なアクション検出」は
+        # DataQuality安全ゲートでブロックされなかった場合のみ成立する
+        # (DataQuality BLOCKED時はrecommendation_type自体は変わらないが、その
+        # アクション判定をユーザー向けとして扱ってよい品質かは否定されているため、
+        # detected/attention_detected/attention_sentのいずれからも除外し、既存の
+        # summary_category()による「要確認」区分側の集計に委ねる)。
+        # 再コードレビュー対応(2026-08、追加修正1・notification_enabled=False時の
+        # DataQuality評価): notification_enabled=False中も、ATTENTION対象であれば
+        # _send_or_suppress_notification()がcheck_data_quality_eligibility()経由で
+        # DataQualityを正しく評価し、outcome.data_quality_blockedへ反映する
+        # (notification_enabled=Falseは送信のみを止める仕組みであり、判定の
+        # 信頼性自体を否定するものではないため)。
+        data_quality_ok = not outcome.data_quality_blocked
+        result = _HoldingResult(
+            recommended=True,
+            notified=outcome.sent,
+            succeeded=True,
+            category=summary_category(audit),
+            audit=audit,
+            attention_detected=data_quality_ok and detected_intent is NotificationIntent.ATTENTION,
+            attention_sent=(
+                outcome.sent and data_quality_ok and detected_intent is NotificationIntent.ATTENTION
+            ),
+            notification_category=(
+                resolve_notification_category(pt_recommendation) if outcome.sent else None
+            ),
+            recommendation_type_at_send=(
+                pt_recommendation.recommendation_type if outcome.sent and data_quality_ok else None
+            ),
+            detected_recommendation_type=(
+                pt_recommendation.recommendation_type if data_quality_ok else None
+            ),
+            recommendation_id=pt_recommendation.recommendation_id,
+        )
+        _persist_holding_evaluation_record(
+            holding_evaluation_record_repo,
+            holding,
+            now,
+            execution_context,
+            rule_version_service.get_active_version_or(RULE_VERSION_PLACEHOLDER),
+            batch_id,
+            execution_plan_mode=runtime_lookup.config.mode.value,
+            execution_plan_reason=plan.execution_reason.value,
+            notification_enabled=notification_enabled,
+            authoritative_engine="PROFIT_TAKING",
+            authoritative_outcome_category=result.category,
+            authoritative_recommendation_id=result.recommendation_id,
+            authoritative_audit_log_id=pt_outcome.audit_id,
+            authoritative_notification_sent=result.notified,
+            legacy_sell_ran=plan.run_legacy_sell_evaluation,
+            legacy_sell_recommendation_id=None,
+            profit_taking_ran=True,
+            profit_taking_recommendation_id=result.recommendation_id,
+            holding_decision_ran=plan.run_holding_decision_evaluation,
+            holding_decision_result_id=None,
+            holding_decision_notified=False,
+        )
+        _observe_price_regime_shadow_safely(pt_outcome)
+        return result
+
+    # --- Issue #75(2026-08-30): 利確判定が成立しなかった場合の区別 ---
+    # recommendationがNoneでも、「判定できたうえで利確シグナルなし(NO_SIGNAL)」と
+    # 「入力が不正で判定そのものが成立しなかった(NOT_EVALUATED)」は別の状態である。
+    # 以前はdata_errorを参照しておらず、両者ともCOMPLETED / NO_SIGNAL / holdとして
+    # 記録されていたため、運用者が沈黙抑止に気付けなかった。
+    profit_taking_unavailable = pt_outcome.data_error is not None
+    audit = HoldingEvaluationAudit(
+        stock_code=holding.stock_code,
+        evaluated_at=now,
+        evaluation_status=(
+            EvaluationStatus.DATA_INSUFFICIENT
+            if profit_taking_unavailable
+            else EvaluationStatus.COMPLETED
+        ),
+        raw_sell_recommendation_type=None,
+        raw_profit_recommendation_type=None,
+        final_recommendation_type=None,
+        notification_status=(
+            NotificationStatus.DATA_INSUFFICIENT
+            if profit_taking_unavailable
+            else NotificationStatus.NOT_REQUIRED
+        ),
+        notification_suppression_reason=pt_outcome.data_error,
+        sell_signal_status="NO_SIGNAL",
+        profit_taking_status="NOT_EVALUATED" if profit_taking_unavailable else "NO_SIGNAL",
+        fair_value_status="NOT_AVAILABLE",
+        data_quality_status="NOT_EVALUATED" if profit_taking_unavailable else "OK",
+        confidence=None,
+        error_code=None,
+    )
+    result = _HoldingResult(
+        recommended=False,
+        notified=False,
+        succeeded=True,
+        category="data_insufficient" if profit_taking_unavailable else "hold",
+        audit=audit,
+    )
+    mode_designated_engine = _resolve_mode_designated_engine(mode_plan)
+    _persist_holding_evaluation_record(
+        holding_evaluation_record_repo,
+        holding,
+        now,
+        execution_context,
+        rule_version_service.get_active_version_or(RULE_VERSION_PLACEHOLDER),
+        batch_id,
+        execution_plan_mode=runtime_lookup.config.mode.value,
+        execution_plan_reason=plan.execution_reason.value,
+        notification_enabled=notification_enabled,
+        authoritative_engine=mode_designated_engine,
+        authoritative_outcome_category=result.category,
+        authoritative_recommendation_id=None,
+        authoritative_audit_log_id=(
+            sell_outcome.audit_id
+            if mode_designated_engine == "LEGACY_SELL" and plan.run_legacy_sell_evaluation
+            else None
+        ),
+        authoritative_notification_sent=False,
+        legacy_sell_ran=plan.run_legacy_sell_evaluation,
+        legacy_sell_recommendation_id=None,
+        profit_taking_ran=True,
+        profit_taking_recommendation_id=None,
+        # Issue #369: 利確判定がHOLD(Recommendationを作らない)だった場合の判定時点の
+        # 証跡。含み益率・上値余地・保留理由は、この監査記録にだけ残っている。
+        profit_taking_audit_log_id=pt_outcome.audit_id,
+        holding_decision_ran=plan.run_holding_decision_evaluation,
+        holding_decision_result_id=None,
+        holding_decision_notified=False,
+    )
+    _observe_price_regime_shadow_safely(pt_outcome)
+    return result
+
+
+def _count_holding_summary_actions(entries: list[str]) -> dict[HoldingSummaryAction, int]:
+    """保有株サマリーの4分類(一部売却/全部売却/売却/緊急確認)の件数集計。
+
+    再コードレビュー対応(2026-08、追加修正4): 分類ロジックの唯一の正本
+    resolve_holding_summary_action()(domain/entities/enums.py)のみを使い、
+    detected集計・sent集計の両方でこの関数を共通利用する(分類の二重実装を
+    避ける)。entriesは"{RecommendationType.value}|{holding_id}"形式
+    (progress.detected_categories/notification_categoriesと同じ形式。
+    M3.1: このハンドラでは"|"より後ろはholding_idであり、件数集計自体は
+    "|"より前(RecommendationType)しか見ないため計算結果に影響しない)。
+    """
+    counts: dict[HoldingSummaryAction, int] = {action: 0 for action in HoldingSummaryAction}
+    for entry in entries:
+        raw_type = entry.split("|", 1)[0]
+        action = resolve_holding_summary_action(RecommendationType(raw_type))
+        if action is not None:
+            counts[action] += 1
+    return counts
+
+
+def _finish_batch_item(
+    batch_id: str | None,
+    category: str,
+    holding_id: str,
+    now: dt.datetime,
+    notification_service: LineNotificationService,
+    runtime_config_service: HoldingDecisionRuntimeConfigService,
+    recommendation_type: RecommendationType | None = None,
+    detected_recommendation_type: RecommendationType | None = None,
+    attention_detected: bool = False,
+    attention_sent: bool = False,
+) -> None:
+    """バッチ進捗の確定(record_result)はkill switchの影響を受けず常に行う。
+    最終1件目の完了によるバッチサマリーLINE送信のみ、その時点のkill switch状態で
+    ガードする(コードレビュー対応: 通知抑止がバッチ完了判定へ影響しないことを保証する)。
+
+    再コードレビュー対応(2026-08、detected/sent一元化): サマリーのユーザー向け
+    表示は「有効なアクション検出件数」(detected_recommendation_type、DataQuality
+    安全ゲートを通過していればTradeCooldown等による個別送信抑止でも減らない)を
+    使う。recommendation_type(実際にLINE送信された場合のみ呼び出し元が渡す、
+    以前からの引数)はsent集計用としてそのまま残し、CloudWatch Logsでの監査・
+    Issue #16評価用途にのみ使う(ユーザー向けサマリーには表示しない)。
+
+    M3.1(命名整理): このモジュールでは、record_result()/BatchProgress側の
+    汎用的な"stock_code"引数・フィールド名(buy_candidates_handler.py側では
+    文字どおりstock_code)へ、実際にはholding_id(= owner + "#" + stock_code)を
+    渡している。DynamoDBの文字列セットは同一値の重複を許さないため、holding_id
+    単位で渡すことで同一銘柄を複数ownerが保有していても正しく別件として集計
+    される(機能はM3切替時から変更していない、命名・コメントの整理のみ)。
+    holding_idの文字列自体がowner・stock_codeの両方を含むため、data_insufficient/
+    failedのサマリー表示(下記notify_batch_summary呼び出し)は追加の変更なしで
+    owner・stock_codeの両方を識別できる。
+    """
+    if batch_id is None:
+        return
+    needs_code = category in ("data_insufficient", "failed")
+    notification_category_entry = (
+        f"{recommendation_type.value}|{holding_id}" if recommendation_type is not None else None
+    )
+    detected_category_entry = (
+        f"{detected_recommendation_type.value}|{holding_id}"
+        if detected_recommendation_type is not None
+        else None
+    )
+    progress = record_result(
+        batch_id,
+        category,
+        # M3.1: 引数名はstock_codeだが、この保有銘柄パイプラインではholding_idを渡す
+        # (上記docstring参照)。
+        stock_code=holding_id if needs_code else None,
+        notification_category_entry=notification_category_entry,
+        detected_category_entry=detected_category_entry,
+        attention_detected_stock_code=holding_id if attention_detected else None,
+        attention_sent_stock_code=holding_id if attention_sent else None,
+        # Issue #57 B1: finalize eligibilityの正本となる完了識別子。同一銘柄を
+        # 複数ownerが保有する場合に別件として数える必要があるためholding_idを渡す
+        # (M3.1の既存方針と同じ)。stock_code引数はcategory依存でしか渡されない
+        # ため流用できず、専用引数として常に渡す。
+        completion_id=holding_id,
+    )
+    if progress is None or not progress.is_complete:
+        return
+    _send_batch_summary(batch_id, progress, now, notification_service, runtime_config_service)
+
+
+def _send_batch_summary(
+    batch_id: str,
+    progress: BatchProgress,
+    now: dt.datetime,
+    notification_service: LineNotificationService,
+    runtime_config_service: HoldingDecisionRuntimeConfigService,
+) -> None:
+    """バッチ完了時のサマリー送信フロー(Issue #57 B2で関数として切り出し)。
+
+    通常の最終worker(`_finish_batch_item`)と、finalize-only recovery
+    (`_run_finalize_only_recovery`)の**両方がこの同一経路を通る**。
+    recovery専用の別経路を作らないことで、kill switch判定・gate取得・
+    失敗記録の意味論が1箇所に保たれる。
+    """
+    if not runtime_config_service.get_notification_enabled():
+        logger.info(
+            "kill_switch_suppressed: batch_summary batch_id=%s notification_enabled=False",
+            batch_id,
+        )
+        return
+    # Issue #31: completedカウンタは非冪等なADDのため、処理済みholding_idの
+    # Lambda非同期retryでis_completeが再成立しうる。summary送信フローの実行権を
+    # 原子的に取得し、取得できた1実行だけが以降を実行する(kill switch判定は
+    # 副作用が無いためゲートの前に置き、抑止中はacquire自体を行わない=
+    # 解除後の後続トリガーで従来どおり送信可能という既存意味論を維持)。
+    finalize_token = try_acquire_completion_finalize(batch_id, now)
+    if finalize_token is None:
+        logger.info(
+            "batch summary finalize skipped (already acquired or completed) batch_id=%s",
+            batch_id,
+        )
+        return
+    detected_counts = _count_holding_summary_actions(progress.detected_categories)
+    sent_counts = _count_holding_summary_actions(progress.notification_categories)
+    attention_detected_n = len(progress.attention_detected_stock_codes)
+    attention_sent_n = len(progress.attention_sent_stock_codes)
+    # 再コードレビュー対応(2026-08、指摘1・8): ユーザー向けサマリーには表示
+    # しないdetected/sentの内訳をCloudWatch Logsへ構造化出力する(Issue #16の
+    # 「1日平均ATTENTION判定数/個別通知数」評価、および将来のPARTIAL/FULL/SELL/
+    # CRITICAL運用評価に使う)。
+    logger.info(
+        "holdings_summary_action_counts batch_id=%s "
+        "partial_detected=%d partial_sent=%d "
+        "full_detected=%d full_sent=%d "
+        "sell_detected=%d sell_sent=%d "
+        "critical_detected=%d critical_sent=%d "
+        "attention_detected=%d attention_sent=%d",
+        batch_id,
+        detected_counts[HoldingSummaryAction.PARTIAL],
+        sent_counts[HoldingSummaryAction.PARTIAL],
+        detected_counts[HoldingSummaryAction.FULL],
+        sent_counts[HoldingSummaryAction.FULL],
+        detected_counts[HoldingSummaryAction.SELL],
+        sent_counts[HoldingSummaryAction.SELL],
+        detected_counts[HoldingSummaryAction.CRITICAL],
+        sent_counts[HoldingSummaryAction.CRITICAL],
+        attention_detected_n,
+        attention_sent_n,
+    )
+    try:
+        notification_service.notify_batch_summary(
+            _PROCESS_NAME,
+            progress.total,
+            progress.category_counts,
+            now,
+            data_insufficient_stock_codes=progress.data_insufficient_stock_codes,
+            failed_stock_codes=progress.failed_stock_codes,
+            partial_sell_detected_count=detected_counts[HoldingSummaryAction.PARTIAL],
+            full_sell_detected_count=detected_counts[HoldingSummaryAction.FULL],
+            sell_detected_count=detected_counts[HoldingSummaryAction.SELL],
+            critical_risk_detected_count=detected_counts[HoldingSummaryAction.CRITICAL],
+            attention_detected_count=attention_detected_n,
+            display_title="保有株チェック",
+        )
+    except BaseException as exc:
+        # Issue #57 B1: 捕捉可能な失敗を永続化する(観測のみ。completed_atは
+        # 書かないためgateの意味論は不変で、再駆動もまだ行わない=Phase B2)。
+        # 記録の失敗で元の例外を握りつぶさない。
+        _mark_finalize_failure_safely(batch_id, finalize_token, now, exc)
+        raise
+    # Issue #31: 完了処理の正常終了を記録する。これ以降、同一batch_idの
+    # acquireは(経過時間に関わらず)永久に失敗する。summary送信が例外の場合は
+    # ここへ到達せず、stale化(1200秒)後に後続トリガーがtakeoverして再実行できる。
+    mark_completion_finalize_completed(batch_id, finalize_token, now)
+
+
+def _run_finalize_only_recovery(
+    record: CompletionBatchRecord,
+    now: dt.datetime,
+    notification_service: LineNotificationService,
+    runtime_config_service: HoldingDecisionRuntimeConfigService,
+) -> dict[str, Any]:
+    """サマリー送信だけを再実行する(Issue #57 Phase B2)。
+
+    **通常workerの処理は行わない。** 通常の最終workerとまったく同じ
+    `_send_batch_summary()`を呼ぶため、**kill switch判定・gate取得・失敗記録の
+    意味論はすべて既存経路と同一**である(kill switch ON中はacquireせず
+    サマリーも送らない=解除後の次回recoveryで回復する、という契約を維持)。
+
+    実行権は既存の`try_acquire_completion_finalize()`が`_send_batch_summary()`
+    の内部で取得する(recovery専用のgateを作らない=Issue #31を迂回しない)。
+    """
+    if record.attempts_exhausted:
+        logger.error(
+            "finalize recovery exhausted batch_id=%s batch_family=%s "
+            "attempt_count=%d reason=FINALIZE_RETRY_EXHAUSTED",
+            record.batch_id,
+            BatchFamily.HOLDINGS_WATCHLIST.value,
+            record.attempt_count,
+        )
+        return {"finalize_recovery": "EXHAUSTED"}
+    _send_batch_summary(
+        record.batch_id,
+        record.progress,
+        now,
+        notification_service,
+        runtime_config_service,
+    )
+    return {"finalize_recovery": "ATTEMPTED"}
+
+
+def _mark_finalize_failure_safely(
+    batch_id: str, finalize_token: str, now: dt.datetime, exc: BaseException
+) -> None:
+    """finalize失敗の記録を試みる(Issue #57 B1)。
+
+    記録は観測目的のbest-effortであり、**元の例外の伝播を妨げてはならない**。
+    記録自体が失敗した場合は警告を残すだけで飲み込む。
+    """
+    try:
+        mark_completion_finalize_failed(batch_id, finalize_token, now, exc)
+    except Exception:  # noqa: BLE001 - 記録失敗で元の例外を隠さない
+        logger.warning(
+            "holdings batch summary: failed to persist finalize failure batch_id=%s",
+            batch_id,
+            exc_info=True,
+        )
+
+
+def _process_single_holding(
+    holding_id: str,
+    batch_id: str | None,
+    now: dt.datetime,
+    providers: ProviderBundle,
+    config: AppConfig,
+    recommendation_repo: RecommendationRepository,
+    notification_service: LineNotificationService,
+    rule_version_service: RuleVersionService,
+    execution_context: ExecutionContext = _DEFAULT_EXECUTION_CONTEXT,
+) -> dict[str, Any]:
+    """M3(保有銘柄オーナー機能): holding_id(= owner + "#" + stock_code)単位で
+    対象Holdingを特定する。同一stock_codeでも複数ownerが保有する場合、
+    それぞれ独立したworker呼び出しとして処理される。"""
+    runtime_config_service = HoldingDecisionRuntimeConfigService(
+        cache_ttl_seconds=config.holding_decision.runtime_config_cache_ttl_seconds
+    )
+    holding = HoldingRepository().get(holding_id)
+    if holding is None:
+        logger.warning("dispatched holding not found holding_ref=%s", log_ref(holding_id))
+        _finish_batch_item(
+            batch_id, "failed", holding_id, now, notification_service, runtime_config_service
+        )
+        return {"holding_id": holding_id, "recommended": False, "notified": False, "found": False}
+
+    profit_service = ProfitTakingService(
+        providers=providers, config=config, execution_context=execution_context
+    )
+    sell_service = SellSignalService(
+        providers=providers, config=config, execution_context=execution_context
+    )
+    holding_decision_service = HoldingDecisionService(
+        providers,
+        config,
+        runtime_config_service=runtime_config_service,
+        execution_context=execution_context,
+    )
+    holding_decision_result_repo = HoldingDecisionResultRepository()
+    holding_evaluation_record_repo = HoldingEvaluationRecordRepository()
+    try:
+        result = _analyze_one_holding(
+            holding,
+            now,
+            providers,
+            config,
+            profit_service,
+            sell_service,
+            holding_decision_service,
+            runtime_config_service,
+            holding_decision_result_repo,
+            holding_evaluation_record_repo,
+            recommendation_repo,
+            notification_service,
+            rule_version_service,
+            batch_id,
+            execution_context,
+        )
+    except Exception:  # noqa: BLE001 - 1銘柄の想定外エラーで再帰呼び出し全体を落とさない
+        logger.exception("holding analysis failed unexpectedly holding_ref=%s", log_ref(holding_id))
+        _finish_batch_item(
+            batch_id, "failed", holding_id, now, notification_service, runtime_config_service
+        )
+        # Issue #668(HF-3 B1)
+        _notify_handled_failure_safely(
+            "HOLDING_ANALYSIS", "HOLDINGS_WATCHLIST_ANALYSIS_FAILED", now, batch_id
+        )
+        return {"holding_id": holding_id, "recommended": False, "notified": False, "failed": True}
+
+    # Issue #362: 子の正常系の終端にも batch_id を出し、「うまくいった1件」を run へ
+    # 結びつけられるようにする。既存の抽出手順を壊さないよう、既存のprefixと
+    # audit の出力位置は変えず、**末尾へ足す**。batch_id は親が生成する識別子で、
+    # owner・holding_id を含まない(PIIではない)。
+    logger.info("holding_evaluation_audit: %s batch_id=%s", result.audit, batch_id)
+    _finish_batch_item(
+        batch_id,
+        result.category,
+        holding_id,
+        now,
+        notification_service,
+        runtime_config_service,
+        recommendation_type=result.recommendation_type_at_send,
+        detected_recommendation_type=result.detected_recommendation_type,
+        attention_detected=result.attention_detected,
+        attention_sent=result.attention_sent,
+    )
+    return {
+        "holding_id": holding_id,
+        "recommended": result.recommended,
+        "notified": result.notified,
+        "evaluation_status": result.audit.evaluation_status.value,
+        "notification_status": result.audit.notification_status.value,
+    }
+
+
+@dataclass(frozen=True)
+class _StockPosition:
+    """家計全体(全owner)で見た、1銘柄ぶんの保有(Issue #64 F-A3)。
+
+    集中度は「家全体で見て、この**銘柄**に偏っているか」を問う判定であり、
+    holding単位ではなく**銘柄単位**で成り立つ。したがって分子も
+    全ownerの同一銘柄を合算した値とする(USER判断 = #64 issuecomment-5629242431)。
+    """
+
+    stock_code: str
+    stock_name: str
+    # 寄与したholdingのidとowner(Issue #64 F-A2)。代表1件を選ばず一覧で残し、
+    # 「誰の分がいくら寄与したか」を後から追えるようにする。
+    holding_ids: tuple[str, ...]
+    owners: tuple[str, ...]
+    shares: int
+    total_purchase_amount: Decimal
+    # 価格が取れなければNone(=時価ベースは判定せず、記録も作らない)。
+    close_price: Decimal | None
+    market_value: Decimal | None
+    price_sources: tuple[DataSourceReference, ...]
+
+
+def _estimate_portfolio_totals(
+    holdings: list[Holding], providers: ProviderBundle
+) -> tuple[Decimal | None, Decimal | None, list[_StockPosition], int]:
+    """ポートフォリオ全体の時価総額・取得価格総額と、銘柄単位の保有を概算する(§14)。
+
+    フルスナップショット(財務・適正価格等)は取得コストが高いため、時価総額の
+    概算には現在株価のみを取得する軽量なget_latest_priceを使う。1銘柄でも
+    価格取得に失敗した場合、時価総額ベースの比率は算出不能(None)とする
+    (一部の銘柄を除外した不正確な合計を「全体」として扱わない)。
+
+    Issue #64 F-A3: 銘柄単位の集計(_StockPosition)も併せて返す。従来は分母だけを
+    ここで作り、分子は子Lambdaが自分のholding 1件から作っていたため、
+    **分子=1owner / 分母=全owner**という中間状態になっていた。価格取得は
+    **銘柄ごとに1回**にまとめる(同一銘柄を複数ownerが持つ場合に重複取得しない)。
+
+    Issue #64 F-I3: 使った価格のsource(提供元・取得時刻)もそのまま持ち回る。
+    保存のために価格を取り直さないため、判定に使った値と記録が必ず一致する。
+
+    Issue #692(HF系列): 4番目の戻り値として、価格取得が**技術的failure**
+    (例外送出)で失敗した銘柄数を返す。`get_latest_price()`が例外を投げずに
+    正常に`None`を返す経路(業務上「価格データが無い」という事実)とは区別する
+    (技術的failureのみを数える。詳細はIssue #692 Phase B設計§1の発見事項参照)。
+    本関数は`evaluate_household_concentration_and_notify()`から1回のLambda
+    実行内で1回だけ呼ばれるため、cross-worker集約(DynamoDB等)を必要としない
+    (戻り値をそのまま使うだけで足りる)。
+    """
+    by_stock: dict[str, list[Holding]] = {}
+    for holding in holdings:
+        by_stock.setdefault(holding.stock_code, []).append(holding)
+
+    total_acquisition_cost = sum((h.total_purchase_amount for h in holdings), start=Decimal("0"))
+    total_market_value: Decimal | None = Decimal("0")
+    positions: list[_StockPosition] = []
+    price_fetch_failed_count = 0
+    for stock_code, group in by_stock.items():
+        try:
+            snap = providers.market_data.get_latest_price(stock_code)
+        except Exception:  # noqa: BLE001 - 1銘柄の株価取得エラーでバッチ全体を落とさない
+            logger.exception(
+                "portfolio total estimation: price fetch failed stock_code=%s", stock_code
+            )
+            snap = None
+            price_fetch_failed_count += 1
+        shares = sum(h.shares for h in group)
+        market_value = None if snap is None else snap.close_price * shares
+        if market_value is None:
+            total_market_value = None
+        elif total_market_value is not None:
+            total_market_value += market_value
+        positions.append(
+            _StockPosition(
+                stock_code=stock_code,
+                stock_name=group[0].stock_name,
+                holding_ids=tuple(sorted(h.holding_id for h in group)),
+                owners=tuple(sorted({h.owner for h in group})),
+                shares=shares,
+                total_purchase_amount=sum(
+                    (h.total_purchase_amount for h in group), start=Decimal("0")
+                ),
+                close_price=None if snap is None else snap.close_price,
+                market_value=market_value,
+                price_sources=() if snap is None else (snap.source,),
+            )
+        )
+    return total_market_value, total_acquisition_cost, positions, price_fetch_failed_count
+
+
+def handler(event: dict[str, Any], context: object) -> dict[str, Any]:
+    # 通知検証モード機能(2026-08追加)。不正なexecution_modeは他の一切の処理より
+    # 前にここで例外を送出し、Lambda呼び出し自体を失敗させる(NORMALへフォール
+    # バックしない)。
+    execution_context = resolve_execution_context(event)
+    now = dt.datetime.now(dt.UTC)
+    config = load_config()
+    providers = build_real_provider_bundle(now, config)
+    # Issue #70 F-B5: buy側(buy_candidates_handler)と同じく**repository自体を
+    # 切り替える**。VALIDATIONでは検証用テーブルへ向くため、保存が1箇所でも
+    # ガードを漏らしたときの着地点が本番ではなくなる。
+    #
+    # ★ 既存の個別ガード(`if not execution_context.is_validation:` の5か所)は
+    #   **そのまま残す**。VALIDATIONで保存しないという方針は変えていない。
+    #   切り替えは方針の変更ではなく、**ガードの書き忘れに対する二重の安全
+    #   (fail-safe)**である。したがって観測可能な挙動は変わらない。
+    #
+    # ★ ガードを外さない理由: ガードの中にはDecisionSnapshot /
+    #   HoldingDecisionResultの保存が同居しており、それらのrepositoryは
+    #   for_execution_context()を持たない。外すとVALIDATIONがそれらの
+    #   本番テーブルを汚す(本Issueが防ごうとしている状態そのもの)。
+    #   3 repositoryのfactory化は別Issueで扱う。
+    recommendation_repo = RecommendationRepository.for_execution_context(execution_context)
+    # BUY候補裾野拡大機能(2026-08、§5-1): 子Lambda(task=holding)は親Lambdaが
+    # detect_and_apply()の結果をイベントペイロード経由で伝播した
+    # trade_detection_confirmedをそのまま使う。
+    # ★ 既定は**False(fail-close)**である(Issue #211 / #70 F-B3)。
+    #   理由と影響範囲はbuy_candidates_handlerの同じ箇所と同一。
+    #   通常のscheduled経路では親が必ず実値を渡すため挙動は変わらない。
+    trade_detection_confirmed = event.get("trade_detection_confirmed", False)
+    notification_service = LineNotificationService(
+        line_client=build_line_client_for_run(dry_run=execution_context.is_dry_run),
+        notification_log_repository=NotificationLogRepository(),
+        # LINE通知dedupの原子化(Issue #17): NORMAL実行の送信決定を原子的に
+        # 一意化するclaimリポジトリ(VALIDATION/DRY_RUNでは使用されない)。
+        notification_claim_repository=NotificationClaimRepository(),
+        recommendation_repository=recommendation_repo,
+        config=config,
+        execution_context=execution_context,
+        trade_detection_confirmed=trade_detection_confirmed,
+    )
+    rule_version_service = RuleVersionService()
+
+    if is_recovery_event(event):
+        # Issue #57 B2: finalize-only recovery。**通常workerの処理は一切行わない**
+        # (銘柄評価・Recommendation/DecisionSnapshot再生成・record_result・
+        # fanoutのいずれも実行しない)。task分岐より前に置き、未知の
+        # recovery_actionが通常worker経路へ落ちないようにする。
+        record = resolve_finalize_only_request(
+            event, BatchFamily.HOLDINGS_WATCHLIST, execution_context
+        )
+        if record is None:
+            return {"finalize_recovery": "REJECTED"}
+        return _run_finalize_only_recovery(
+            record,
+            now,
+            notification_service,
+            HoldingDecisionRuntimeConfigService(
+                cache_ttl_seconds=config.holding_decision.runtime_config_cache_ttl_seconds
+            ),
+        )
+
+    task = event.get("task")
+    if task == "holding":
+        # 子Lambda: batch_idはevent由来なのでこの時点で既に確定している。
+        if execution_context.is_validation:
+            logger.info(
+                "VALIDATION MODE task=holding execution_mode=VALIDATION "
+                "notification_mode=%s event_notification_mode=%r is_dry_run=%s "
+                "validation_run_id=%s holding_ref=%s",
+                execution_context.notification_mode.value,
+                event.get("notification_mode"),
+                execution_context.is_dry_run,
+                event.get("batch_id"),
+                log_ref(event["holding_id"]),
+            )
+        result = _process_single_holding(
+            event["holding_id"],
+            event.get("batch_id"),
+            now,
+            providers,
+            config,
+            recommendation_repo,
+            notification_service,
+            rule_version_service,
+            execution_context,
+        )
+        # Issue #309: result を丸ごと出すと holding_id(所有者名を含む)が
+        # CloudWatch Logs へ平文で残る。所在は log_ref の符号で辿れるため、
+        # 生値は出さず、PII を含まないフィールドだけを明示して出す。
+        # ★ dict を丸ごと渡さない。渡すとキーが増えたときに黙って漏れる。
+        logger.info(
+            "holdings_watchlist_handler single holding done holding_ref=%s "
+            "recommended=%s notified=%s found=%s failed=%s "
+            "evaluation_status=%s notification_status=%s",
+            log_ref(event["holding_id"]),
+            result.get("recommended"),
+            result.get("notified"),
+            result.get("found"),
+            result.get("failed"),
+            result.get("evaluation_status"),
+            result.get("notification_status"),
+        )
+        return result
+
+    # Issue #440: JPX休場日は、市場依存のこのentryをskipする(正常なno-op)。
+    # 順序: validation(上のresolve_execution_context)→ recovery/child等の非対象分岐(上)→
+    # 本gate(allow_market_closedの検証 → JST日付 → BusinessCalendar)→ 通常処理。
+    # 最初の状態変更(trade検知・batch行・fan-out・市場依存の通知)より前で判定する。
+    # recovery(前営業日のbatchの回復)とchildは休場日でも止めない(gateの上で処理済み)。
+    if should_skip_for_market_closed(
+        event, execution_context, now, config, handler="holdings_watchlist"
+    ):
+        return {"dispatched_holdings": 0, "skipped": SKIP_REASON}
+
+    # 通常のスケジュール起動(ディスパッチのみ行い、銘柄ごとの実処理は非同期の
+    # 自己再帰呼び出しに委ねる。全銘柄を直列処理するとLambdaの最大タイムアウト
+    # (900秒)を超えうるため)。ウォッチリストの買いシグナル評価はbuy_candidates_
+    # handler.pyの統合BUY候補パイプラインへ一本化済みのため、ここでは保有銘柄の
+    # 売却・利確判定のみをdispatchする。
+    # 株主優待レジストリの読み込み件数チェックは、銘柄ごとのワーカー呼び出しでは
+    # なくバッチ開始時(ここ)で1回だけ行う(2026-07仕様レビュー対応)。
+    check_registry_health(
+        config.notification.operations.shareholder_benefit_registry_min_expected_entries
+    )
+    function_name = resolve_function_name(context, os.environ.get("AWS_LAMBDA_FUNCTION_NAME", ""))
+    holdings = PortfolioService().list_holdings()
+    # Issue #754: 株主優待registryのcoverageの保有側をINFO記録する(読み込み済みのholdingsから算出。
+    # 候補側は買い候補バッチで記録する。判定・通知は変えない)。
+    check_registry_coverage(candidate_codes=None, holding_codes=[h.stock_code for h in holdings])
+
+    # --- BUY候補裾野拡大機能(2026-08、§5-1・§5-2): 売買イベント検知を
+    # BUY候補Lambda・保有銘柄Lambdaの起動順序に依存させない。両ハンドラの
+    # 入口でTradeCooldownService.detect_and_apply()を呼ぶ(冪等・PROCESSING/
+    # COMPLETEDロックにより当日1回だけ実際の検知処理が走る)。
+    calendar = BusinessCalendar.from_config(config.holiday_calendar)
+    trade_cooldown_service = TradeCooldownService(
+        business_calendar=calendar,
+        config=config.notification.trade_cooldown,
+        execution_context=execution_context,
+    )
+    current_holdings_by_id = {h.holding_id: h for h in holdings}
+    detection_outcome = trade_cooldown_service.detect_and_apply(current_holdings_by_id, now)
+    if detection_outcome.confirmed:
+        watch_state_service = WatchStateService(
+            business_calendar=calendar, execution_context=execution_context
+        )
+        # 再コードレビュー対応(2026-08、JST暦日境界修正・指摘4): TradeCooldownService
+        # がevaluation_date_jst(now)を基準日として検知・記録するようになったため、
+        # 同じ売買イベントに紐づくWatchState終了もこれと同一のJST暦日を使う
+        # (ended_at/last_evaluated_atはWatchStateの営業日ベースの経過判定
+        # (business_days_between等)に使われる値のため、TradeDetectionと
+        # 異なる基準日にすると同一WatchStateの日付系列が矛盾する)。
+        watch_state_service.end_for_trade_events(detection_outcome.events, evaluation_date_jst(now))
+    else:
+        logger.warning(
+            "holdings_watchlist_handler: trade detection not confirmed this run "
+            "(TRADE_DETECTION_IN_PROGRESSとして通常通知をfail-closedする)"
+        )
+
+    total = len(holdings)
+    # Issue #558: EventBridge Schedulerのretryで同一論理実行が新しいbatch_idで
+    # 再dispatchされることを防ぐため、event["scheduled_time"]から決定論的に
+    # batch_idを導出する(#65 F-E7と同じ導出ロジック。_scheduling.py参照)。
+    batch_id = derive_scheduled_batch_id("holdings-watchlist", event, now)
+    # Issue #533(#319 Phase 2): dispatch経路はbatch開始時点の環境変数値で固定する
+    # (以後この変数を再評価しない。1回のbatch起動は必ず開始時点の経路のまま)。
+    use_sqs_dispatch = holdings_watchlist_sqs_dispatch_enabled()
+    dispatch_mode = DISPATCH_MODE_SQS if use_sqs_dispatch else DISPATCH_MODE_LEGACY
+    # Issue #57 B2: reconcilerがstatusではなくfamily markerで積極識別するため、
+    # 種別と実行文脈をここで必ず永続化する。
+    started = start_batch(
+        batch_id,
+        total,
+        now,
+        BatchFamily.HOLDINGS_WATCHLIST,
+        execution_context,
+        dispatch_mode=dispatch_mode,
+    )
+    if not started:
+        # Issue #558: 同一batch_idでの2回目の開始(Scheduler retry等)。正常な
+        # idempotency結果として扱い、fanout・通知・進捗初期化のいずれも
+        # 行わずに終了する(ERROR/例外にしない。retryをさらに誘発しない)。
+        logger.info(
+            "holdings_watchlist_handler: duplicate batch start ignored batch_id=%s", batch_id
+        )
+        return {"dispatched_holdings": 0, "skipped": "duplicate_batch_start"}
+    if execution_context.is_validation:
+        # 通知検証モード機能(2026-08追加): batch_idはここで初めて確定するため、
+        # イベント解析直後ではなくこの時点でVALIDATION開始ログを出す。
+        logger.info(
+            "VALIDATION MODE START execution_mode=VALIDATION notification_mode=%s "
+            "validation_run_id=%s target_count=%d",
+            execution_context.notification_mode.value,
+            batch_id,
+            total,
+        )
+
+    # Issue #64 F-A3: ポートフォリオ集中リスクは**家計全体(全ownerの同一銘柄合算)**を
+    # 分子とする銘柄単位の判定である。holding単位の子Lambdaで判定すると同一銘柄で
+    # 重複して発火するため、ここ(親)で1回だけ評価する。価格取得も銘柄ごとに1回で済む。
+    # ★ 総額を子payloadへ渡す必要は無くなった(子は集中度を判定しない)。
+    # kill switchは緊急停止用途のため、TTLキャッシュを経由せず毎回最新値を取得する
+    # (子Lambda側と同じ扱い。実装プラン修正2)。
+    evaluate_household_concentration_and_notify(
+        holdings,
+        providers,
+        config,
+        recommendation_repo,
+        notification_service,
+        rule_version_service,
+        now,
+        HoldingDecisionRuntimeConfigService(
+            cache_ttl_seconds=config.holding_decision.runtime_config_cache_ttl_seconds
+        ).get_notification_enabled(),
+        execution_context,
+    )
+
+    for holding in holdings:
+        child_payload: dict[str, Any] = {
+            "task": "holding",
+            "holding_id": holding.holding_id,
+            "batch_id": batch_id,
+            "execution_mode": execution_context.mode.value,
+            "trade_detection_confirmed": detection_outcome.confirmed,
+        }
+        # バグ修正(2026-08、通知ドライラン機能): notification_modeを子Lambdaへ
+        # 伝播し忘れており、VALIDATION+DRY_RUNで起動しても子Lambda側は
+        # notification_mode未指定→既定のSEND扱いとなり、実LINE送信が抑止
+        # されない不備があった。NORMAL実行時はresolve_execution_context()が
+        # execution_mode=NORMAL+notification_mode指定をエラーにするため、
+        # VALIDATION時のみキー自体を追加する(NORMAL実行への影響を避ける)。
+        if execution_context.is_validation:
+            child_payload["notification_mode"] = execution_context.notification_mode.value
+        if use_sqs_dispatch:
+            dispatch_sqs(os.environ["HOLDINGS_WATCHLIST_QUEUE_URL"], child_payload)
+        else:
+            dispatch_async(function_name, child_payload)
+
+    logger.info(
+        "holdings_watchlist_handler dispatched: holdings=%d batch_id=%s",
+        len(holdings),
+        batch_id,
+    )
+    return {"dispatched_holdings": len(holdings)}

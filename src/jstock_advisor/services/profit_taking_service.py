@@ -1,0 +1,1791 @@
+"""利確判定サービス(要求仕様3節 profit_taking_service、2026-07仕様レビュー対応)。
+
+保有銘柄についてstock_snapshot_serviceでデータを取得し、profit_takingドメイン
+ロジックで判定したうえでRecommendationスナップショットを生成する。
+
+信頼度はfair_value_methods_used_countだけで決め打ちせず、sell_signalと共通の
+confidence_scoring機構を使って算出する。
+"""
+
+from __future__ import annotations
+
+import calendar
+import datetime as dt
+import logging
+import uuid
+from dataclasses import dataclass, field
+from typing import cast, get_args
+
+from jstock_advisor.config.models import AppConfig
+from jstock_advisor.domain.business_calendar import BusinessCalendar
+from jstock_advisor.domain.classification.financial_industry import classify_industry
+from jstock_advisor.domain.classification.profit_taking_industry import (
+    classify_profit_taking_industry_sector,
+    industry_model_missing_reason,
+)
+from jstock_advisor.domain.entities.common import SellPriceLevels
+from jstock_advisor.domain.entities.enums import (
+    AccountType,
+    ConfidenceLevel,
+    DividendComparisonOutcome,
+    EarningsDecisionRelevance,
+    EarningsReleaseConfirmationState,
+    PriceRangeEvaluationState,
+    ProfitTakingIndustrySector,
+    RecommendationScope,
+    RecommendationType,
+    SellIntensity,
+    StockType,
+    TrendClassification,
+)
+from jstock_advisor.domain.entities.execution_context import ExecutionContext
+from jstock_advisor.domain.entities.exit_price_range import ExitPriceRangeResult
+from jstock_advisor.domain.entities.holding import Holding
+from jstock_advisor.domain.entities.recommendation import Recommendation
+from jstock_advisor.domain.entities.valuation import (
+    FairValueUnusableReasonCode,
+    ProfitTakingFairValueBlockReasonCode,
+)
+from jstock_advisor.domain.financial_decomposition import (
+    has_guidance_revision_disclosure,
+    is_fundamentally_driven,
+)
+from jstock_advisor.domain.jst import evaluation_date_jst
+from jstock_advisor.domain.shadow_observation import (
+    SHADOW_STATE_COMPUTATION_FAILED,
+    isolated_shadow_computation,
+    isolated_shadow_observation,
+)
+from jstock_advisor.domain.signals.confidence_scoring import (
+    ConfidenceFactors,
+    ConfidenceScoreResult,
+    compute_confidence,
+)
+from jstock_advisor.domain.signals.earnings_surprise import (
+    earnings_surprise_config_values,
+    earnings_surprise_result_to_metrics,
+)
+from jstock_advisor.domain.signals.earnings_trend import (
+    earnings_trend_config_values,
+    earnings_trend_result_to_metrics,
+)
+from jstock_advisor.domain.signals.earnings_window import (
+    resolve_earnings_decision_relevance,
+    resolve_earnings_release_confirmation,
+    resolve_latest_financial_period_end,
+)
+from jstock_advisor.domain.signals.entry_price_range import (
+    entry_price_range_config_values,
+    entry_price_range_result_to_metrics,
+)
+from jstock_advisor.domain.signals.environment import (
+    environment_config_values,
+    environment_result_to_metrics,
+)
+from jstock_advisor.domain.signals.exit_price_range import (
+    evaluate_exit_price_range,
+    exit_price_range_config_values,
+    exit_price_range_result_to_metrics,
+)
+from jstock_advisor.domain.signals.historical_valuation import (
+    historical_valuation_config_values,
+    historical_valuation_result_to_metrics,
+)
+from jstock_advisor.domain.signals.judgment_safety import (
+    CorporateActionFacts,
+    CorporateActionIssueKind,
+    ProfitTakingMitigationFacts,
+    SafetyFacts,
+)
+from jstock_advisor.domain.signals.judgment_safety_shadow_config import (
+    JudgmentSafetyShadowConfig,
+    load_judgment_safety_shadow_config,
+)
+from jstock_advisor.domain.signals.market_environment import (
+    market_environment_config_values,
+    market_environment_result_to_metrics,
+)
+from jstock_advisor.domain.signals.price_path_facts import PricePathFacts, build_price_path_facts
+from jstock_advisor.domain.signals.profit_protection import (
+    ProfitProtectionMetrics,
+    compute_profit_protection_metrics,
+)
+from jstock_advisor.domain.signals.profit_taking import (
+    ExitTrace,
+    InvalidProfitTakingInputError,
+    MitigatingFactorInputs,
+    ProfitTakingConditionInputs,
+    ProfitTakingResult,
+    evaluate_profit_taking,
+)
+from jstock_advisor.domain.signals.profit_taking_gate_trace import (
+    build_profit_taking_gate_trace,
+)
+from jstock_advisor.domain.signals.record_date_resolution import (
+    resolve_benefit_record_date_recurring_label,
+    resolve_benefit_record_date_source_type,
+    resolve_dividend_record_date_recurring_label,
+    resolve_dividend_record_date_source_type,
+)
+from jstock_advisor.domain.signals.sector_environment import (
+    sector_environment_config_values,
+    sector_environment_result_to_metrics,
+)
+from jstock_advisor.domain.signals.timing_score import (
+    timing_score_config_values,
+    timing_score_result_to_metrics,
+)
+from jstock_advisor.domain.signals.trading_unit_feasibility import (
+    TradingUnitFeasibility,
+    compute_suggested_sell_shares,
+    evaluate_trading_unit_feasibility,
+)
+from jstock_advisor.interfaces.types import CorporateActionEvent, DividendInfo, ShareholderBenefit
+from jstock_advisor.services.audit_service import AuditService
+from jstock_advisor.services.buy_signal_service import RULE_VERSION_PLACEHOLDER
+from jstock_advisor.services.corporate_action_service import (
+    BasisDateConsistency,
+    CorporateActionService,
+)
+from jstock_advisor.services.data_quality_service import check_split_consistency
+from jstock_advisor.services.financial_freshness_integration import (
+    FINANCIAL_STALE_USER_WARNING,
+    FinancialFreshnessAssessment,
+    assess_financial_freshness,
+)
+from jstock_advisor.services.provider_bundle import ProviderBundle
+from jstock_advisor.services.rule_version_service import RuleVersionService
+from jstock_advisor.services.stock_snapshot_service import StockSnapshot, build_stock_snapshot
+
+logger = logging.getLogger(__name__)
+
+# 決算直前は原則として通常のPARTIAL/FULL_PROFIT_TAKE提案を保留する(要求仕様§4)。
+_EARNINGS_SUPPRESSIBLE_TO_REVIEW = (
+    RecommendationType.PARTIAL_PROFIT_TAKE,
+    RecommendationType.FULL_PROFIT_TAKE,
+)
+
+
+@dataclass(frozen=True)
+class ProfitTakingOutcome:
+    stock_code: str
+    recommendation: Recommendation | None
+    data_error: str | None
+    # Phase 2-B「銘柄分析」向け(2026-08): この判定サイクルで実際に書き込んだ
+    # AuditLogEntryのID(judgment audit呼び出しに到達しなかった場合はNone)。
+    # HoldingEvaluationRecord.authoritative_audit_log_idへ橋渡しするための参照。
+    audit_id: str | None = None
+    # --- Issue #160 shadow計測(PR-2b): 判定に入る前の事実(非永続・判定へ使わない) ---
+    # 推奨が生成された経路でのみ設定する(data_error / HOLD等の推奨なし経路はNone)。等価比較・
+    # reprには含めない(既存の比較・ログを変えない)。shadowの評価点(PR-3以降)だけが読む。
+    safety_facts: SafetyFacts | None = field(default=None, compare=False, repr=False)
+    # --- Issue #877 PR-2b-i: 価格の経路の事実(素の型 5 つ。非永続・判定へ使わない) ---
+    # 指標とトレンドの分類を写すだけ(再計算なし)。推奨の有無に依らず(HOLD でも)、判定の経路に入った
+    # 後で設定する(data_error の経路はNone)。値の詰めは隔離され、失敗してもNone(判定・保存・通知は
+    # 変えない)。等価比較・reprには含めない。shadowの受け手(PR-2b-ii)だけが読む。
+    price_path_facts: PricePathFacts | None = field(default=None, compare=False, repr=False)
+    # --- Issue #878 PR-4a: 実判定の評価の経過の記録(ExitTrace。非永続・判定へ使わない) ---
+    # ★ 実判定の 1 回の評価からだけ取る ★(#720 の反実仮想の再評価は trace を作れない)。誰にも
+    # 読まれない(PR-4b の受け手だけが読む)。等価比較・reprには含めない。推奨の有無に依らず(HOLD
+    # でも)、実判定が走った後の経路で設定する。None = 『実判定が走らなかった』(snapshot 取得失敗・
+    # 不正入力 = 評価の前の data_error の経路)だけを意味する。PARTIAL の数量が確定しない
+    # fail-closed の経路は実判定の後なので、trace を持つ(判定を棄却したことと、trace の有無は別)。
+    exit_trace: ExitTrace | None = field(default=None, compare=False, repr=False)
+
+
+def _dividend_decrease_explanation(
+    dividend: DividendInfo, forecast_increase: bool | None
+) -> str | None:
+    """今期の予想配当が前期実績を下回る場合の表示文言を、確定情報と推定情報を
+    区別して構築する(要求仕様§9)。特別配当剥落を通常の減配として表示しない。
+    """
+    if forecast_increase is not False:
+        return None
+    if dividend.official_dividend_cut_announced:
+        return "普通配当が公式に減額されており、今期は普通配当の減配予想"
+    if dividend.dividend_breakdown_confirmed and dividend.special_dividend_expired is True:
+        return "前期の特別配当終了により総額が減少しており、普通配当の減配ではない"
+    return (
+        "年間配当総額の減少候補です(内訳が確認できないため、"
+        "普通配当の減配か特別配当の剥落かは未確認)"
+    )
+
+
+def _build_next_review_conditions(
+    result: ProfitTakingResult,
+    next_earnings_date: dt.date | None,
+    release_confirmation_state: EarningsReleaseConfirmationState = (
+        EarningsReleaseConfirmationState.NOT_APPLICABLE
+    ),
+) -> list[str]:
+    conditions: list[str] = []
+    sp = result.sell_prices
+    if sp.recommended_limit_price is not None:
+        p = sp.recommended_limit_price
+        if p.price_low is not None and p.price_high is not None:
+            conditions.append(f"{p.price_low}〜{p.price_high}円到達時に一部利確の要否を再評価")
+        else:
+            conditions.append(f"{p.price}円到達時に一部利確の要否を再評価")
+    conditions.append("業績下方修正")
+    conditions.append("EPS成長率鈍化")
+    if next_earnings_date is not None:
+        conditions.append(f"次回決算({next_earnings_date})後に適正価格を再計算")
+    elif release_confirmation_state == EarningsReleaseConfirmationState.DELAYED:
+        conditions.append(
+            "決算発表予定日を経過し、最新財務データの反映確認が長引いています。"
+            "確認でき次第、適正価格を再計算します"
+        )
+    elif release_confirmation_state == EarningsReleaseConfirmationState.AWAITING_CONFIRMATION:
+        conditions.append(
+            "決算発表予定日を経過していますが、無償データから実際の発表状況を確認できて"
+            "いません。最新財務データの更新を確認後に適正価格を再計算します"
+        )
+    else:
+        conditions.append("次回決算後に適正価格を再計算")
+    return conditions
+
+
+_INDUSTRY_SECTOR_LABELS: dict[ProfitTakingIndustrySector, str] = {
+    ProfitTakingIndustrySector.BANKING: "銀行業",
+    ProfitTakingIndustrySector.LEASING_FINANCE: "リース・金融業",
+    ProfitTakingIndustrySector.FOOD: "食品業",
+    ProfitTakingIndustrySector.CHEMICAL: "化学業",
+    ProfitTakingIndustrySector.GAS_UTILITY: "ガス・公益業",
+    ProfitTakingIndustrySector.SMALL_GROWTH: "小型成長株",
+    ProfitTakingIndustrySector.GENERAL: "一般事業会社",
+    ProfitTakingIndustrySector.UNKNOWN: "業種不明",
+}
+
+
+# Issue #21: usable_for_trading_judgment=False時に「なぜ価格基準の利確判定を
+# 使用できなかったか」を利用者向けに説明する文言。分岐は必ず構造化code
+# (FairValueUnusableReasonCode)で行い、自由文unusable_reasonをparseしない。
+_FAIR_VALUE_UNUSABLE_REASON_TEXTS: dict[FairValueUnusableReasonCode, str] = {
+    FairValueUnusableReasonCode.NO_VALID_METHODS: (
+        "適正価格を算出できる有効な評価手法がないため、価格基準の利確判定に使用していません"
+    ),
+    FairValueUnusableReasonCode.TOO_FEW_METHODS: (
+        "適正価格を算出できる評価手法が不足しているため、価格基準の利確判定に使用していません"
+    ),
+    FairValueUnusableReasonCode.METHOD_SPREAD_TOO_WIDE: (
+        "適正価格の算出手法間の乖離が大きいため、価格基準の利確判定に使用していません"
+    ),
+}
+
+
+def _profit_taking_fair_value_block_reason_text(
+    code: ProfitTakingFairValueBlockReasonCode, config: AppConfig
+) -> str:
+    """利確判定側の追加ゲートが想定上限価格を弾いた理由の利用者向け文言
+    (Issue #221 Phase 1)。
+
+    閾値は文言へハードコードせず、必ずconfigの実値を埋め込む
+    (configを変えたときに説明文だけが古い値のまま残らないようにする)。
+    """
+    cbj = config.profit_taking.condition_based_judgment
+    if code is ProfitTakingFairValueBlockReasonCode.METHOD_SPREAD_TOO_WIDE_FOR_ACTION:
+        threshold = cbj.max_fair_value_spread_ratio_for_partial
+        return (
+            f"適正価格の手法間の広がりが利確判定の基準({threshold:.2f}倍)を超えているため、"
+            "価格基準の利確判定に使用していません"
+        )
+    # Issue #471(USER決定 U-b): 下の4つの文言は、USER確定の原文どおり(nはconfigの実値)。
+    if code is ProfitTakingFairValueBlockReasonCode.TOO_FEW_METHODS_FOR_ACTION:
+        return (
+            "適正価格の根拠がまだ十分ではないため、今回は価格を基準にした利確判断を見送ります"
+            f"(必要:{cbj.min_fair_value_methods_for_partial}手法以上)"
+        )
+    if code is ProfitTakingFairValueBlockReasonCode.FAIR_VALUE_NOT_REFLECTING_LATEST_EARNINGS:
+        return (
+            "適正価格に最新の決算が反映されていないため、"
+            "今回は価格を基準にした利確判断を見送ります"
+        )
+    if code is ProfitTakingFairValueBlockReasonCode.FAIR_VALUE_EARNINGS_REFLECTION_UNKNOWN:
+        return (
+            "適正価格に最新の決算が反映されているか確認できないため、"
+            "今回は価格を基準にした利確判断を見送ります"
+        )
+    if code is ProfitTakingFairValueBlockReasonCode.EARNINGS_TOO_CLOSE_FOR_ACTION:
+        # 遮断の条件は「営業日数 < 下限」。n = 遮断される最大の営業日数(下限 - 1)。
+        # 表示と遮断の閾値を、この1か所(遮断側のconfig)へ一本化する(U-a)。
+        days = cbj.min_business_days_to_earnings_for_fair_value_action - 1
+        return f"次回決算まで{days}営業日以内のため、今回は価格を基準にした利確判断を見送ります"
+    raise ValueError(f"未対応の利確判定側ブロック理由コードです: {code}")
+
+
+def _build_not_yet_action_reasons(
+    result: ProfitTakingResult,
+    config: AppConfig,
+    trading_unit_feasibility: TradingUnitFeasibility,
+    fair_value_unusable_reason_code: FairValueUnusableReasonCode | None,
+    effective_recommendation_type: RecommendationType,
+) -> list[str]:
+    """「直ちに利確しない理由」を構築する(要求仕様§2)。
+
+    Issue #701(2026-10、USER確定方針): 本関数が返すのは、実際に判定を
+    遮断した事実(fair_value_unusable_reason_code・fair_value_action_block_
+    reason_code)と、実際に判定を弱めた事実(mitigating_downgrade_applied・
+    timing_downgrade_applied)、およびPARTIAL判定で実行制約が実際に該当した
+    事実のみとする。判定を変えていない参考情報(信頼度MEDIUM・業種別モデル
+    未適用・反対材料/上昇トレンドの単なる該当)は`_build_valuation_caveats()`
+    (「判断上の留意点」)へ分離した。表示層で旧閾値(unrealized_gain_
+    partial_pct)を再計算して理由を作ることも廃止した(config自身が
+    「判定レベルの決定には使わない」と明記しており、実際の判定はgain×upside
+    の2次元マトリクスのため、単一閾値での説明はそもそも不正確だった)。
+
+    Issue #21: fair_value_unusable_reason_code(usable_for_trading_judgment=
+    Falseのときのみ非None)がある場合、実際に価格基準の利確判定を遮断した
+    理由を表示する。
+
+    Issue #700: PARTIAL固有の実行制約(trading_unit_feasibility.
+    partial_sale_executable)は、effective_recommendation_type==
+    PARTIAL_PROFIT_TAKEの場合のみ評価する(OD-1 = PARTIAL_ONLY_GUARD)。
+    profit_taking_service.py内の既存のfail-closed不変条件(PARTIAL_PROFIT_
+    TAKEかつpartial_sale_executable=Falseの組は、本関数へ到達する前に
+    別経路でrecommendation=Noneとして弾かれる)により、現状this guardは
+    実質的にno-opだが、「D分類はPARTIAL専用」という契約をコード自身に
+    明示し、他所の不変条件1か所だけに依存しない防御的設計とする
+    (service.py内の既存方針「domain/service間の不変条件...個別経路の
+    ゲート漏れに依存しない防御」と同型)。
+
+    USER確定方針により、実際の遮断・降格理由が1つも無い場合に「適正価格
+    モデルには手法間のばらつき等の不確実性がある」を無条件で補完する旧来の
+    fallbackは廃止した。空リストをそのまま返す(呼び出し元・表示層は空リスト
+    を許容する)。
+    """
+    reasons: list[str] = []
+    if fair_value_unusable_reason_code is not None:
+        reasons.append(_FAIR_VALUE_UNUSABLE_REASON_TEXTS[fair_value_unusable_reason_code])
+    # Issue #221 Phase 1(U2-a): レンジ自体は使えるが、利確判定側のより厳しい
+    # 基準で弾かれた場合。Issue #21のcodeとは排他であり(domain側でNoneを返す)、
+    # 同じ事実が2行になることはない。
+    if result.fair_value_action_block_reason_code is not None:
+        reasons.append(
+            _profit_taking_fair_value_block_reason_text(
+                ProfitTakingFairValueBlockReasonCode(result.fair_value_action_block_reason_code),
+                config,
+            )
+        )
+    if (
+        effective_recommendation_type == RecommendationType.PARTIAL_PROFIT_TAKE
+        and not trading_unit_feasibility.partial_sale_executable
+    ):
+        reasons.append(
+            f"保有株数が売買単位({trading_unit_feasibility.trading_unit}株)に届かず"
+            "一部売却が実行できない"
+        )
+    # Issue #221 Phase 1(U2-b): 「該当した」ことではなく「実際に判定を1段下げた」
+    # ことを書く。
+    if result.mitigating_downgrade_applied:
+        reasons.append("上記の反対材料により、利確の判定を1段階弱めています")
+    if result.timing_downgrade_applied:
+        reasons.append("上昇トレンドの継続により、利確の判定を1段階弱めています")
+    if result.fair_value_used_as_sole_strong_basis:
+        reasons.append(
+            "適正価格モデルの手法間一致度・強気適正価格との関係が強い確信の水準に達していない"
+        )
+    return reasons
+
+
+def _build_valuation_caveats(
+    fair_value_overall_confidence: ConfidenceLevel | None,
+    industry_sector: ProfitTakingIndustrySector,
+    industry_model_applied: bool,
+    has_strong_counter_material: bool,
+    is_uptrend: bool,
+    mitigating_downgrade_applied: bool,
+    timing_downgrade_applied: bool,
+) -> list[str]:
+    """「判断上の留意点」: 判定を直接変更していないが利用者にとって有用な
+    参考情報(Issue #701、OD-5 = ACTUAL_REASON_VS_CAVEAT_SEPARATION)。
+
+    has_strong_counter_material/is_uptrendは、対応する実際のdowngradeが
+    既に適用されている場合(mitigating_downgrade_applied/timing_downgrade_
+    applied=True)、「まだ利確しない理由」側に同じ事実が既に出ているため、
+    ここでは重複させない(OD-2 = SUPPRESS_DUPLICATED_CAVEAT)。
+
+    partial_sale_executable==Falseはここに含めない(OD-1。execution/action
+    gateであり、どのcandidate/actionを実際に抑制したかによって意味が
+    変わるため、現状の構造では因果を判別できず、表示層で因果を推測しない。
+    詳細は#720〔causal trace Issue〕参照)。
+    """
+    caveats: list[str] = []
+    if fair_value_overall_confidence == ConfidenceLevel.MEDIUM:
+        caveats.append("適正価格モデルの信頼度がMEDIUM")
+    if not industry_model_applied:
+        # 利用者向け通知では内部設計用語(「専用モデルが未適用」)をそのまま使わず、
+        # 業種名が安全に取得できる場合だけそれを含めた自然な文言にする
+        # (2026-07仕様レビュー対応)。Recommendation.industry_sector/
+        # industry_model_appliedという構造化フィールド自体は変更しないため、
+        # 監査ログ側の詳細な内部理由は引き続き追跡できる。
+        if industry_sector in (
+            ProfitTakingIndustrySector.GENERAL,
+            ProfitTakingIndustrySector.UNKNOWN,
+        ):
+            caveats.append(
+                "現在の適正価格は汎用モデルによる参考値です"
+                if industry_sector == ProfitTakingIndustrySector.GENERAL
+                else "業種特性を反映した専用評価モデルではありません"
+            )
+        else:
+            label = _INDUSTRY_SECTOR_LABELS[industry_sector]
+            caveats.append(f"{label}の事業特性を十分に反映した専用評価モデルではありません")
+    if has_strong_counter_material and not mitigating_downgrade_applied:
+        caveats.append("増益・増配などの反対材料がある")
+    if is_uptrend and not timing_downgrade_applied:
+        caveats.append("強い上昇トレンドが継続")
+    return caveats
+
+
+_DEFAULT_EXECUTION_CONTEXT = ExecutionContext.normal()
+
+
+class ProfitTakingService:
+    def __init__(
+        self,
+        providers: ProviderBundle,
+        config: AppConfig,
+        audit_service: AuditService | None = None,
+        rule_version_service: RuleVersionService | None = None,
+        business_calendar: BusinessCalendar | None = None,
+        execution_context: ExecutionContext = _DEFAULT_EXECUTION_CONTEXT,
+        shadow_config: JudgmentSafetyShadowConfig | None = None,
+    ) -> None:
+        self._providers = providers
+        self._config = config
+        # Issue #160 shadow計測: 未指定なら専用loaderで1回だけ読む(不備はOFFへ縮退。例外なし)。
+        self._shadow_config = shadow_config or load_judgment_safety_shadow_config()
+        self._audit = audit_service or AuditService(execution_context=execution_context)
+        self._rule_version_service = rule_version_service or RuleVersionService()
+        self._calendar = business_calendar or BusinessCalendar.from_config(config.holiday_calendar)
+
+    def _active_rule_version(self) -> str:
+        return self._rule_version_service.get_active_version_or(RULE_VERSION_PLACEHOLDER)
+
+    def _profit_taking_input_invalid_outcome(
+        self,
+        holding: Holding,
+        exc: InvalidProfitTakingInputError,
+        now: dt.datetime,
+    ) -> ProfitTakingOutcome:
+        """取得原価が不正で利確判定が成立しない場合の処理(Issue #75)。
+
+        「判定できたうえでHOLD」と区別できる形で終える。具体的には
+        **Recommendationを生成せず**、`ProfitTakingOutcome.data_error` へ理由を載せる
+        (取得失敗時と同じ経路であり、holdings pipeline側が
+        `EvaluationStatus.DATA_INSUFFICIENT` / `NotificationStatus.DATA_INSUFFICIENT`
+        として記録する)。
+
+        監査は `data_error` のみを記録する。正常に評価を終えた銘柄と同じ
+        `input_values` / `output_values` を書くと、判定できなかった事実が
+        記録上で見分けられなくなるため。
+
+        個別のLINE通知は新設しない(同一の不正データが毎日通知されるのを避ける)。
+        """
+        message = (
+            f"{exc.reason}(平均取得単価・総取得金額は正である必要があります: "
+            f"{exc.field}={exc.value})"
+        )
+        logger.warning(
+            "profit_taking_input_invalid stock_code=%s field=%s value=%s reason=%s",
+            holding.stock_code,
+            exc.field,
+            exc.value,
+            exc.reason,
+        )
+        self._audit.record(
+            decision_type="profit_taking",
+            stock_code=holding.stock_code,
+            input_values={
+                "average_purchase_price": str(holding.average_purchase_price),
+                "total_purchase_amount": str(holding.total_purchase_amount),
+            },
+            calculation_formulas={},
+            output_values={
+                "data_error": message,
+                "invalid_input_field": exc.field,
+                "profit_taking_status": "NOT_EVALUATED",
+            },
+            data_sources=[],
+            rule_version=self._active_rule_version(),
+            timestamp=now,
+        )
+        return ProfitTakingOutcome(holding.stock_code, None, message)
+
+    def _fair_value_reflects_latest_earnings(
+        self, snapshot: StockSnapshot, evaluation_date: dt.date
+    ) -> bool | None:
+        """適正価格算出の入力が最新決算を反映しているかの簡易判定(要求仕様レビュー対応)。
+
+        手法別の入力日付を個別に厳密照合する手段が無いため、決算期末が一定期間内
+        (データ鮮度の許容日数を年換算した目安。400日は本Issueでは変更しない)で
+        あることを代理指標とする。決算期末を解決できない場合は判定不能。
+
+        Issue #509(#128②着手前ゲート): 決算期末の解決に
+        `snapshot.financial.fiscal_period_end`(年次決算期末)を直接参照していたが、
+        `domain/financial_freshness.py`(financial_freshness_integration.py経由)の
+        鮮度判定は同じ目的で`resolve_latest_financial_period_end()`を使い、
+        四半期実績(recent_quarters)を優先して解決している。直接参照だと、
+        年次決算後に四半期決算が新たに発表されていても検知できず(直接参照は
+        年次決算期末のまま古い値を返す)、両者が食い違う経路があった。
+        `resolve_latest_financial_period_end()`へ統一し、同じ基準日解決ロジックを
+        再利用する(独自の解決ロジックは作らない)。400日しきい値・age_daysの
+        算出方法(data_fetched_at基準)自体は変更しない(基準日の解決方法のみを
+        是正する。「Fair Valueを何日まで利用可能とみなすか」の再評価は別途)。
+        """
+        if not snapshot.fair_value_range.methods_used:
+            return None
+        fiscal_period_end = resolve_latest_financial_period_end(
+            snapshot.financial, evaluation_date
+        ).period_end
+        if fiscal_period_end is None:
+            return None
+        age_days = (snapshot.data_fetched_at.date() - fiscal_period_end).days
+        return 0 <= age_days <= 400
+
+    @staticmethod
+    def _profit_protection_basis_date(holding: Holding) -> dt.date:
+        """Profit Protectionのpeak探索基準日を算出する唯一の正本。
+
+        _compute_profit_protection_metrics()とanalyze()呼び出し側の両方が
+        同じ値を参照するため、ここに切り出す(重複実装を避ける)。判定ロジック
+        自体は変更しない。
+        """
+        basis_date = holding.last_purchase_date
+        if holding.last_sale_date is not None and holding.last_sale_date > basis_date:
+            basis_date = holding.last_sale_date
+        return basis_date
+
+    def _split_consistency_lookback_start(self, now: dt.datetime) -> dt.date:
+        """`check_split_consistency()`が内部で使う`lookback_start`と**同じ式**(値の一致をテストで固定)。
+
+        Issue #160 / #456(U9): 企業行動の取得開始日を、G4が必要とする窓まで広げるために使う。
+        `data_quality_service.py`は変更しないため、式はここで再現し、パリティをテストで固定する。
+        """
+        lookback_years = self._config.data_validation.split_consistency.lookback_years
+        return now.date() - dt.timedelta(days=365 * lookback_years)
+
+    def _fetch_corporate_action_events(
+        self,
+        holding: Holding,
+        now: dt.datetime,
+        *,
+        extra_since_floor: dt.date | None = None,
+    ) -> list[CorporateActionEvent]:
+        """企業行動eventsを**1回だけ**取得する(Issue #160 / #456 U7 OPTION_B_SINGLE_WIDENED_FETCH)。
+
+        取得開始日を`min(profit_protection_basis_date, lookback_start)`へ広げる。yfinance providerは
+        履歴を取得した後に`since`より古いeventsをローカルで除外するため、`since`を過去へ広げても外部通信は
+        増えない(追加のprovider呼び出しは0)。★ 「取得範囲を広げる」は
+        「Profit Protectionの判定対象期間を広げる」ではない: 既存の判定は、取得済みeventsを
+        `effective_date >= basis_date`で再filterする
+        (`_compute_profit_protection_metrics`)ため、結果は変わらない。shadowのmodeには依存しない
+        (単一のコード経路。MANAGER判断 D-b)。
+
+        `extra_since_floor`(Issue #698 PR-2b): basis_date_consistency判定が
+        必要とする窓(fundamental_basis_dateとprice_basis_dateの間)もこの
+        1回の取得で賄うため、指定された場合は取得開始日をさらにそこまで
+        広げる。取得範囲を広げるだけであり(上記と同じ「広く取得・個別に
+        filter」の原則)、Profit Protection/G4 shadow側の`effective_date >=
+        basis_date`フィルタ・挙動は一切変更しない。basis_date_consistency側は
+        呼び出し元で`events`引数へこの戻り値をそのまま渡し、再取得しない。
+        """
+        basis_date = self._profit_protection_basis_date(holding)
+        since = min(basis_date, self._split_consistency_lookback_start(now))
+        if extra_since_floor is not None:
+            since = min(since, extra_since_floor)
+        corporate_action_service = CorporateActionService(self._providers.corporate_action, now=now)
+        return corporate_action_service.get_effective_events(holding.stock_code, since)
+
+    def _compute_profit_protection_metrics(
+        self,
+        holding: Holding,
+        snapshot: StockSnapshot,
+        now: dt.datetime,
+        *,
+        events: list[CorporateActionEvent] | None = None,
+    ) -> ProfitProtectionMetrics:
+        """利益保全(Profit Protection)判定の指標を算出する(要求仕様§1・§9)。
+
+        peak探索の基準日にはholding.first_purchase_date(保有開始日)ではなく
+        holding.last_purchase_date(最終購入日)を使う(コードレビュー対応
+        2026-08、指摘1)。holding.average_purchase_priceは複数PurchaseLotの
+        加重平均であり、買い増しがあった場合は最終購入日以降にのみ現在の
+        平均取得単価が成立しているため、保有開始日を基準にすると買い増し前の
+        (現在の平均取得単価とは無関係な)高値をpeakに含めてしまい、実際には
+        存在しなかった含み益吐き出しを検出してしまう。
+
+        さらに、holding.last_sale_date(直近売却日、コードレビュー対応2026-08、
+        指摘A-2)がlast_purchase_dateより後であれば、そちらを基準日として使う。
+        これにより、Strong Profit Protectionが発火して一部売却された後、
+        「新しいpeakが形成される前の、同じ下落局面(peak/drawdown/giveback
+        がほぼ変わらない状態)」を根拠にPARTIALが連続発火することを防ぐ
+        (売却日以降の値動きだけを見る=売却時点までの上昇・下落は「既に
+        一部利確済みの材料」として扱い、新たな判定材料としては使わない)。
+        一部売却はFIFO(古いロットから消費)のため、last_purchase_dateより
+        新しい取得原価を生成せず、last_sale_date自体もaverage_purchase_price
+        の意味を壊さない(詳細はprofit_protection.pyのcompute_profit_
+        protection_metrics()のdocstring参照)。
+
+        新しいpeakが形成された後は、通常どおりbasis_date(=last_sale_date)
+        以降の値動きから再度peak/drawdown/givebackを計算するため、条件を
+        満たせば再度Strong PARTIALへ到達できる(再発火の完全禁止ではない)。
+        通常の(Profit Protection以外の理由による)売却も同様にbasis_dateを
+        進める。手動売却とProfit Protection起因売却を区別する信頼できる
+        手段が現在のデータモデルには無い(Transaction.recommendation_idは
+        任意項目であり、LINE会話型UIの売却フローはTransactionレコード自体を
+        作成しない)ため、あえて区別せず「直近の売却以降のみを見る」という
+        単純で安全側の規則に統一した(売却は常に「その時点までの値動きは
+        判断材料として使い切った」とみなす)。
+
+        基準日以降に株式分割・株式併合・無償割当があった場合、raw価格系列
+        (snapshot.bars、auto_adjust=False)と平均取得単価の調整基準が一致しない
+        可能性があるため、CorporateActionServiceで検知しデータ不足として
+        スキップする(誤ったPARTIALを出すより安全側)。基準日より前の分割等は
+        判定を妨げない(既に現在の平均取得単価に反映済みであるため)。
+        """
+        basis_date = self._profit_protection_basis_date(holding)
+        corporate_action_service = CorporateActionService(self._providers.corporate_action, now=now)
+        if events is None:
+            events = self._fetch_corporate_action_events(holding, now)
+        # ★ 取得は広い窓(basis_dateより古いeventsを含む)だが、既存の判定はここで
+        #   `effective_date >= basis_date`のeventsだけを見る(従来と同じ観測窓。意味を変えない)。
+        ratio_events = corporate_action_service.get_ratio_adjustment_events(events)
+        ratio_adjustment_event_since_basis = any(
+            e.effective_date is not None and e.effective_date >= basis_date for e in ratio_events
+        )
+        return compute_profit_protection_metrics(
+            bars=snapshot.bars,
+            current_price=snapshot.current_price,
+            average_purchase_price=holding.average_purchase_price,
+            basis_date=basis_date,
+            as_of_date=evaluation_date_jst(now),
+            ratio_adjustment_event_since_basis=ratio_adjustment_event_since_basis,
+            config=self._config.profit_taking.profit_protection,
+            business_calendar=self._calendar,
+        )
+
+    @staticmethod
+    def _price_path_facts(
+        metrics: ProfitProtectionMetrics, snapshot: StockSnapshot
+    ) -> PricePathFacts | None:
+        """価格の経路の事実(素の型 5 つ)を詰める(Issue #877 PR-2b-i)。★ 失敗してもNone ★。
+
+        指標とトレンドの分類を写すだけで、判定・保存・通知へ使わない(shadowの受け手だけが読む)。
+        組み立ての失敗(想定外のトレンド値など)は隔離し、判定の結果を変えない。ログには型名だけを
+        残す(値・例外の文面を出さない)。
+
+        ★ ログは保有 1 件ごとに最大 1 行(1 回の実行で件数ぶん出得る。#954 のように畳まない)★。
+        現実的に到達しない経路である: トレンドの写像は TrendClassification の全メンバーを
+        覆い(契約テストが全メンバーで固定)、組み立ては値の直接の代入だけで四則演算を持たない
+        ため、KeyError・演算の例外が起きる経路が無い。この隔離は将来の変更への保険である。
+        """
+        try:
+            return build_price_path_facts(metrics, snapshot.momentum.trend_classification)
+        except Exception as error:  # noqa: BLE001 - shadowの失敗を判定へ伝播させない
+            logger.warning("price path facts unavailable: error_type=%s", type(error).__name__)
+            return None
+
+    def _corporate_action_shadow_facts(
+        self,
+        recommendation: Recommendation,
+        holding: Holding,
+        snapshot: StockSnapshot,
+        events: list[CorporateActionEvent],
+        now: dt.datetime,
+    ) -> CorporateActionFacts | None:
+        """G4(shadow)の事実を作る。shadow OFF・G4の対象外はNone(評価しない)。
+
+        対象は保有の`FULL_PROFIT_TAKE`のみ(USER決定 U2)。**評価の失敗は本流へ伝播させない**
+        (`isolated_shadow_computation`。S-20)。`on_failure`は例外を出さない定数構築のみ。
+        """
+        if not self._shadow_config.enabled:
+            return None
+        if recommendation.recommendation_type is not RecommendationType.FULL_PROFIT_TAKE:
+            return None
+        return isolated_shadow_computation(
+            "judgment_safety_corporate_action",
+            lambda: self._build_corporate_action_facts(holding, snapshot, events, now),
+            lambda _exc: CorporateActionFacts("COMPUTATION_FAILED"),
+        )
+
+    def _build_corporate_action_facts(
+        self,
+        holding: Holding,
+        snapshot: StockSnapshot,
+        events: list[CorporateActionEvent],
+        now: dt.datetime,
+    ) -> CorporateActionFacts:
+        """既存の`check_split_consistency()`の結果を、`CorporateActionFacts`へ写す(U8)。
+
+        `unresolved_checks`は検査が実際に返した`check_name`である。向きの推定・descriptionの解析は
+        しない。**未知のcheck_name(将来の検査追加)は黙って捨てず`COMPUTATION_FAILED`にする**
+        (「未解決なし」と誤認しない。MANAGER判断 D-a)。
+        """
+        issues = check_split_consistency(
+            stock_code=holding.stock_code,
+            current_price=snapshot.current_price,
+            bars_close_by_date=[(bar.date, bar.close) for bar in snapshot.bars],
+            fair_value=snapshot.fair_value,
+            actual_annual_dividend_per_share=snapshot.dividend.actual_annual_dividend_per_share,
+            previous_fiscal_year_dividend_per_share=(
+                snapshot.dividend.previous_fiscal_year_dividend_per_share
+            ),
+            corporate_action_events=events,
+            holding=holding,
+            now=now,
+            config=self._config.data_validation.split_consistency,
+        )
+        known = set(get_args(CorporateActionIssueKind))
+        kinds: list[CorporateActionIssueKind] = []
+        for issue in issues:
+            if issue.check_name not in known:
+                return CorporateActionFacts("COMPUTATION_FAILED")
+            kinds.append(cast(CorporateActionIssueKind, issue.check_name))
+        return CorporateActionFacts("EVALUATED", tuple(kinds))
+
+    def _compute_confidence(
+        self,
+        result: ProfitTakingResult,
+        snapshot: StockSnapshot,
+        now: dt.datetime,
+        financial_freshness: FinancialFreshnessAssessment,
+    ) -> ConfidenceScoreResult:
+        fv_range = snapshot.fair_value_range
+        spread_ratio = (
+            float(fv_range.bull / fv_range.bear)
+            if fv_range.bear is not None and fv_range.bull is not None and fv_range.bear > 0
+            else None
+        )
+        days_to_earnings = snapshot.business_days_to_earnings
+        is_benefit_eligible = snapshot.benefit is not None
+        benefit_value_missing = is_benefit_eligible and snapshot.annual_benefit_value is None
+
+        factors = ConfidenceFactors(
+            data_freshness_days=(now - snapshot.data_fetched_at).days,
+            fair_value_methods_used_count=len(fv_range.methods_used),
+            fair_value_method_spread_ratio=spread_ratio,
+            days_to_next_earnings_business_days=days_to_earnings,
+            latest_quarter_fetched=bool(snapshot.quarterly_operating_incomes),
+            record_date_known=(
+                snapshot.dividend.dividend_record_date is not None
+                or (snapshot.benefit is not None and snapshot.benefit.benefit_ex_date is not None)
+            ),
+            key_metric_missing=snapshot.fair_value is None,
+            one_time_factors_identified=is_fundamentally_driven(snapshot.cashflow_decomposition),
+            counter_factors_evaluated=True,
+            benefit_eligible_but_value_unavailable=benefit_value_missing,
+            fair_value_is_sole_strong_basis=result.fair_value_used_as_sole_strong_basis,
+            # Issue #52 Phase B3-B2: 財務期間の鮮度。上のdata_freshness_days
+            # (取得時刻)とは別fieldであり、同じ事実を2箇所へ書かない。
+            # UNKNOWNは「古いと確認できていない」ためFalseとする。
+            financial_data_freshness_stale=financial_freshness.is_stale,
+        )
+        return compute_confidence(factors, self._config.confidence)
+
+    def analyze(
+        self, holding: Holding, now: dt.datetime, snapshot: StockSnapshot | None = None
+    ) -> ProfitTakingOutcome:
+        """snapshotを渡すと再取得を省略する(sell_signalと同一銘柄を二重に取得する
+        無駄を避けるため、呼び出し側で一度だけ取得して両方に渡すことを想定)。"""
+        error: str | None = None
+        if snapshot is None:
+            snapshot, error = build_stock_snapshot(
+                self._providers,
+                holding.stock_code,
+                now,
+                self._config,
+                business_calendar=self._calendar,
+            )
+        if snapshot is None:
+            self._audit.record(
+                decision_type="profit_taking",
+                stock_code=holding.stock_code,
+                input_values={},
+                calculation_formulas={},
+                output_values={"data_error": error},
+                data_sources=[],
+                rule_version=self._active_rule_version(),
+                timestamp=now,
+            )
+            return ProfitTakingOutcome(holding.stock_code, None, error)
+
+        # Issue #66 F-L4: 評価日(JST)はこの評価の**最初**に1回だけ確定させ、
+        # 以降はこの値だけを使う。従来は下の期間末解決の直前(旧:713付近)で
+        # 計算しており、それより前にある`_is_long_term_benefit_imminent()`が
+        # `now.date()`(=UTC暦日)を独自に使っていた。定期実行は08:00 JST
+        # (=前日23:00 UTC)であるため、UTC暦日は**毎回JSTの前日**になり、
+        # 長期優待の条件達成日までの残日数が常に1日ずれていた
+        # (緩和要因の成立/不成立が1日ずれ、最終Actionが変わりうる)。
+        # 「各所で個別にnow.date()/evaluation_date_jst(now)を再計算しない」という
+        # 既存方針(下記コメント)の対象へ、本helperを含める。
+        evaluation_date = evaluation_date_jst(now)
+
+        mitigating_inputs = MitigatingFactorInputs(
+            fair_value_rising_with_earnings_growth=(
+                snapshot.fair_value is not None
+                and not snapshot.severe_earnings_decline
+                and all(
+                    snapshot.quarterly_operating_incomes[i]
+                    >= snapshot.quarterly_operating_incomes[i - 1]
+                    for i in range(1, len(snapshot.quarterly_operating_incomes))
+                )
+                if len(snapshot.quarterly_operating_incomes) >= 2
+                else False
+            ),
+            # Issue #55 Phase B-2(N5): `or 0` で不明(None)を0年へ潰さない。
+            # 潰すと監査ログ(input_values.consecutive_dividend_increase_years)上で
+            # 「0年であることが確定」と「取得できていない」が区別できなくなる。
+            # 判定への影響はない(いずれも緩和要因に該当しない)。
+            continuous_dividend_increase_years=(
+                snapshot.dividend.consecutive_dividend_increase_years
+            ),
+            is_progressive_or_doe_policy=snapshot.dividend.is_progressive_or_doe_policy,
+            long_term_holding_benefit_imminent=_is_long_term_benefit_imminent(
+                holding, snapshot.benefit, evaluation_date, self._config
+            ),
+            few_reinvestment_alternatives=False,  # 将来: 買い候補件数から動的算出する拡張ポイント
+            is_nisa_account=holding.account_type == AccountType.NISA,
+        )
+
+        days_to_earnings = snapshot.business_days_to_earnings
+
+        trading_unit_config = self._config.profit_taking.trading_unit
+        trading_unit_feasibility = evaluate_trading_unit_feasibility(
+            shares=holding.shares,
+            trading_unit=trading_unit_config.default_trading_unit,
+            odd_lot_trading_available=trading_unit_config.default_odd_lot_trading_available,
+        )
+
+        is_growth_stock = StockType.GROWTH in snapshot.stock_type_classification.types
+        industry_sector = classify_profit_taking_industry_sector(
+            snapshot.financial.industry, snapshot.financial.sector, is_growth_stock
+        )
+        # 現行データソースでは業種別専用モデル(CET1比率・DOE等)を安定取得できないため、
+        # 常にFalse(要求仕様§7: 未対応の場合はHIGH信頼度・適正価格単独でのPARTIAL以上を禁止)。
+        industry_model_applied = False
+        # 再コードレビュー対応(2026-08、指摘5): ceiling_price利用可否の金融業ゲート
+        # (_fair_value_action_usable())には、profit_taking_industry.py(銀行・
+        # リース金融のみ識別)ではなく、既存のfinancial_industry.py(保険・証券等
+        # 金融業全般をキーワードで識別し、未知の値は安全側にUNKNOWNとする三値分類)を
+        # 使う。industry_sector(表示・既存ProfitTaking用の業種区分)自体は変更しない。
+        industry_classification = classify_industry(
+            snapshot.financial.sector, snapshot.financial.industry
+        ).classification
+
+        # Issue #55 Phase B-2(N6): 連続増配年数のしきい値をここへハードコード
+        # (`>= 2`)せず、config を唯一のtruth sourceにする
+        # (同じ「何年で連続増配とみなすか」を2箇所で二重管理しない)。
+        # enabled: true のとき1以上であることは起動時検証が保証する。
+        # 年数不明(None)は該当させない(従来 `or 0` と判定結果は同じ)。
+        min_increase_years = (
+            self._config.profit_taking.mitigating_factors.continuous_dividend_increase.min_consecutive_years
+        )
+        consecutive_years = snapshot.dividend.consecutive_dividend_increase_years
+        has_strong_counter_material = (
+            snapshot.dividend.dividend_comparison_outcome
+            == DividendComparisonOutcome.DIVIDEND_INCREASE
+            or (
+                min_increase_years is not None
+                and consecutive_years is not None
+                and consecutive_years >= min_increase_years
+            )
+        )
+
+        # Issue #698 PR-2b(E3採用。MANAGER決定issuecomment-5961781383):
+        # 財務指標側基準日は、共有pipelineに既に無条件で設定済みの
+        # snapshot.financial_input_provenance.fiscal_period_endを使う
+        # (buy_signal_serviceが自前のvaluation_summaryで使うのと同じ値)。
+        # 共有pipeline・S-05(domain/valuation/)・financial_input_provenance.py
+        # 本体はいずれも変更しない(既存fieldを読むだけ)。
+        # 「該当手法が無ければ記録しない」という既存方針は維持するため、
+        # fair_value_range.methods_usedが空の場合は窓を広げず、
+        # basis_date_consistency自体も記録しない(「取得できない情報を
+        # 推測で補完しない」要求仕様12節)。
+        has_applicable_valuation_method = bool(snapshot.fair_value_range.methods_used)
+        fiscal_period_end = (
+            snapshot.financial_input_provenance.fiscal_period_end
+            if snapshot.financial_input_provenance is not None
+            else None
+        )
+        fundamental_basis_date = fiscal_period_end if has_applicable_valuation_method else None
+
+        # Issue #160 / #456: 企業行動eventsの1回の取得を、Profit ProtectionとG4(shadow)で共用する。
+        corporate_action_events = self._fetch_corporate_action_events(
+            holding, now, extra_since_floor=fundamental_basis_date
+        )
+        profit_protection_metrics = self._compute_profit_protection_metrics(
+            holding, snapshot, now, events=corporate_action_events
+        )
+
+        # Issue #698 PR-2b: valuation経路(fair_value_rangeがEPS/BPS/DPS等
+        # 財務指標を使う手法)で、価格側と財務指標側の基準日が分割・併合・
+        # 無償割当をまたいでいないかを記録する(記録のみ。抑止はしない。
+        # 既存の判定結果は一切変更しない)。上で取得済みのcorporate_action_events
+        # をそのまま渡すため(events=Noneにしない)、この判定自体は追加の
+        # provider呼び出しを発生させない。
+        # fail-soft(レビュー対応issuecomment-5961092047 F-1):
+        # classify_basis_date_consistency()はprovider取得失敗時に例外を
+        # 送出する契約を変更していない(上のcorporate_action_events取得が
+        # 既に成功した後にのみ本ブロックへ到達するため、provider障害時は
+        # 通常ここへ到達しない。その場合はProfit Protection自体が従来どおり
+        # 例外を送出する〔本PRで変更しない既存挙動〕)。それでも本判定固有の
+        # 処理で想定外の例外が起きた場合に、利確判定・通知・保存を止めない
+        # よう、本判定だけUNDETERMINEDへfail-softする。
+        basis_date_consistency: str | None = None
+        basis_date_consistency_check_failed = False
+        if has_applicable_valuation_method and fundamental_basis_date is None:
+            # 該当手法はあるが財務側基準日(fiscal_period_end)自体が不明。
+            # HANAKO確定待ち(issuecomment-5961781383): 「記録なし」ではなく
+            # 安全側のUNDETERMINEDへ暫定で倒す(「確認できない場合はUNDETERMINED」
+            # という既存設計哲学〔要求仕様12節・USER決定OD-3〕と一貫させるため)。
+            # 「記録なし」が確定した場合は、この分岐を削除するだけでよい。
+            basis_date_consistency = BasisDateConsistency.UNDETERMINED.value
+        elif fundamental_basis_date is not None:
+            try:
+                basis_date_consistency_service = CorporateActionService(
+                    self._providers.corporate_action, now=now
+                )
+                basis_date_consistency = (
+                    basis_date_consistency_service.classify_basis_date_consistency(
+                        holding.stock_code,
+                        price_basis_date=evaluation_date,
+                        fundamental_basis_date=fundamental_basis_date,
+                        events=corporate_action_events,
+                    ).value
+                )
+            except Exception:  # noqa: BLE001 - 記録のみの付随処理。失敗しても利確判定・通知・保存を止めない
+                logger.exception(
+                    "basis_date_consistency check failed stock_code=%s", holding.stock_code
+                )
+                basis_date_consistency = BasisDateConsistency.UNDETERMINED.value
+                basis_date_consistency_check_failed = True
+
+        # Issue #53 Phase B2: accounting_or_scandal_or_delisting_riskはここで一切
+        # 設定せず、既定のFalseのままとする(開示情報を取得できなかったことを
+        # 売却リスクへ変換しない。EDINET障害を売却理由にしてはならない)。
+        # guidance_revision_disclosedも、取得不能時はsnapshot.disclosuresが空となり
+        # False = 「修正開示を検出していない」となる(リスク側へ倒れない)。
+        condition_inputs = ProfitTakingConditionInputs(
+            stock_types=snapshot.stock_type_classification.types,
+            fair_value_range=snapshot.fair_value_range,
+            momentum=snapshot.momentum,
+            dividend_comparison_outcome=snapshot.dividend.dividend_comparison_outcome,
+            cashflow_fundamentally_driven=is_fundamentally_driven(snapshot.cashflow_decomposition),
+            guidance_revision_disclosed=has_guidance_revision_disclosure(snapshot.disclosures),
+            severe_earnings_decline=snapshot.severe_earnings_decline,
+            profit_target_price=holding.profit_target_price,
+            profit_target_rate=holding.profit_target_rate,
+            fair_value_reflects_latest_earnings=self._fair_value_reflects_latest_earnings(
+                snapshot, evaluation_date
+            ),
+            industry_model_applied=industry_model_applied,
+            industry_sector=industry_sector,
+            industry_classification=industry_classification,
+            partial_sale_executable=trading_unit_feasibility.partial_sale_executable,
+            days_to_next_earnings_business_days=days_to_earnings,
+            has_strong_counter_material=has_strong_counter_material,
+            profit_protection=profit_protection_metrics,
+            profit_protection_basis_date=self._profit_protection_basis_date(holding),
+        )
+
+        is_benefit_eligible = snapshot.benefit is not None
+
+        def _evaluate(
+            inputs: ProfitTakingConditionInputs,
+            *,
+            trace_sink: list[ExitTrace] | None = None,
+        ) -> ProfitTakingResult:
+            # 実判定(下)と、Issue #720のgate因果追跡(反実仮想の再評価)の両方が
+            # 同じ呼び出しを使う(condition_inputs以外の引数を2か所で別々に書いて
+            # 食い違わせないため)。trace_sink(Issue #878 PR-4a)は実判定の 1 回だけが渡す
+            # (反実仮想は inputs 1 つで呼ぶため sink を渡せない = 構造的に trace を作れない)。
+            return evaluate_profit_taking(
+                current_price=snapshot.current_price,
+                average_purchase_price=holding.average_purchase_price,
+                shares=holding.shares,
+                total_purchase_amount=holding.total_purchase_amount,
+                cumulative_dividend_received=holding.cumulative_dividend_received,
+                cumulative_benefit_value_received=holding.cumulative_benefit_value_received,
+                current_total_yield_pct=snapshot.total_yield_pct,
+                forecast_annual_dividend_per_share=(
+                    snapshot.dividend.forecast_annual_dividend_per_share
+                ),
+                mitigating_inputs=mitigating_inputs,
+                config=self._config.profit_taking,
+                condition_inputs=inputs,
+                annual_benefit_value_at_min_lot=snapshot.annual_benefit_value,
+                benefit_min_shares_required=(
+                    snapshot.benefit.min_shares_required if snapshot.benefit is not None else None
+                ),
+                is_benefit_eligible=is_benefit_eligible,
+                trace_sink=trace_sink,
+            )
+
+        real_trace_sink: list[ExitTrace] = []
+        try:
+            result = _evaluate(condition_inputs, trace_sink=real_trace_sink)
+        except InvalidProfitTakingInputError as exc:
+            # --- Issue #75(2026-08-30): 取得原価が不正な保有の fail-close ---
+            # 以前はdomain側が不正入力を含み損益率0.0%へ潰していたため、
+            # 適正価格を大きく超過していても「利確条件に該当しなかった」として
+            # 沈黙で抑止され、運用者がHOLDと区別できなかった。
+            # ここでは判定不能をそのまま保ち、**Recommendationを生成しない**。
+            # 通常の利確判定を終えた銘柄として監査へ記録することもしない
+            # (正常評価と混同させない。既存のdata_error経路と同じ扱いにする)。
+            return self._profit_taking_input_invalid_outcome(holding, exc, now)
+
+        # 決算直前の判定抑制(要求仕様§4)。上場廃止決定・債務超過公式確認等の
+        # 一次情報確認済みの即時criticalが検出されている場合は抑制しない。
+        is_confirmed_critical = (
+            condition_inputs.accounting_or_scandal_or_delisting_risk
+            or condition_inputs.investment_premise_broken
+        )
+        suppression_days = self._config.earnings_window.profit_taking_suppression_business_days
+        # 決算発表確認待ち(コードレビュー対応: 明治ホールディングス(2269)事例)。
+        # 決算予定日を経過したが無償データで発表実績を確認できない期間は、
+        # 財務データが更新されるまで通常のPARTIAL/FULL_PROFIT_TAKE提案を保留する。
+        # 評価日(JST)は1回だけ計算し、期間末解決・関連性判定の両方で使い回す
+        # (デプロイ前対応: 各所で個別にnow.date()/evaluation_date_jst(now)を
+        # 再計算しない)。
+        # Issue #66 F-L4: 確定はこのメソッドの冒頭へ移した(緩和要因の判定が
+        # ここより前にあり、そちらが取り残されていたため)。
+        # 決算反映確認には年次のfiscal_period_endではなく、recent_quartersを
+        # 優先した最新財務期間末を使う(デプロイ前対応: 四半期決算の反映を
+        # 検知できないバグの修正)。評価日より未来のperiod_endは候補から除外する。
+        resolved_period = resolve_latest_financial_period_end(snapshot.financial, evaluation_date)
+        release_confirmation_state = resolve_earnings_release_confirmation(
+            snapshot.earnings_date_status,
+            snapshot.earnings_date_raw,
+            resolved_period.period_end,
+            snapshot.financial.source.fetched_at,
+            now,
+            self._config.earnings_window,
+        )
+        # 過去の決算予定日が現在の判断にまだ関連するか(デプロイ前対応: 何か月も
+        # 前の過去日で無期限に通常判定を止めないための安全策)。
+        decision_relevance = resolve_earnings_decision_relevance(
+            snapshot.earnings_date_status,
+            snapshot.earnings_date_raw,
+            release_confirmation_state,
+            evaluation_date,
+            self._config.earnings_window,
+        )
+        effective_recommendation_type = result.recommendation_type
+        effective_sell_prices = result.sell_prices
+        if (
+            not is_confirmed_critical
+            and days_to_earnings is not None
+            and days_to_earnings <= suppression_days
+        ):
+            if effective_recommendation_type in _EARNINGS_SUPPRESSIBLE_TO_REVIEW:
+                effective_recommendation_type = RecommendationType.REVIEW_BEFORE_EARNINGS
+                effective_sell_prices = SellPriceLevels()
+            elif effective_recommendation_type == RecommendationType.WATCH:
+                effective_recommendation_type = RecommendationType.WATCH_BEFORE_EARNINGS
+        elif (
+            not is_confirmed_critical
+            and release_confirmation_state
+            in (
+                EarningsReleaseConfirmationState.AWAITING_CONFIRMATION,
+                EarningsReleaseConfirmationState.DELAYED,
+            )
+            and decision_relevance == EarningsDecisionRelevance.RELEVANT
+            and effective_recommendation_type in _EARNINGS_SUPPRESSIBLE_TO_REVIEW
+        ):
+            effective_recommendation_type = RecommendationType.REVIEW_AFTER_EARNINGS
+            effective_sell_prices = SellPriceLevels()
+
+        # PARTIAL成立後の売却数量決定(コードレビュー対応2026-08、指摘Part B)。
+        # 「売るべきか」(上記のeffective_recommendation_type)とは分離し、
+        # 実際にPARTIAL_PROFIT_TAKEが成立した場合のみ、判定強度(sell_intensity、
+        # profit_taking.pyのorigin+momentumから決定済み)に応じた比率で売却株数を
+        # 算出する。決算直前抑制でREVIEW等へ格下げされた場合は算出しない
+        # (result.sell_intensityはfinal_action基準で計算されており、
+        # effective_recommendation_typeでの格下げを知らないため、ここで
+        # 明示的にNoneへ戻す)。
+        sell_intensity = result.sell_intensity
+        suggested_sell_shares: int | None = None
+        suggested_sell_ratio: float | None = None
+        if effective_recommendation_type == RecommendationType.PARTIAL_PROFIT_TAKE:
+            if sell_intensity is not None and trading_unit_feasibility.partial_sale_executable:
+                ratios = self._config.profit_taking.partial_sell_ratios
+                target_ratio = {
+                    SellIntensity.LIGHT: ratios.light,
+                    SellIntensity.STANDARD: ratios.standard,
+                    SellIntensity.STRONG: ratios.strong,
+                    SellIntensity.VERY_STRONG: ratios.very_strong,
+                }[sell_intensity]
+                suggestion = compute_suggested_sell_shares(
+                    shares=holding.shares,
+                    trading_unit=trading_unit_feasibility.trading_unit,
+                    odd_lot_trading_available=trading_unit_feasibility.odd_lot_trading_available,
+                    target_sell_ratio=target_ratio,
+                )
+                if suggestion is not None:
+                    suggested_sell_shares = suggestion.shares
+                    suggested_sell_ratio = suggestion.ratio
+        else:
+            sell_intensity = None
+
+        # Issue #52 Phase B3-B2: 既に解決済みの期間末・評価日をそのまま渡し、
+        # 同じ値を二度計算しない(判定に使う値を1つに保つ)。
+        financial_freshness = assess_financial_freshness(
+            snapshot.financial,
+            now,
+            self._config,
+            latest_financial_period_end=resolved_period.period_end,
+            evaluation_date=evaluation_date,
+        )
+        confidence_result = self._compute_confidence(result, snapshot, now, financial_freshness)
+
+        # Issue #720: 利確gateが実際に候補を抑制したかの因果追跡(観測のみ。
+        # 判定結果・通知・Recommendationは一切変えない)。遮断側の入力を1つずつ
+        # 通過側へ置換して同じ純粋関数(_evaluate)で再評価する。S-20の
+        # isolated_shadow_computation()で隔離し、失敗しても利確判定・通知・保存を
+        # 止めず、「算出できなかった」ことを記録側へ残す(空listへ偽装しない)。
+        # ★ industry_model_appliedは上で定数Falseを渡している(現状の配線)ため、
+        # この入力は全保有で常に遮断側となり、INDUSTRY_MODEL_NOT_APPLIEDの記録が
+        # 必ず1件入る(業種モデルの遮断が至る所で起きているという発見ではない)。
+        # 遮断が他に1つでもあればJOINT判定の再評価も走る(詳細はgate_trace module)。
+        gate_trace = isolated_shadow_computation(
+            "profit_taking_gate_trace",
+            lambda: build_profit_taking_gate_trace(
+                condition_inputs,
+                _evaluate,
+                result,
+                self._config.profit_taking.condition_based_judgment.min_business_days_to_earnings_for_fair_value_action,
+            ),
+            lambda exc: [
+                {
+                    "shadow_state": SHADOW_STATE_COMPUTATION_FAILED,
+                    "error_type": type(exc).__name__,
+                }
+            ],
+        )
+
+        audit_entry = self._audit.record(
+            decision_type="profit_taking",
+            stock_code=holding.stock_code,
+            input_values={
+                "current_price": str(snapshot.current_price),
+                "average_purchase_price": str(holding.average_purchase_price),
+                "shares": holding.shares,
+                "fair_value": (
+                    str(snapshot.fair_value) if snapshot.fair_value is not None else None
+                ),
+                "current_total_yield_pct": snapshot.total_yield_pct,
+                "consecutive_dividend_increase_years": (
+                    mitigating_inputs.continuous_dividend_increase_years
+                ),
+                "is_progressive_or_doe_policy": mitigating_inputs.is_progressive_or_doe_policy,
+                "is_nisa_account": mitigating_inputs.is_nisa_account,
+            },
+            calculation_formulas={
+                "unrealized_pnl_pct": "(current_price / average_purchase_price - 1) * 100",
+                "total_return_pct": (
+                    "(unrealized_pnl + cumulative_dividend + cumulative_benefit) "
+                    "/ total_purchase_amount * 100"
+                ),
+            },
+            output_values={
+                # Issue #698 PR-2b: 記録のみ(抑止はしない)。
+                "basis_date_consistency": basis_date_consistency,
+                "basis_date_consistency_check_failed": basis_date_consistency_check_failed,
+                # Issue #720: 記録のみ(判定・通知・Recommendationは変えない)。
+                "profit_taking_gate_trace": gate_trace,
+                "recommendation_type": result.recommendation_type.value,
+                "effective_recommendation_type": effective_recommendation_type.value,
+                "fundamental_action": result.fundamental_action.value,
+                "timing_action": result.timing_action.value,
+                "final_action": result.final_action.value,
+                "industry_sector": industry_sector.value,
+                "days_to_next_earnings_business_days": days_to_earnings,
+                "trading_unit_partial_sale_executable": (
+                    trading_unit_feasibility.partial_sale_executable
+                ),
+                "sell_intensity": sell_intensity.value if sell_intensity is not None else None,
+                "suggested_sell_shares": suggested_sell_shares,
+                "suggested_sell_ratio": suggested_sell_ratio,
+                "current_price_vs_neutral_fair_value_pct": (
+                    result.current_price_vs_neutral_fair_value_pct
+                ),
+                "current_price_vs_bull_fair_value_pct": (
+                    result.current_price_vs_bull_fair_value_pct
+                ),
+                "triggered_reasons": result.triggered_reasons,
+                "mitigating_factors_applied": result.mitigating_factors_applied,
+                "unrealized_pnl_pct": result.pnl.unrealized_pnl_pct,
+                "total_return_pct": result.pnl.total_return_pct,
+                # --- Issue #419: 純粋HOLD(利確を見送った)の理由を、後から銘柄分析で表示する
+                # ための構造化事実。値は比率・件数・bool・codeのみで、金額・株数を運ぶ
+                # fieldは持たない(表示側はこの許可リストのキーだけを読む)。
+                # hold_reasons(固定1文)や理由文ではなく事実を保存する理由はIssue #419。
+                "gain_watch_threshold_pct": (
+                    self._config.profit_taking.thresholds.unrealized_gain_watch_pct
+                ),
+                "upside_pct": result.upside_pct,
+                "independent_condition_count": result.independent_condition_count,
+                "fair_value_action_usable": result.fair_value_action_usable,
+                "fair_value_action_block_reason_code": (
+                    result.fair_value_action_block_reason_code
+                ),
+                # Issue #471(USER決定 U-c): 利用者表示は最初の原因1つ、監査は全原因。
+                "fair_value_action_block_reason_codes": list(
+                    result.fair_value_action_block_reason_codes
+                ),
+                "fair_value_unusable_reason_code": (
+                    snapshot.fair_value_range.unusable_reason_code.value
+                    if snapshot.fair_value_range.unusable_reason_code is not None
+                    else None
+                ),
+                "confidence": confidence_result.level.value,
+                "confidence_score": confidence_result.score,
+                "confidence_reasons": confidence_result.reasons_not_high,
+                # --- Issue #52 Phase B3-B2: 財務データの期間鮮度 ---
+                **financial_freshness.audit_values(self._config),
+                # --- デプロイ前対応: 決算反映確認の由来を監査可能にする ---
+                "resolved_financial_period_end": (
+                    resolved_period.period_end.isoformat()
+                    if resolved_period.period_end is not None
+                    else None
+                ),
+                "financial_period_end_source": resolved_period.source.value,
+                "recent_periods_source": snapshot.financial.recent_periods_source.value,
+                "earnings_date_raw": (
+                    snapshot.earnings_date_raw.isoformat()
+                    if snapshot.earnings_date_raw is not None
+                    else None
+                ),
+                "financial_fetched_at": snapshot.financial.source.fetched_at.isoformat(),
+                "release_confirmation_state": release_confirmation_state.value,
+                "earnings_decision_relevance": decision_relevance.value,
+                "profit_protection_signal": result.profit_protection_signal,
+                "profit_protection_basis_date": (
+                    result.profit_protection_basis_date.isoformat()
+                    if result.profit_protection_basis_date is not None
+                    else None
+                ),
+                "profit_protection_peak_price": (
+                    str(result.profit_protection_peak_price)
+                    if result.profit_protection_peak_price is not None
+                    else None
+                ),
+                "profit_protection_peak_date": (
+                    result.profit_protection_peak_date.isoformat()
+                    if result.profit_protection_peak_date is not None
+                    else None
+                ),
+                "profit_protection_peak_gain_pct": result.profit_protection_peak_gain_pct,
+                "profit_protection_current_gain_pct": result.profit_protection_current_gain_pct,
+                "profit_protection_drawdown_from_peak_pct": (
+                    result.profit_protection_drawdown_from_peak_pct
+                ),
+                "profit_protection_gain_giveback_ratio_pct": (
+                    result.profit_protection_gain_giveback_ratio_pct
+                ),
+                "profit_protection_insufficient_reason": (
+                    result.profit_protection_insufficient_reason
+                ),
+            },
+            data_sources=list(snapshot.data_sources),
+            rule_version=self._active_rule_version(),
+            timestamp=now,
+            fair_value_results=[
+                {
+                    "method": m.method,
+                    "fair_value": str(m.fair_value) if m.fair_value is not None else None,
+                    "confidence": m.confidence.value,
+                    "exclusion_reason": m.exclusion_reason,
+                }
+                for m in snapshot.fair_value_range.methods_used
+            ],
+            triggered_rules=result.triggered_reasons,
+            suppressed_rules=result.mitigating_factors_applied,
+        )
+
+        # コードレビュー対応(2026-08、PARTIAL数量欠落不具合の再発防止): domain層
+        # (evaluate_profit_taking())が将来別の経路を追加した場合でも、「PARTIAL_
+        # PROFIT_TAKEとして通知されるのに何株売るべきか確定しない」状態が
+        # Service層より先(通知)へ到達しないことをここで最終確認する
+        # (domain/service間の不変条件、個別経路のゲート漏れに依存しない防御)。
+        # 上のself._audit.record()は既にこの時点のsuggested_sell_shares/ratio等
+        # 診断値を記録済みのため、追加の監査呼び出しは行わない。違反時は
+        # snapshot取得失敗時(429行目)と全く同じ「recommendation=None、data_error
+        # 設定」パターンで1銘柄のみをdata_insufficient相当として扱い、Lambda全体は
+        # 落とさない(formatter側での数量補完・新規例外クラスの追加は行わない)。
+        if effective_recommendation_type == RecommendationType.PARTIAL_PROFIT_TAKE and (
+            not trading_unit_feasibility.partial_sale_executable
+            or sell_intensity is None
+            or suggested_sell_shares is None
+            or suggested_sell_shares <= 0
+            or suggested_sell_ratio is None
+            or not (0 < suggested_sell_ratio < 1)
+        ):
+            return ProfitTakingOutcome(
+                holding.stock_code,
+                None,
+                "PARTIAL_PROFIT_TAKEなのに一部売却数量が確定できません"
+                "(domain/service間の不変条件違反、fail-closed)",
+                # 実判定は走った後(上の `_evaluate`)なので trace は在る。None のままにすると
+                # 『判定が走らなかった』と『走ったが fail-closed で棄却した』が同じ印になる
+                exit_trace=real_trace_sink[0] if real_trace_sink else None,
+            )
+
+        if effective_recommendation_type == RecommendationType.HOLD:
+            return ProfitTakingOutcome(
+                holding.stock_code,
+                None,
+                None,
+                audit_id=audit_entry.audit_id,
+                price_path_facts=self._price_path_facts(profit_protection_metrics, snapshot),
+                exit_trace=real_trace_sink[0] if real_trace_sink else None,
+            )
+
+        dividend = snapshot.dividend
+        forecast_increase = None
+        forecast_increase_rate = None
+        if (
+            dividend.forecast_annual_dividend_per_share is not None
+            and dividend.actual_annual_dividend_per_share is not None
+            and dividend.actual_annual_dividend_per_share > 0
+        ):
+            forecast_increase = (
+                dividend.forecast_annual_dividend_per_share
+                > dividend.actual_annual_dividend_per_share
+            )
+            forecast_increase_rate = (
+                float(
+                    dividend.forecast_annual_dividend_per_share
+                    / dividend.actual_annual_dividend_per_share
+                    - 1
+                )
+                * 100
+            )
+        dividend_decrease_explanation = _dividend_decrease_explanation(dividend, forecast_increase)
+
+        fv_range = snapshot.fair_value_range
+        spread_ratio = (
+            float(fv_range.bull / fv_range.bear)
+            if fv_range.bear is not None and fv_range.bull is not None and fv_range.bear > 0
+            else None
+        )
+
+        # 判定精度向上機能次フェーズSTEP2: Exit Price Range(Shadow計測)。
+        # ProfitTaking判定が実際にRecommendationを構築すると決まった時点
+        # (HOLD等の早期returnより後)でのみ計算する。既存の早期return・
+        # 判定条件分岐の実行順は一切変更しない。
+        # レビュー対応(Issue #384 PR-7): exit_price_range自体もDecisionSnapshot
+        # 記録専用のShadow計測であり(exit_price_range.pyモジュールdocstring
+        # 「既存のSELL(legacy)判定・ProfitTaking判定[sell_prices]には一切依存
+        # せず、また一切影響しない」)、sell_prices(effective_sell_prices)は
+        # 既に確定済み(上記)であるため対象外にはならない。返り値がdict以外
+        # (ExitPriceRangeResult)のためisolated_shadow_computation()(PR-3で
+        # 追加、dict以外用)を使う。
+        exit_price_range = isolated_shadow_computation(
+            "exit_price_range",
+            lambda: evaluate_exit_price_range(
+                snapshot.fair_value_range,
+                snapshot.historical_valuation,
+                snapshot.timing,
+                holding.average_purchase_price,
+                snapshot.current_price,
+                now,
+                self._config.entry_exit_price.exit,
+            ),
+            lambda exc: ExitPriceRangeResult(
+                state=PriceRangeEvaluationState.NOT_EVALUATED,
+                current_price=snapshot.current_price,
+                reason_codes=(f"SHADOW_COMPUTATION_FAILED:{type(exc).__name__}",),
+                evaluated_at=now,
+                model_version=self._config.entry_exit_price.exit.model_version,
+            ),
+        )
+
+        # レビュー対応(Issue #384、#22 C2 / #371と同型): 以下の*_metrics(いずれも
+        # DecisionSnapshot記録専用のShadow計測)は、算出・整形の両方をisolated_
+        # shadow_observation()の内側へ入れ、shadow側で例外が出てもv1の判定・
+        # 保存・通知が止まらないことを構造で保証する。
+        historical_valuation_metrics = isolated_shadow_observation(
+            "historical_valuation_metrics",
+            lambda: historical_valuation_result_to_metrics(snapshot.historical_valuation),
+        )
+        timing_metrics = isolated_shadow_observation(
+            "timing_metrics",
+            lambda: timing_score_result_to_metrics(
+                snapshot.timing, snapshot.momentum, snapshot.current_price
+            ),
+        )
+        earnings_surprise_metrics = isolated_shadow_observation(
+            "earnings_surprise_metrics",
+            lambda: earnings_surprise_result_to_metrics(snapshot.earnings_surprise),
+        )
+        earnings_trend_metrics = isolated_shadow_observation(
+            "earnings_trend_metrics",
+            lambda: earnings_trend_result_to_metrics(snapshot.earnings_trend),
+        )
+        entry_price_range_metrics = isolated_shadow_observation(
+            "entry_price_range_metrics",
+            lambda: entry_price_range_result_to_metrics(
+                snapshot.entry_price_range,
+                snapshot.fair_value_range,
+                snapshot.historical_valuation,
+                snapshot.timing,
+                snapshot.momentum,
+                self._config.entry_exit_price.entry,
+            ),
+        )
+        exit_price_range_metrics = isolated_shadow_observation(
+            "exit_price_range_metrics",
+            lambda: exit_price_range_result_to_metrics(
+                exit_price_range,
+                snapshot.fair_value_range,
+                snapshot.historical_valuation,
+                snapshot.timing,
+                holding.average_purchase_price,
+                self._config.entry_exit_price.exit,
+            ),
+        )
+        market_metrics = isolated_shadow_observation(
+            "market_metrics",
+            lambda: market_environment_result_to_metrics(snapshot.market_environment),
+        )
+        sector_metrics = isolated_shadow_observation(
+            "sector_metrics",
+            lambda: sector_environment_result_to_metrics(snapshot.sector_environment),
+        )
+        environment_metrics = isolated_shadow_observation(
+            "environment_metrics",
+            lambda: environment_result_to_metrics(
+                snapshot.environment, snapshot.market_environment, snapshot.sector_environment
+            ),
+        )
+
+        recommendation = Recommendation(
+            recommendation_id=str(uuid.uuid4()),
+            # Issue #580: 1件の保有についての推奨。
+            scope_type=RecommendationScope.SINGLE_HOLDING,
+            owner=holding.owner,
+            holding_id=holding.holding_id,
+            stock_code=holding.stock_code,
+            stock_name=snapshot.financial.stock_name or holding.stock_name,
+            recommended_at=now,
+            recommendation_type=effective_recommendation_type,
+            raw_recommendation_type=result.fundamental_action,
+            sell_prices=effective_sell_prices,
+            price_at_recommendation=snapshot.current_price,
+            price_as_of_date=snapshot.price_as_of_date,
+            average_purchase_price_at_recommendation=holding.average_purchase_price,
+            shares_at_recommendation=holding.shares,
+            dividend_yield_pct_at_recommendation=snapshot.dividend_yield_pct,
+            shareholder_benefit_yield_pct_at_recommendation=snapshot.benefit_yield_pct,
+            total_yield_pct_at_recommendation=snapshot.total_yield_pct,
+            fair_value_at_recommendation=snapshot.fair_value,
+            reasons=result.triggered_reasons,
+            counter_factors=result.mitigating_factors_applied,
+            key_risks=[
+                f"含み損益率{result.pnl.unrealized_pnl_pct:.1f}%",
+                f"配当・優待込み累計利益率{result.pnl.total_return_pct:.1f}%",
+                # Issue #52 Phase B3-B2: 判定に使った財務データが報告サイクル上の
+                # 最新でない場合の留意事項。利確を促す判定理由ではないため
+                # reasons ではなく key_risks(留意事項)へ入れる。
+                *([FINANCIAL_STALE_USER_WARNING] if financial_freshness.is_stale else []),
+            ],
+            confidence=confidence_result.level,
+            next_earnings_date=snapshot.next_earnings_date,
+            earnings_date_status=snapshot.earnings_date_status,
+            earnings_date_raw=snapshot.earnings_date_raw,
+            earnings_release_confirmation_state=release_confirmation_state,
+            earnings_decision_relevance=decision_relevance,
+            dividend_record_date=snapshot.dividend.dividend_record_dates[0]
+            if snapshot.dividend.dividend_record_dates
+            else None,
+            benefit_record_date=snapshot.benefit.benefit_record_dates[0]
+            if snapshot.benefit is not None and snapshot.benefit.benefit_record_dates
+            else None,
+            rule_version=self._active_rule_version(),
+            config_values_used={
+                "unrealized_gain_full_pct": (
+                    self._config.profit_taking.thresholds.unrealized_gain_full_pct
+                ),
+                "total_yield_strong_caution_pct": (
+                    self._config.profit_taking.thresholds.total_yield_strong_caution_pct
+                ),
+                "independent_condition_count": result.independent_condition_count,
+                "fair_value_used_as_sole_strong_basis": (
+                    result.fair_value_used_as_sole_strong_basis
+                ),
+                "historical_valuation": historical_valuation_config_values(
+                    self._config.historical_valuation
+                ),
+                "timing_score": timing_score_config_values(self._config.timing_score),
+                "earnings_surprise": earnings_surprise_config_values(
+                    self._config.earnings_surprise
+                ),
+                "earnings_trend": earnings_trend_config_values(self._config.earnings_trend),
+                "entry_price_range": entry_price_range_config_values(
+                    self._config.entry_exit_price.entry
+                ),
+                "exit_price_range": exit_price_range_config_values(
+                    self._config.entry_exit_price.exit
+                ),
+                "market_environment": market_environment_config_values(
+                    self._config.market_sector_environment.market
+                ),
+                "sector_environment": sector_environment_config_values(
+                    self._config.market_sector_environment.sector
+                ),
+                "environment": environment_config_values(
+                    self._config.market_sector_environment.environment
+                ),
+                # コードレビュー対応(2026-08、上値余地の導入): 判定当時に実際に
+                # 使用したprice_position設定値と、算出したceiling_price/upside_pct/
+                # fair_value_action_usableを記録する(§18)。
+                "price_position": self._config.profit_taking.price_position.model_dump(),
+                "ceiling_price": (
+                    float(result.ceiling_price) if result.ceiling_price is not None else None
+                ),
+                "upside_pct": result.upside_pct,
+                "fair_value_action_usable": result.fair_value_action_usable,
+                # 利益保全(Profit Protection)判定当時に実際に使用した閾値(§18)。
+                "profit_protection": self._config.profit_taking.profit_protection.model_dump(),
+                # Phase 2-B「銘柄分析」向け(2026-08): PARTIAL_PROFIT_TAKEの
+                # 「目標比率→理論株数→単元株調整→最終株数」フローで使用した
+                # 目標比率テーブルを判定時点の値としてスナップショットする
+                # (どのsell_intensityがどの比率に対応したかは
+                # suggested_sell_ratio/sell_intensityから復元できるが、比率
+                # テーブル自体の判定時点値は従来保存されていなかった)。
+                "partial_sell_ratios": self._config.profit_taking.partial_sell_ratios.model_dump(),
+            },
+            data_sources=list(snapshot.data_sources),
+            next_review_conditions=_build_next_review_conditions(
+                result, snapshot.next_earnings_date, release_confirmation_state
+            ),
+            not_yet_action_reasons=_build_not_yet_action_reasons(
+                result,
+                self._config,
+                trading_unit_feasibility,
+                fv_range.unusable_reason_code,
+                effective_recommendation_type,
+            ),
+            valuation_caveats=_build_valuation_caveats(
+                fv_range.overall_confidence,
+                industry_sector,
+                industry_model_applied,
+                has_strong_counter_material,
+                snapshot.momentum.trend_classification
+                in (TrendClassification.UPTREND, TrendClassification.STRONG_UPTREND),
+                result.mitigating_downgrade_applied,
+                result.timing_downgrade_applied,
+            ),
+            current_price_vs_neutral_fair_value_pct=(
+                result.current_price_vs_neutral_fair_value_pct
+            ),
+            current_price_vs_bull_fair_value_pct=result.current_price_vs_bull_fair_value_pct,
+            profit_taking_origin=result.origin,
+            profit_taking_ceiling_price=result.ceiling_price,
+            profit_taking_upside_pct=result.upside_pct,
+            profit_protection_signal=result.profit_protection_signal,
+            profit_protection_basis_date=result.profit_protection_basis_date,
+            profit_protection_peak_price=result.profit_protection_peak_price,
+            profit_protection_peak_date=result.profit_protection_peak_date,
+            profit_protection_peak_gain_pct=result.profit_protection_peak_gain_pct,
+            profit_protection_current_gain_pct=result.profit_protection_current_gain_pct,
+            profit_protection_drawdown_from_peak_pct=(
+                result.profit_protection_drawdown_from_peak_pct
+            ),
+            profit_protection_gain_giveback_ratio_pct=(
+                result.profit_protection_gain_giveback_ratio_pct
+            ),
+            profit_protection_insufficient_reason=result.profit_protection_insufficient_reason,
+            trading_unit=trading_unit_feasibility.trading_unit,
+            minimum_sellable_shares=trading_unit_feasibility.minimum_sellable_shares,
+            partial_sale_executable=trading_unit_feasibility.partial_sale_executable,
+            suggested_sell_shares=suggested_sell_shares,
+            suggested_sell_ratio=suggested_sell_ratio,
+            sell_intensity=sell_intensity.value if sell_intensity is not None else None,
+            odd_lot_trading_available=trading_unit_feasibility.odd_lot_trading_available,
+            industry_sector=industry_sector,
+            industry_model_applied=industry_model_applied,
+            industry_model_missing_reason=industry_model_missing_reason(industry_sector),
+            dividend_decrease_explanation=dividend_decrease_explanation,
+            fair_value_bear=fv_range.bear,
+            fair_value_neutral=fv_range.neutral,
+            fair_value_bull=fv_range.bull,
+            fair_value_overall_confidence=fv_range.overall_confidence,
+            fair_value_methods=[
+                {
+                    "method": m.method,
+                    "fair_value": str(m.fair_value) if m.fair_value is not None else None,
+                    "confidence": m.confidence.value,
+                    "exclusion_reason": m.exclusion_reason,
+                }
+                for m in (fv_range.methods_used + fv_range.methods_excluded)
+            ],
+            fair_value_spread_ratio=spread_ratio,
+            # Issue #21: 判定時点のFairValueRange使用可否スナップショット。
+            # codeはenumの.value(文字列)で保存する(sell_intensity・
+            # fair_value_methods内confidence等と同じ既存規約)。
+            fair_value_usable_for_trading_judgment=fv_range.usable_for_trading_judgment,
+            fair_value_unusable_reason_code=(
+                fv_range.unusable_reason_code.value
+                if fv_range.unusable_reason_code is not None
+                else None
+            ),
+            fair_value_unusable_reason=fv_range.unusable_reason,
+            # Issue #20 Phase B2-A: 判定入力financial dataのprovenance
+            # (snapshot構築時点の事実の転記のみ。観測専用・判定不変)。
+            financial_input_provenance=snapshot.financial_input_provenance,
+            consecutive_actual_dividend_increase_years=(
+                dividend.consecutive_dividend_increase_years
+            ),
+            forecast_dividend_increase=forecast_increase,
+            forecast_dividend_increase_rate=forecast_increase_rate,
+            dividend_record_date_recurring_label=resolve_dividend_record_date_recurring_label(
+                dividend, snapshot.financial.fiscal_year_end_month
+            ),
+            benefit_record_date_recurring_label=resolve_benefit_record_date_recurring_label(
+                snapshot.benefit, snapshot.financial.fiscal_year_end_month
+            ),
+            dividend_record_date_source_type=resolve_dividend_record_date_source_type(dividend),
+            benefit_record_date_source_type=resolve_benefit_record_date_source_type(
+                snapshot.benefit
+            ),
+            business_days_to_earnings=days_to_earnings,
+            # 判定精度向上機能Phase B: DecisionSnapshot記録専用(Shadow計測)。
+            historical_valuation_score=snapshot.historical_valuation.score,
+            historical_valuation_confidence=snapshot.historical_valuation.confidence,
+            historical_valuation_coverage=snapshot.historical_valuation.coverage,
+            historical_valuation_reason_codes=snapshot.historical_valuation.reason_codes,
+            historical_valuation_metrics=historical_valuation_metrics,
+            # 判定精度向上機能Phase B第二弾: DecisionSnapshot記録専用(Shadow計測)。
+            timing_score=snapshot.timing.score,
+            timing_confidence=snapshot.timing.confidence,
+            timing_coverage=snapshot.timing.coverage,
+            timing_reason_codes=snapshot.timing.reason_codes,
+            timing_metrics=timing_metrics,
+            # 判定精度向上機能Phase C: DecisionSnapshot記録専用(Shadow計測)。
+            earnings_surprise_score=snapshot.earnings_surprise.score,
+            earnings_surprise_confidence=snapshot.earnings_surprise.confidence,
+            earnings_surprise_coverage=snapshot.earnings_surprise.coverage,
+            earnings_surprise_reason_codes=snapshot.earnings_surprise.reason_codes,
+            earnings_surprise_metrics=earnings_surprise_metrics,
+            earnings_trend_score=snapshot.earnings_trend.score,
+            earnings_trend_confidence=snapshot.earnings_trend.confidence,
+            earnings_trend_coverage=snapshot.earnings_trend.coverage,
+            earnings_trend_reason_codes=snapshot.earnings_trend.reason_codes,
+            earnings_trend_metrics=earnings_trend_metrics,
+            # 判定精度向上機能次フェーズSTEP2: DecisionSnapshot記録専用
+            # (Shadow計測)。Entryはsnapshot算出済みの値をそのままコピー、
+            # Exitは上記で算出済みのexit_price_rangeをコピーする。
+            entry_price_range_state=snapshot.entry_price_range.state,
+            entry_price_range_confidence=snapshot.entry_price_range.confidence,
+            entry_price_range_coverage=snapshot.entry_price_range.coverage,
+            entry_price_range_reason_codes=snapshot.entry_price_range.reason_codes,
+            entry_price_range_metrics=entry_price_range_metrics,
+            entry_price_range_starter_price=snapshot.entry_price_range.starter_entry_price,
+            entry_price_range_preferred_price=snapshot.entry_price_range.preferred_entry_price,
+            entry_price_range_strong_price=snapshot.entry_price_range.strong_entry_price,
+            entry_price_range_max_price=snapshot.entry_price_range.max_entry_price,
+            entry_price_range_stop_review_price=snapshot.entry_price_range.stop_review_price,
+            exit_price_range_state=exit_price_range.state,
+            exit_price_range_confidence=exit_price_range.confidence,
+            exit_price_range_coverage=exit_price_range.coverage,
+            exit_price_range_reason_codes=exit_price_range.reason_codes,
+            exit_price_range_metrics=exit_price_range_metrics,
+            exit_price_range_partial_low_price=exit_price_range.partial_profit_take_low_price,
+            exit_price_range_partial_high_price=exit_price_range.partial_profit_take_high_price,
+            exit_price_range_strong_price=exit_price_range.strong_profit_take_price,
+            exit_price_range_downside_review_price=exit_price_range.downside_review_price,
+            exit_price_range_exit_review_price=exit_price_range.exit_review_price,
+            # 判定精度向上機能Phase D: DecisionSnapshot記録専用(Shadow計測)。
+            market_score=snapshot.market_environment.score,
+            market_confidence=snapshot.market_environment.confidence,
+            market_coverage=snapshot.market_environment.coverage,
+            market_reason_codes=snapshot.market_environment.reason_codes,
+            market_metrics=market_metrics,
+            sector_score=snapshot.sector_environment.score,
+            sector_confidence=snapshot.sector_environment.confidence,
+            sector_coverage=snapshot.sector_environment.coverage,
+            sector_reason_codes=snapshot.sector_environment.reason_codes,
+            sector_metrics=sector_metrics,
+            environment_score=snapshot.environment.score,
+            environment_confidence=snapshot.environment.confidence,
+            environment_coverage=snapshot.environment.coverage,
+            environment_reason_codes=snapshot.environment.reason_codes,
+            environment_metrics=environment_metrics,
+        )
+        return ProfitTakingOutcome(
+            holding.stock_code,
+            recommendation,
+            None,
+            audit_id=audit_entry.audit_id,
+            price_path_facts=self._price_path_facts(profit_protection_metrics, snapshot),
+            exit_trace=real_trace_sink[0] if real_trace_sink else None,
+            # UNKNOWN(None)を事実として識別できる2項目の**実値**を、判定式を変えずに転記する。
+            # Noneは「取得できていない」、0年・Falseは「確認した結果」(FalseをUNKNOWNと推測しない)。
+            safety_facts=SafetyFacts(
+                profit_taking_mitigation=ProfitTakingMitigationFacts(
+                    continuous_dividend_increase_years=(
+                        mitigating_inputs.continuous_dividend_increase_years
+                    ),
+                    is_progressive_or_doe_policy=mitigating_inputs.is_progressive_or_doe_policy,
+                ),
+                corporate_action=self._corporate_action_shadow_facts(
+                    recommendation, holding, snapshot, corporate_action_events, now
+                ),
+            ),
+        )
+
+
+def _is_long_term_benefit_imminent(
+    holding: Holding,
+    benefit: ShareholderBenefit | None,
+    evaluation_date: dt.date,
+    config: AppConfig,
+) -> bool:
+    """保有銘柄が優待の長期保有条件をまもなく満たすかどうかを判定する。
+
+    ShareholderBenefit.benefits内のlong_term_holding_condition_monthsと
+    Holding.first_purchase_dateから、条件達成日が設定のwithin_business_days以内かを見る。
+    """
+    if benefit is None:
+        return False
+
+    mitigating = config.profit_taking.mitigating_factors.long_term_holding_benefit_imminent
+    within_days = mitigating.within_business_days
+    # Issue #55 Phase B-2(N11)。`within_business_days` が None になり得るのは
+    # 「enabled: false(この要因を使わない)」の場合だけである。
+    # enabled: true で未設定のまま起動することは、config の起動時検証
+    # (MitigatingFactors)が禁じる。したがってここでの None は
+    # 「データ不足」でも「未評価」でもなく、**設定上この要因を使わない**の意であり、
+    # 該当なし(False)を返すのが正しい。
+    # 従来はこの区別が明記されておらず、enabled: true のまま設定行が消えても
+    # 無言で False へ落ちていた(その沈黙は起動時検証で塞いだ)。
+    #
+    # なお `enabled` はここでは見ない。この関数が返すのは「条件達成が近いか」という
+    # 事実であり、「緩和要因として適用するか」は profit_taking.py:469 が
+    # `enabled` と併せて判断する責務のため(両者を混ぜない)。
+    if within_days is None:
+        return False
+
+    for detail in benefit.benefits:
+        months = detail.long_term_holding_condition_months
+        if months is None:
+            continue
+        qualify_date = _add_months(holding.first_purchase_date, months)
+        # Issue #66 F-L4: 呼び出し側が確定させた**JST評価日**と比較する。
+        # 以前は `now.date()` = **UTC暦日**で比較しており、定期実行(08:00 JST
+        # = 前日23:00 UTC)では毎回JSTの前日と比較していた。
+        days_remaining = (qualify_date - evaluation_date).days
+        if 0 <= days_remaining <= within_days * 2:  # 営業日ベースの概算(週末考慮の簡易マージン)
+            return True
+    return False
+
+
+def _add_months(date: dt.date, months: int) -> dt.date:
+    month_index = date.month - 1 + months
+    year = date.year + month_index // 12
+    month = month_index % 12 + 1
+    day = min(date.day, calendar.monthrange(year, month)[1])
+    return dt.date(year, month, day)

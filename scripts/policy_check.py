@@ -1,0 +1,673 @@
+"""操作の前に読むべき正本の条文を引く preflight(Issue #337 の D)。
+
+「どの操作をするとき、どの正本のどの節を読む必要があるか」を
+`docs/policy_registry.yaml` から引いて JSON で返す。CI からではなく
+作業者が手元で任意に実行する。
+
+    python scripts/policy_check.py --operation PR_CREATE
+
+## 本スクリプトが保証しないこと
+
+**required_policies を示すだけであり、読んだことも守ったことも保証しない。**
+遵守の確認はレビューと各正本が担う。preflight を通したことを遵守の証拠として
+扱ってはならない。
+
+denylist 方式の `scan_for_pii.py` が「通過したからといって他の個人情報が一切
+存在しないことを保証しない」と自ら書いているのと同じ趣旨である。機械的に
+検査できるのは形式だけである。
+
+## revision を固定して読む(POLICY_REF_PINNING)
+
+**current effective policy は merge 済みの main にある。** 作業中の branch に
+書かれた未 merge の規則は、まだ誰にも効いていない。
+
+    POLICY_REF == REGISTRY_SOURCE_REVISION == SSOT_SOURCE_REVISION
+
+registry も ssot_file も `git show <revision>:<path>` で**同一 revision から**読む。
+working tree は読まない。
+
+これを守らないと、**feature branch 上で書いた規則が merge 前に自分自身を
+正当化する**構造になる。Issue #337 の設計はこの構造を明示的に禁じている。
+`policy_ref` に main の SHA を表示しながら working tree の内容で判定するのは、
+その禁止に反する。
+
+読む revision を差し替えたい場合は `read_source` を明示的に渡す。
+**その経路は呼び出し側が意図して選ぶものであり、既定では使わない。**
+
+## 三値を厳格に区別する
+
+    PASS     検証済み revision の registry から required_policies を引けた
+    FAIL     未知の operation / registry の参照が壊れている
+    UNKNOWN  判定に必要な情報が無い
+
+**UNKNOWN を PASS へ倒さない。** 倒すと「確認できなかった」が「問題なし」に
+化ける。これは fail-open であり、Issue #337 が問題にしている構図そのものである。
+
+## exit code も三値を保つ(Issue #343)
+
+    0  PASS
+    1  FAIL
+    2  CLI usage / argument error(argparse が使う)
+    3  UNKNOWN
+
+**判定語だけを分けても、exit code が PASS と同じなら fail-open は閉じない。**
+呼び出し側が exit code だけを見る場合、`UNKNOWN` が 0 では「確認できなかった」が
+「成功」として伝わる。`UNKNOWN` には **3** を割り当てる。
+
+**`UNKNOWN` に 2 を使わない。** `argparse` が引数不正で 2 を返すため、
+「呼び出し方が不正」と「判定できなかった」が区別できなくなる。
+
+## policy source の鮮度(POLICY_SOURCE_FRESHNESS)
+
+ローカルの `origin/main` は remote-tracking ref であり、最後の fetch 以降に
+GitHub 上の main が進んでいれば stale である。「origin/main という名前だから
+fresh」とは扱わない。
+
+    VERIFIED    remote の main SHA と local の origin/main が一致することを確認した
+    STALE       不一致を検出した
+    UNVERIFIED  確認できなかった(ネットワーク断 / git の失敗)
+
+**`VERIFIED` 以外では policy を読まない。** `STALE` も `UNVERIFIED` も
+`UNKNOWN` とし、**PASS にしない**。古い規則へ自動 fallback して操作を許可しない
+ためである。
+
+確認は `git ls-remote` による**比較のみ**とし、fetch の副作用を持たせない。
+`STALE` のときに fetch するかどうかは呼び出し側の判断である。
+
+## 全文書を読まない
+
+正本 4 文書は合計 7,000 行を超える。毎回すべてを読む設計にはせず、
+`jit_reading` として**読むべき節だけ**を返す。
+
+## 節の本文を抽出して返す(Issue #656。#364 Unit 4)
+
+`jit_reading` の各 entry は、`ssot_anchor` が指す**節の本文**(`section_text`)と、
+その出典(`ssot_file` / `ssot_anchor` / `source_commit_sha` / `policy_id`)を持つ。
+本文は、検証済み revision(`POLICY_REF_PINNING` の revision)の正本から**呼び出しの
+たびに**取り出す。保存しない。
+
+    ★ section_text は cache / generated context であり、SSoT ではない。
+      正本は ssot_file 自体であり、食い違う場合は正本が優先する
+      (出力の `section_text_notice` に明示する)。要約版を作らない・規則を複製しない。
+
+`expand` で範囲を広げられる(section-first であって section-only ではない)。
+
+    section  anchor の節だけ(既定)
+    parent   anchor の 1 つ上の level の節(最上位の見出しなら文書全体)
+    full     ssot_file の全文
+
+節の切り出し(`extract_section`)の規則:
+
+    - ATX 見出し(`#` の個数 = level)だけを見出しとして扱う
+    - **コードフェンス(``` / ~~~)の内側の行は見出しとして扱わない**
+      (フェンス内の `# コメント` で節が途中で切れないようにする)
+    - 節は、anchor の見出しから、次の「同じ level 以下の見出し」の直前までである
+    - anchor が見出し行として 1 件に決まらない場合は、**黙って選ばず失敗にする**
+      (見つからない / 複数 = `FAIL`)。fail-open にしない
+
+registry(`docs/policy_registry.yaml`)の内容は本スクリプトが変更しない。
+どの operation にどの policy を載せるかは恒久規則の領域である(POLICY_AUTHORITY = HUMAN_ONLY)。
+
+## 依存
+
+標準ライブラリと PyYAML のみ。PyYAML は `config/*.yaml` の読み込みで
+既に使われている。requirements を増やさない。
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import subprocess
+import sys
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+REGISTRY_RELPATH = "docs/policy_registry.yaml"
+
+PASS = "PASS"
+FAIL = "FAIL"
+UNKNOWN = "UNKNOWN"
+
+# exit code の契約(Issue #343)。判定語と 1 対 1 に対応させる。
+EXIT_PASS = 0
+EXIT_FAIL = 1
+# ★ 2 は argparse が引数不正で使う。ここからは返さない(契約を分離するため)。
+EXIT_CLI_USAGE_ERROR = 2
+EXIT_UNKNOWN = 3
+
+_EXIT_CODE_BY_RESULT = {
+    PASS: EXIT_PASS,
+    FAIL: EXIT_FAIL,
+    UNKNOWN: EXIT_UNKNOWN,
+}
+
+VERIFIED = "VERIFIED"
+STALE = "STALE"
+UNVERIFIED = "UNVERIFIED"
+
+SOURCE_KIND_REVISION = "REVISION"
+SOURCE_KIND_WORKING_TREE = "WORKING_TREE"
+
+_REMOTE = "origin"
+_MAIN_REF = "refs/heads/main"
+
+# registry は pointer だけを持つ。entry に規則本文を書き始めたら、この長さで
+# 気づけるようにする(検査そのものは tests/unit/test_policy_registry.py が行う)。
+MAX_REGISTRY_FIELD_LENGTH = 200
+
+# repository 相対 path を受け取り、内容を返す。
+# ★ None を返すのは「存在しない」場合だけである。取得に失敗した場合は
+#   None ではなく SourceReadError を送出する(「読めなかった」を「無い」に
+#   化けさせないため)。
+SourceReader = Callable[[str], "str | None"]
+
+
+# jit_reading の節の範囲(Issue #656)。section-first であって section-only ではない。
+EXPAND_SECTION = "section"
+EXPAND_PARENT = "parent"
+EXPAND_FULL = "full"
+EXPAND_MODES = (EXPAND_SECTION, EXPAND_PARENT, EXPAND_FULL)
+
+SECTION_TEXT_NOTICE = (
+    "section_text は current main の正本から都度取り出した cache / generated context であり、"
+    "SSoT ではない。正本は ssot_file 自体であり、食い違う場合は正本が優先する。"
+    "節だけでは足りない場合は --expand parent / full で範囲を広げる"
+)
+
+_ATX_HEADING = re.compile(r"^(#{1,6})[ \t]+\S")
+_FENCE_LINE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
+
+
+class RegistryError(Exception):
+    """registry を読めない、または内容が壊れている。"""
+
+
+class SectionExtractionError(Exception):
+    """anchor の節を**一意に**取り出せなかった。
+
+    見つからない場合だけでなく、複数の見出しに一致する場合も含む。
+    どれを採るかを黙って決めると、別の節を「正本の節」として渡してしまう。
+    """
+
+
+class SourceReadError(Exception):
+    """source の**取得に失敗した**。
+
+    ★ 「存在しない」と区別する。取得の失敗を不在として報告すると、
+    「読めなかった」が「無い」に化ける。Issue #337 で実際に起きた誤診断であり、
+    本 exception はその再発を型で防ぐためにある。
+
+    reader は **存在しない場合にだけ None を返す**。取得はできたが復号できない
+    等の失敗は、None ではなく本 exception で表す。
+    """
+
+
+def _git(*args: str) -> str:
+    """git を呼ぶ。失敗したら CalledProcessError を送出する。
+
+    ★ `text=True` を使わない。`text=True` は **locale の encoding** で復号するため、
+    cp932 のような環境では ★ 日本語を含む正本を復号できない(実測: Windows で
+    `UnicodeDecodeError`)。本 repository の管理ファイルは UTF-8 であるから、
+    bytes で受けて ★ 明示的に UTF-8 で復号する。
+
+    ★ 復号に失敗した場合は `UnicodeDecodeError` がそのまま送出される。
+    呼び出し側はこれを ★ 「存在しない」ではなく「取得に失敗した」として扱う
+    (`SourceReadError` を参照)。
+
+    ★ `check=True` かつ `text=True` でないため、`CalledProcessError.stderr` は
+    bytes である。本モジュールは stderr を文字列として組み立てないため影響しない。
+    """
+    completed = subprocess.run(
+        ["git", *args],
+        cwd=_REPO_ROOT,
+        capture_output=True,
+        timeout=60,
+        check=True,
+    )
+    return completed.stdout.decode("utf-8")
+
+
+def make_revision_reader(revision: str) -> SourceReader:
+    """指定 revision から repository 相対 path の内容を読む reader を作る。
+
+    ★ working tree を読まない。`git show <revision>:<path>` を使う。
+
+    ★ **revision の有効性を、reader を作る時点で 1 回だけ検証する。**
+    検証しないと、`git show` の失敗が
+    「その path が revision に無い」なのか「revision 自体が無い」なのかを
+    区別できず、**revision の不在を path の不在として報告してしまう**。
+    これは `SourceReadError` を設けて分けたのと同じ型の誤りである
+    (取得の失敗を事実の不在として報告する)。
+
+    stderr の文言では区別しない。git の版で変わりうるためである。
+    **失敗の単位(revision 単位 / path 単位)を構造で分ける。**
+
+    revision が無効なら `SourceReadError` を送出する。
+    """
+    try:
+        _git("rev-parse", "--verify", "--quiet", f"{revision}^{{commit}}")
+    except (subprocess.SubprocessError, OSError) as exc:
+        raise SourceReadError(f"revision を解決できなかった: {revision}") from exc
+
+    def _read(relpath: str) -> str | None:
+        try:
+            return _git("show", f"{revision}:{relpath}")
+        except UnicodeDecodeError as exc:
+            # ★ 取得はできたが復号できない。★ 「無い」ではない。
+            raise SourceReadError(
+                f"{relpath} を UTF-8 として復号できなかった: {exc}"
+            ) from exc
+        except (subprocess.SubprocessError, OSError):
+            # ★ revision は検証済みなので、ここは ★ path が無い場合だけである。
+            return None
+
+    return _read
+
+
+def make_working_tree_reader() -> SourceReader:
+    """working tree を読む reader。
+
+    ★ 既定では使わない。current effective policy は merge 済みの main にあり、
+    working tree の内容は「まだ効いていない規則」を含みうるためである。
+    呼び出し側が意図して選ぶときだけ渡す。
+    """
+
+    def _read(relpath: str) -> str | None:
+        target = _REPO_ROOT / relpath
+        if not target.is_file():
+            return None
+        try:
+            return target.read_text(encoding="utf-8")
+        except UnicodeDecodeError as exc:
+            raise SourceReadError(
+                f"{relpath} を UTF-8 として復号できなかった: {exc}"
+            ) from exc
+
+    return _read
+
+
+def check_policy_freshness() -> tuple[str, str | None]:
+    """policy source の鮮度を確かめる。
+
+    返り値は (FRESHNESS_RESULT, local の origin/main SHA)。
+    SHA が取れなかった場合は None を返す。
+
+    **比較だけを行い fetch しない。** fetch は remote-tracking ref を書き換える
+    副作用を持つため、確認のたびに走らせない。
+    """
+    try:
+        local_sha = _git("rev-parse", f"{_REMOTE}/main").strip()
+    except (subprocess.SubprocessError, OSError):
+        return UNVERIFIED, None
+
+    try:
+        remote_line = _git("ls-remote", _REMOTE, _MAIN_REF).strip()
+    except (subprocess.SubprocessError, OSError):
+        # ネットワーク断 / 認証失敗 / git の不在。
+        # ★ 「たぶん最新だろう」で VERIFIED にしない。
+        return UNVERIFIED, local_sha
+
+    remote_sha = remote_line.split("\t", 1)[0].strip() if remote_line else ""
+    if not remote_sha:
+        return UNVERIFIED, local_sha
+    if remote_sha != local_sha:
+        return STALE, local_sha
+    return VERIFIED, local_sha
+
+
+def _scan_headings(lines: list[str]) -> list[tuple[int, int, str]]:
+    """ATX 見出しを (行 index, level, 行の文字列) で返す。コードフェンスの内側は読まない。"""
+    headings: list[tuple[int, int, str]] = []
+    fence: tuple[str, int] | None = None  # (fence の文字, 開きの長さ)
+    for index, line in enumerate(lines):
+        fence_match = _FENCE_LINE.match(line)
+        if fence is None:
+            if fence_match:
+                marker, info = fence_match.group(1), fence_match.group(2)
+                # バッククォートのフェンスは、info 文字列にバッククォートを含められない
+                if not (marker[0] == "`" and "`" in info):
+                    fence = (marker[0], len(marker))
+                    continue
+        else:
+            # 閉じは、同じ文字・開き以上の長さ・info 文字列なし
+            if (
+                fence_match
+                and fence_match.group(1)[0] == fence[0]
+                and len(fence_match.group(1)) >= fence[1]
+                and fence_match.group(2).strip() == ""
+            ):
+                fence = None
+            continue
+        heading = _ATX_HEADING.match(line)
+        if heading:
+            headings.append((index, len(heading.group(1)), line.strip()))
+    return headings
+
+
+def extract_section(content: str, anchor: str, expand: str = EXPAND_SECTION) -> str | None:
+    """`content` から、見出し `anchor` の節の本文を取り出す(Issue #656)。
+
+    - anchor に一致する見出しが無い → None(anchor が散文・コードフェンス内にしか無い場合を含む)
+    - anchor に一致する見出しが複数 → SectionExtractionError(黙って選ばない)
+    - expand = section: anchor の見出しから、次の「同じ level 以下の見出し」の直前まで
+    - expand = parent: 1 つ上の level の節(最上位の見出しなら文書全体)
+    - expand = full: 文書全体
+
+    改行は "\n" へ正規化して返す。末尾の空行は含めない。
+    """
+    if expand not in EXPAND_MODES:
+        raise ValueError(f"expand は {EXPAND_MODES} のいずれかである必要がある: {expand!r}")
+    lines = content.splitlines()
+    headings = _scan_headings(lines)
+    wanted = anchor.strip()
+    matches = [h for h in headings if h[2] == wanted]
+    if not matches:
+        return None
+    if len(matches) > 1:
+        raise SectionExtractionError(
+            f"anchor が複数の見出しに一致する({len(matches)} 件): {wanted}"
+        )
+    if expand == EXPAND_FULL:
+        return "\n".join(lines).rstrip()
+    start, level, _ = matches[0]
+    if expand == EXPAND_PARENT:
+        parents = [h for h in headings if h[0] < start and h[1] < level]
+        if not parents:
+            return "\n".join(lines).rstrip()
+        start, level, _ = parents[-1]
+    end = len(lines)
+    for index, heading_level, _ in headings:
+        if index > start and heading_level <= level:
+            end = index
+            break
+    return "\n".join(lines[start:end]).rstrip()
+
+
+def load_registry(read_source: SourceReader) -> dict[str, Any]:
+    """registry を読む。壊れていれば RegistryError を送出する。"""
+    try:
+        raw_text = read_source(REGISTRY_RELPATH)
+    except SourceReadError as exc:
+        # ★ 「読めなかった」を「無い」と報告しない。
+        raise RegistryError(f"registry を取得できなかった: {exc}") from exc
+    if raw_text is None:
+        raise RegistryError(f"registry が見つからない: {REGISTRY_RELPATH}")
+    try:
+        raw = yaml.safe_load(raw_text)
+    except yaml.YAMLError as exc:
+        raise RegistryError(f"registry を parse できない: {exc}") from exc
+
+    if not isinstance(raw, dict):
+        raise RegistryError("registry の最上位が mapping ではない")
+    for key in ("operations", "policies"):
+        if key not in raw:
+            raise RegistryError(f"registry に {key} が無い")
+    if not isinstance(raw["operations"], list) or not isinstance(raw["policies"], list):
+        raise RegistryError("operations と policies は list でなければならない")
+    return raw
+
+
+def policies_for(registry: dict[str, Any], operation: str) -> list[dict[str, Any]]:
+    """operation に該当する policy を返す。registry の順序を保つ。"""
+    return [
+        policy
+        for policy in registry["policies"]
+        if operation in policy.get("applicable_operations", [])
+    ]
+
+
+def validate_references(
+    registry: dict[str, Any], read_source: SourceReader
+) -> list[str]:
+    """registry の参照が壊れていないかを確かめ、問題の一覧を返す。
+
+    ★ registry と同じ revision の ssot_file を読む。working tree を見ない。
+
+    ここで見るのは **pointer として成立しているか**だけである
+    (ssot_file が実在し、ssot_anchor がその中に完全一致で存在するか)。
+    規則の内容が正しいかは判定しない。機械では判定できない。
+    """
+    problems: list[str] = []
+    operations = set(registry["operations"])
+    seen: set[str] = set()
+
+    for policy in registry["policies"]:
+        policy_id = policy.get("policy_id")
+        if not policy_id:
+            problems.append("policy_id の無い entry がある")
+            continue
+        if policy_id in seen:
+            problems.append(f"policy_id が重複している: {policy_id}")
+        seen.add(policy_id)
+
+        ssot_file = policy.get("ssot_file")
+        anchor = policy.get("ssot_anchor")
+        if not ssot_file or not anchor:
+            problems.append(f"{policy_id}: ssot_file または ssot_anchor が無い")
+            continue
+
+        try:
+            text = read_source(ssot_file)
+        except SourceReadError as exc:
+            # ★ 取得の失敗を「無い」と報告しない。診断が変わると原因を誤らせる。
+            problems.append(f"{policy_id}: ssot_file を取得できなかった: {exc}")
+            continue
+        if text is None:
+            problems.append(f"{policy_id}: ssot_file が対象 revision に無い: {ssot_file}")
+            continue
+        if anchor not in text:
+            problems.append(f"{policy_id}: ssot_anchor が {ssot_file} に無い")
+
+        for operation in policy.get("applicable_operations", []):
+            if operation not in operations:
+                problems.append(f"{policy_id}: 未定義の operation: {operation}")
+
+    return problems
+
+
+def check(
+    operation: str,
+    registry: dict[str, Any] | None = None,
+    read_source: SourceReader | None = None,
+    expand: str = EXPAND_SECTION,
+) -> dict[str, Any]:
+    """operation に必要な policy を引く。
+
+    ★ result は三値である。UNKNOWN を PASS へ倒さない。
+    ★ 既定では検証済み revision(origin/main)から読む。working tree を読まない。
+
+    `read_source` を渡した場合は、その reader が返す内容で判定する。
+    `registry` を渡した場合は registry の読み込みだけを差し替える。
+
+    `expand`(Issue #656): jit_reading の `section_text` の範囲
+    (section / parent / full。`extract_section` 参照)。
+    """
+    if expand not in EXPAND_MODES:
+        raise ValueError(f"expand は {EXPAND_MODES} のいずれかである必要がある: {expand!r}")
+    freshness, local_sha = check_policy_freshness()
+
+    report: dict[str, Any] = {
+        "operation": operation,
+        # ★ policy_ref は ★ REVISION 経路でのみ設定する。
+        #   working tree を読んだ report へ origin/main の SHA を付けると、
+        #   「表示している revision」と「実際に読んだ source」が食い違う。
+        #   Finding 1 と同じ型の誤りであり、USER 指示が明文で禁じている。
+        "policy_ref": None,
+        "policy_ref_freshness": freshness,
+        # ★ freshness は「origin/main の鮮度」という独立した事実である。
+        #   WORKING_TREE 経路では ★ 判定に使っていない。それが読み手に分かるよう
+        #   本 flag で明示する。
+        "freshness_applies_to_judgment": False,
+        "policy_source_kind": None,
+        "policy_source_revision": None,
+        "required_policies": [],
+        "human_gate_required": False,
+        "jit_reading": [],
+        "expand": expand,
+        "section_text_notice": SECTION_TEXT_NOTICE,
+        "result": UNKNOWN,
+        "problems": [],
+        "disclaimer": (
+            "required_policies を示すものであり、読んだことも守ったことも保証しない"
+        ),
+    }
+
+    if read_source is None:
+        # ★ 検証済みでない revision からは読まない。
+        #   STALE も UNVERIFIED も UNKNOWN であり、PASS にはならない。
+        if freshness != VERIFIED or local_sha is None:
+            report["result"] = UNKNOWN
+            report["problems"] = [
+                "policy source が検証済みでないため判定しない"
+                f"(freshness = {freshness})",
+                (
+                    "git fetch origin main で origin/main を更新してから再実行して"
+                    f"ください(local origin/main = {local_sha})"
+                    if freshness == STALE
+                    else "remote の main SHA を取得できませんでした"
+                ),
+            ]
+            return report
+        try:
+            read_source = make_revision_reader(local_sha)
+        except SourceReadError as exc:
+            # ★ revision を解決できなかった。「policy が無い」ではない。
+            report["result"] = UNKNOWN
+            report["problems"] = [str(exc)]
+            return report
+        report["policy_ref"] = local_sha
+        report["freshness_applies_to_judgment"] = True
+        report["policy_source_kind"] = SOURCE_KIND_REVISION
+        report["policy_source_revision"] = local_sha
+    else:
+        # 呼び出し側が読み取り経路を明示した場合。
+        # ★ current effective policy と区別できるよう source を記録し、
+        # ★ policy_ref は付けない（USER 指示の明文）。
+        report["policy_source_kind"] = SOURCE_KIND_WORKING_TREE
+
+    try:
+        reg = registry if registry is not None else load_registry(read_source)
+    except RegistryError as exc:
+        report["result"] = FAIL
+        report["problems"] = [str(exc)]
+        return report
+
+    problems = validate_references(reg, read_source)
+    if problems:
+        # 参照が壊れている registry は「判定できない」ではなく「壊れている」。
+        report["result"] = FAIL
+        report["problems"] = problems
+        return report
+
+    if operation not in set(reg["operations"]):
+        # ★ 未知の operation を PASS へ倒さない。知らない操作は検査できていない。
+        report["result"] = FAIL
+        report["problems"] = [f"未知の operation: {operation}"]
+        return report
+
+    matched = policies_for(reg, operation)
+    report["required_policies"] = [policy["policy_id"] for policy in matched]
+    report["human_gate_required"] = any(
+        policy.get("human_gate_required", False) for policy in matched
+    )
+    jit_reading: list[dict[str, Any]] = []
+    extraction_problems: list[str] = []
+    for policy in matched:
+        try:
+            content = read_source(policy["ssot_file"])
+            section_text = (
+                extract_section(content, policy["ssot_anchor"], expand)
+                if content is not None
+                else None
+            )
+        except (SourceReadError, SectionExtractionError) as exc:
+            extraction_problems.append(f"{policy['policy_id']}: {exc}")
+            continue
+        if section_text is None:
+            # validate_references は anchor が文書内に存在するかだけを見る。
+            # 見出し行として成立しない(散文・コードフェンス内にしか無い)anchor は、
+            # ここで検出する。黙って空の節を返さない。
+            extraction_problems.append(
+                f"{policy['policy_id']}: ssot_anchor が見出し行として一致しない: "
+                f"{policy['ssot_file']}"
+            )
+            continue
+        jit_reading.append(
+            {
+                "policy_id": policy["policy_id"],
+                "ssot_file": policy["ssot_file"],
+                "ssot_anchor": policy["ssot_anchor"],
+                # ★ 出典の revision。REVISION 経路でのみ値を持つ(WORKING_TREE 経路は None。
+                #   policy_ref と同じ理由で、読んでいない revision の SHA を付けない)
+                "source_commit_sha": report["policy_source_revision"],
+                "expand": expand,
+                "section_text": section_text,
+            }
+        )
+    if extraction_problems:
+        report["result"] = FAIL
+        report["problems"] = extraction_problems
+        return report
+    report["jit_reading"] = jit_reading
+    report["result"] = PASS
+    return report
+
+
+def _print_json(report: dict[str, Any]) -> None:
+    """report を UTF-8 の JSON として標準出力へ書く。
+
+    ★ `print()` は標準出力の encoding(Windows の既定は cp932 等)で符号化するため、
+      section_text に含まれる文字(— 等)が encoding で表せないと UnicodeEncodeError で
+      落ちる(Issue #656 の実機確認で発生)。JSON は UTF-8 が正であり、標準出力の
+      locale に依存させない。標準出力に buffer が無い場合(一部のテスト環境)だけ print へ戻す。
+    """
+    text = json.dumps(report, ensure_ascii=False, indent=2) + "\n"
+    buffer = getattr(sys.stdout, "buffer", None)
+    if buffer is None:
+        sys.stdout.write(text)
+        return
+    sys.stdout.flush()
+    buffer.write(text.encode("utf-8"))
+    buffer.flush()
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="操作の前に読むべき正本の条文を引く(Issue #337)"
+    )
+    parser.add_argument("--operation", required=True, help="操作名")
+    parser.add_argument("--issue", type=int, default=None, help="対象 Issue 番号")
+    parser.add_argument("--pr", type=int, default=None, help="対象 PR 番号")
+    parser.add_argument(
+        "--expand",
+        choices=EXPAND_MODES,
+        default=EXPAND_SECTION,
+        help=(
+            "section_text の範囲(既定 section)。section = anchor の節 / "
+            "parent = 1 つ上の level の節 / full = 正本の全文"
+        ),
+    )
+    args = parser.parse_args(argv)
+
+    report = check(args.operation, expand=args.expand)
+    if args.issue is not None:
+        report["issue"] = args.issue
+    if args.pr is not None:
+        report["pr"] = args.pr
+
+    _print_json(report)
+    # 判定語ごとに exit code を分ける(Issue #343)。
+    # UNKNOWN を 0 で返すと「確認できなかった」が「成功」として伝わる。
+    # 未知の result は判定できていないのと同じであり、fail-close して
+    # EXIT_UNKNOWN とする(0 へ倒さない)。
+    return _EXIT_CODE_BY_RESULT.get(report["result"], EXIT_UNKNOWN)
+
+
+if __name__ == "__main__":  # pragma: no cover - CLI entry point
+    sys.exit(main())

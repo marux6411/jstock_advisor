@@ -1,0 +1,32 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+dist/
+build/
+data/local_store/*.json
+!data/local_store/.gitkeep
+data/imports/
+data/cache/
+.env
+.aws-sam/
+cdk.out/
+*.log
+.claude/settings.local.json
+infra/samconfig.toml
+infra/line_rich_menu/*.png
+infra/line_rich_menu/*.jpg
+infra/line_rich_menu/*.jpeg
+
+# 実在人物の個人情報(所有者名等)を含むローカル専用の移行入力ファイル
+# (CLAUDE.md「個人情報のGit管理対象外化」ルール、jstock migrate
+# owner-reclassification run --plan-fileが読み込む)。Git管理対象へ
+# 絶対にコミットしないこと。
+*.reclassification-plan.json
+local_migration_plans/

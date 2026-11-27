@@ -1,0 +1,317 @@
+"""pydanticモデルのコレクションをJSONファイルへ永続化する汎用ストア。
+
+MVPではDynamoDBの代わりにローカルJSONファイルを使用する。CRUD操作のみを
+公開することで、将来DynamoDB実装(infrastructure/aws)に差し替えても
+呼び出し側(リポジトリクラス)のインターフェースが変わらないようにする。
+単一ユーザー・単一プロセスでのCLI利用を前提とし、同時書き込みの排他制御は行わない。
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import tempfile
+from collections.abc import Callable, Iterable, Iterator, Mapping
+from pathlib import Path
+from typing import Any
+
+from pydantic import BaseModel
+
+from jstock_advisor.infrastructure.record_failure_policy import (
+    DecodeOutcome,
+    ItemIdDisclosure,
+    RecordFailureCollector,
+    RecordFailurePolicy,
+    decode_records,
+)
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_STORE_DIR = Path(__file__).resolve().parents[4] / "data" / "local_store"
+
+
+class JsonCollectionStore[T: BaseModel]:
+    def __init__(
+        self,
+        model_type: type[T],
+        file_name: str,
+        id_field: str,
+        store_dir: Path | None = None,
+        failure_policy: RecordFailurePolicy = RecordFailurePolicy.STRICT,
+        item_id_disclosure: ItemIdDisclosure = ItemIdDisclosure.HASH,
+    ) -> None:
+        self._model_type = model_type
+        self._id_field = id_field
+        self._path = (store_dir or DEFAULT_STORE_DIR) / file_name
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._failure_policy = failure_policy
+        self._item_id_disclosure = item_id_disclosure
+        self._collection = file_name
+
+    def _collector(self) -> RecordFailureCollector:
+        return RecordFailureCollector(
+            collection=self._collection,
+            policy=self._failure_policy,
+            item_id_disclosure=self._item_id_disclosure,
+        )
+
+    def _decode(
+        self, raw_items: list[dict[str, Any]]
+    ) -> tuple[dict[str, T], dict[str, dict[str, Any]]]:
+        """生の要素列を「デコードできたモデル」と「できなかった raw」へ分ける。
+
+        Issue #63 PR-2(A-U2)。**デコードできなかった要素は raw のまま保持する。**
+        `_write_all()` はこれを元の JSON のまま書き戻す。
+
+        こうしないと、skip した不正レコードが次の書き込みで**黙って消える**。
+        `_write_all()` は検証済みモデルから再直列化するため、skip された要素は
+        書き戻し対象から外れてしまうためである。A-U2 の目的は「壊れたレコードを
+        消せるようにする(自己修復)」であって「意図せず消える」ことではない。
+
+        `STRICT` では最初の失敗で元の例外がそのまま送出される(現行と同じ)。
+        """
+        decoded: dict[str, T] = {}
+        quarantined: dict[str, dict[str, Any]] = {}
+        collector = self._collector()
+        for item in raw_items:
+            try:
+                item_id = str(item[self._id_field])
+            except (KeyError, TypeError):
+                # id 欄が取れない要素は failure policy へ届く前に落ちる(意図した設計。救済しない)。
+                # 落ちる原因が分かるよう、collection 名・事実・要素の型だけを WARNING に 1 回出し、
+                # 元の例外をそのまま送出する(Issue #278 の O-d)。要素の中身は出さない。
+                logger.warning(
+                    "json_store: id 欄を取れない要素があります collection=%s reason=%s "
+                    "element_type=%s",
+                    self._collection,
+                    "id_field_missing" if isinstance(item, dict) else "element_not_a_dict",
+                    type(item).__name__,
+                )
+                raise
+            try:
+                decoded[item_id] = self._model_type.model_validate(item)
+            except Exception as error:  # noqa: BLE001 - ポリシーに委ねるため広く捕捉する
+                collector.handle(item_id, error)
+                quarantined[item_id] = item
+        return decoded, quarantined
+
+    def _load(self) -> tuple[dict[str, T], dict[str, dict[str, Any]]]:
+        if not self._path.exists():
+            return {}, {}
+        with self._path.open(encoding="utf-8") as f:
+            raw = json.load(f)
+        return self._decode(raw)
+
+    def _read_all(self) -> dict[str, T]:
+        return self._load()[0]
+
+    def _write_all(
+        self, items: dict[str, T], quarantined: dict[str, dict[str, Any]] | None = None
+    ) -> None:
+        """検証済みモデルを書き戻す。`quarantined` は**元の JSON のまま**残す。
+
+        Issue #63 PR-2(A-U2)。デコードできなかったレコードを書き込みのたびに
+        取りこぼさないため、呼び出し側は `_load()` が返した quarantined を渡す。
+
+        quarantined が消えるのは、**その id を名指しした操作**を行った場合だけである。
+
+            delete(id)                       消える(自己修復の経路)
+            upsert / upsert_many /
+            apply_batch の puts・delete_ids  同じ id を書けば置換・削除される
+            insert_if_absent                 既存とみなして拒否する(上書きしない)
+            それ以外の書き込み               触れない(raw のまま残る)
+
+        つまり「他の id への書き込みに巻き込まれて消える」ことが無い、という保証で
+        あって、「delete でしか消えない」という意味ではない。同じ id への upsert は
+        壊れたレコードを正しい値で置き換える正当な復旧手段である。
+        """
+        payload: list[dict[str, Any]] = [
+            json.loads(item.model_dump_json()) for item in items.values()
+        ]
+        if quarantined:
+            payload.extend(quarantined.values())
+        fd, tmp_path = tempfile.mkstemp(dir=self._path.parent, prefix=".tmp_", suffix=".json")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, self._path)
+        except BaseException:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+            raise
+
+    def list_all(self) -> list[T]:
+        return list(self._read_all().values())
+
+    def iter_all(self) -> Iterator[T]:
+        """`list_all()`のストリーミング版(Issue #113、CollectionStore Protocol)。
+
+        ローカルJSONは元々ファイル全体を一度に読むため、DynamoDB実装のような
+        ピークメモリ削減効果は無い(ローカルCLI専用であり本番Lambdaの
+        メモリ制約の対象ではない)。呼び出し側から見た列挙順・件数・内容が
+        `list_all()`と一致することだけを保証する。
+        """
+        return iter(self._read_all().values())
+
+    def get(self, item_id: str) -> T | None:
+        return self._read_all().get(item_id)
+
+    def get_consistent(self, item_id: str) -> T | None:
+        """ローカルJSONは常に最新のファイル内容を読むため、get()と同じでよい。"""
+        return self.get(item_id)
+
+    def get_raw_data(self, item_id: str) -> str | None:
+        """ローカル実装はDynamoDBへ書き込まないため、get()相当の
+        model_dump_json()を返す(楽観ロックの実利用はDynamoDB実装のみ)。"""
+        item = self.get(item_id)
+        return item.model_dump_json() if item is not None else None
+
+    def upsert(self, item: T) -> None:
+        items, quarantined = self._load()
+        item_id = str(getattr(item, self._id_field))
+        items[item_id] = item
+        quarantined.pop(item_id, None)
+        self._write_all(items, quarantined)
+
+    def apply_batch(self, delete_ids: Iterable[str], puts: Iterable[T]) -> None:
+        """削除と追加/更新を1回の書き込みで適用する(Issue #61 Phase B2)。
+
+        _write_all()は一時ファイルへ書いてからos.replace()で差し替えるため、
+        このファイルについては部分適用が発生しない(全部反映されるか、
+        元のファイルがそのまま残るかのどちらか)。
+        """
+        items, quarantined = self._load()
+        for item_id in delete_ids:
+            items.pop(str(item_id), None)
+            quarantined.pop(str(item_id), None)
+        for item in puts:
+            key = str(getattr(item, self._id_field))
+            items[key] = item
+            quarantined.pop(key, None)
+        self._write_all(items, quarantined)
+
+    def upsert_many(self, new_items: Iterable[T]) -> None:
+        items, quarantined = self._load()
+        for item in new_items:
+            key = str(getattr(item, self._id_field))
+            items[key] = item
+            quarantined.pop(key, None)
+        self._write_all(items, quarantined)
+
+    def delete(self, item_id: str) -> bool:
+        """id を指定した削除。**デコードできなかったレコードも消せる。**
+
+        Issue #63 PR-2(A-U2)。壊れたレコードを消して復旧する経路であり、
+        ここが通らないと自己修復ができない(従来は全件検証を経由するため
+        delete すら通らなかった)。
+        """
+        items, quarantined = self._load()
+        if item_id in quarantined:
+            del quarantined[item_id]
+            self._write_all(items, quarantined)
+            return True
+        if item_id not in items:
+            return False
+        del items[item_id]
+        self._write_all(items, quarantined)
+        return True
+
+    def find(self, predicate: Callable[[T], bool]) -> list[T]:
+        return [item for item in self._read_all().values() if predicate(item)]
+
+    def _read_raw(self) -> list[dict[str, Any]]:
+        """ファイルの生の要素列を返す(decodeしない)。
+
+        `find_with_outcome()` が decode の成否を数えるために使う。
+        `_load()` は decode 済みの結果しか返さないため、生の列が要る。
+        """
+        if not self._path.exists():
+            return []
+        with self._path.open(encoding="utf-8") as f:
+            raw: list[dict[str, Any]] = json.load(f)
+        return raw
+
+    def find_with_outcome(self, predicate: Callable[[T], bool]) -> DecodeOutcome[T]:
+        """`find()` と同じ絞り込みに、decodeの成否を添えて返す(Issue #279)。
+
+        `find()` は `list[T]` しか返せないため、**FAIL_SAFE_SUPPRESSで
+        skipした事実が呼び出し側へ届かない**。再送判定のように
+        「読めなかったなら送らない」を選びたい経路では、
+        skipされた件数と「判定不能」を知る必要がある。
+
+        既存の `decode_records()` を経由するため、失敗の記録・開示レベルの
+        適用・走査単位の集計ログはすべて既存の機構と同一である。
+
+        ★ `find()` と同じく全件を材料化する(`iter_all()`のピークメモリ有界性
+          (Issue #113)は本メソッドの対象外。`find()`も同様に全件を持つ)。
+        ★ `predicate` はdecodeできたレコードにのみ適用する。
+          decodeできなかったレコードは絞り込みの対象にできないため、
+          `failures` として別に数える(黙って0件へ寄せない)。
+        """
+        outcome = decode_records(
+            ((str(raw.get(self._id_field, "")), raw) for raw in self._read_raw()),
+            self._model_type.model_validate,
+            collection=self._collection,
+            policy=self._failure_policy,
+            item_id_disclosure=self._item_id_disclosure,
+        )
+        return DecodeOutcome(
+            records=[item for item in outcome.records if predicate(item)],
+            failures=outcome.failures,
+            undecidable=outcome.undecidable,
+        )
+
+    def upsert_with_index_attributes(
+        self, item: T, index_attributes: Mapping[str, str | int]
+    ) -> None:
+        """ローカルJSONにGSI概念は無いため、index_attributesを無視して通常のupsertと同一。"""
+        self.upsert(item)
+
+    def query_by_index(self, index_name: str, key_name: str, key_value: str) -> list[T]:
+        """ローカルJSONにGSI概念は無いため、index_nameは無視しfind()相当で絞り込む。"""
+        return self.find(lambda item: str(getattr(item, key_name)) == key_value)
+
+    def get_many(self, item_ids: Iterable[str]) -> dict[str, T]:
+        """対象確認機能2026-08向け。既存の全件読み込みから該当IDだけを取り出す
+        だけであり、追加I/Oは発生しない(DynamoDB実装のBatchGetItem相当の
+        分割・リトライ・失敗概念はローカル実装には存在しない)。"""
+        items = self._read_all()
+        return {item_id: items[item_id] for item_id in dict.fromkeys(item_ids) if item_id in items}
+
+    def insert_if_absent(self, item: T) -> bool:
+        """既存があれば触らずFalse、無ければ追加してTrue。
+
+        単一プロセスでのCLI利用を前提とし(モジュール冒頭のdocstring参照)、
+        read→writeの間の排他制御は行わない(check-then-act)。
+        """
+        items, quarantined = self._load()
+        item_id = str(getattr(item, self._id_field))
+        if item_id in items or item_id in quarantined:
+            return False
+        items[item_id] = item
+        self._write_all(items, quarantined)
+        return True
+
+    def replace_if_raw_matches(self, item_id: str, expected_raw_data: str, item: T) -> bool:
+        """現在値のmodel_dump_json()がexpected_raw_dataと一致する場合のみ置換
+        (CAS。Issue #17)。単一プロセス前提のread-compare-write
+        (insert_if_absent()と同じ前提)。"""
+        items, quarantined = self._load()
+        current = items.get(item_id)
+        if current is None or current.model_dump_json() != expected_raw_data:
+            return False
+        items[item_id] = item
+        self._write_all(items, quarantined)
+        return True
+
+    def delete_if_raw_matches(self, item_id: str, expected_raw_data: str) -> bool:
+        """現在値のmodel_dump_json()がexpected_raw_dataと一致する場合のみ削除
+        (条件付き削除。Issue #17)。単一プロセス前提のread-compare-write。"""
+        items, quarantined = self._load()
+        current = items.get(item_id)
+        if current is None or current.model_dump_json() != expected_raw_data:
+            return False
+        del items[item_id]
+        self._write_all(items, quarantined)
+        return True

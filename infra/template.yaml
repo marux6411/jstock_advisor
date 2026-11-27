@@ -1,0 +1,4388 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  jstock_advisor - 日本株 長期・高配当・株主優待重視の売買支援システム。
+  config/schedule.yamlの各ジョブに対応するLambda関数、DynamoDBテーブル、
+  LINE Webhook用API Gatewayを定義する。
+
+Parameters:
+  TablePrefix:
+    Type: String
+    Default: jstock
+    Description: DynamoDBテーブル名の接頭辞(build_collection_storeのDYNAMODB_TABLE_PREFIXと一致させる)
+  EdinetApiKeySecretArn:
+    Type: String
+    Description: >
+      EDINET_API_KEYを保持するSecrets ManagerシークレットのARN。
+      事前に`aws secretsmanager create-secret`等で作成し、
+      `aws secretsmanager put-secret-value`で値を投入してから指定する。
+  LineChannelAccessTokenSecretArn:
+    Type: String
+    Description: LINE_CHANNEL_ACCESS_TOKENを保持するSecrets ManagerシークレットのARN
+  LineUserIdSecretArn:
+    Type: String
+    Description: LINE_USER_IDを保持するSecrets ManagerシークレットのARN(本人確認・Webhook認可にも使用)
+  LineChannelSecretSecretArn:
+    Type: String
+    Description: LINE_CHANNEL_SECRETを保持するSecrets ManagerシークレットのARN(Webhook署名検証用)
+  LineCredentialRotationVersion:
+    Type: String
+    Default: "0"
+    Description: >
+      Issue #117 Phase R1。LINE認証情報のローテーション時に**明示的に値を変える**ための
+      非秘密マーカー。Secrets Managerの値だけを更新してもdynamic referenceは再解決
+      されず(リソースに実変更が無いとCloudFormationがNO_CHANGESとするため)、Lambdaは
+      旧credentialのまま動き続ける。この値を変更するとGlobalsのEnvironmentが変わり、
+      全Lambda関数がModify対象になるため再解決が確実に起きる。
+      **秘密値・トークン・キーを入れないこと**(この値は環境変数として平文で残る)。
+      通常のデプロイでは既定値のまま変更しない(変更しなければ再解決を意図しない)。
+  EdinetCredentialRotationVersion:
+    Type: String
+    Default: "0"
+    Description: >
+      Issue #117 Phase R1。EDINET認証情報のローテーション用の非秘密マーカー。
+      役割はLineCredentialRotationVersionと同じで、**LINEとEDINETを同一波で
+      ローテーションしない**運用方針に合わせて独立したパラメータとする
+      (ChangeSet上で「どちらのローテーションを意図した変更か」を識別可能にする)。
+      **秘密値・キーを入れないこと。**
+  WatchlistReservedConcurrentExecutions:
+    Type: Number
+    Default: 4
+    Description: >
+      候補ユニバース本格対応(2026-08)。WatchlistWorkerFunctionの同時実行数上限。
+      Yahoo Financeへの同時アクセスを抑制する(3節)。2026-08-20、Issue #4の
+      実施基準充足(SQS OldestMessage最大69分・Throttles最大3,158件/日・
+      429率実質0%)を確認し、3→4へ段階的に引き上げ(検証用、悪化があれば3へ
+      ロールバック)。
+  WeeklyAggregateWriteEnabled:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >
+      Issue #537。true にすると、定点評価が暦日7日の評価を保存するとき、EvaluationResultの条件付きPutと
+      週次評価集計(WeeklyEvaluationAggregateTable)の加算・marker を1回のTransactWriteItemsで行う。
+      **既定は false(従来どおり insert_if_absent)。** 有効化は backfill(全履歴の集計の作成)の後の
+      別の承認による(docs/operations_manual.md 28節)。
+  WeeklyAggregateReadEnabled:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >
+      Issue #537。true にすると、週次改善レビューが集計済みの WeeklyEvaluationAggregateTable を読む
+      (EvaluationResultsTable を全件 Scan しない)。backfill が COMPLETE でなければ、true でも読まない
+      (従来の経路へ戻る)。**既定は false。** 有効化は別の承認による(docs/operations_manual.md 28節)。
+  WatchlistSqsBatchSize:
+    Type: Number
+    Default: 1
+    Description: >
+      候補ユニバース本格対応(2026-08)。WatchlistScreeningQueueのLambdaトリガー
+      BatchSize。初期値は1(3節)、安定稼働後に引き上げ可能。
+  BuyCandidateReservedConcurrentExecutions:
+    Type: Number
+    Default: 50
+    Description: >
+      Issue #319 Phase 1。BuyCandidateQueue経由のfan-out先(将来のworker)の
+      同時実行数上限。恒久値ではなく初期値であり、Queue depth・Oldest
+      message age・worker duration・throttles・account全体の同時実行数・
+      DLQ流入・batch完了時間をnatural verificationで実測してから増減判断する
+      (USER判断、2026-09-18)。account全体の同時実行上限(実測400、
+      unreserved396)の13%に相当し、無予約プールを奪い合わないための
+      backpressureとして機能する。Service Quota引上げ(#387)はこの初期値の
+      前提にしない。
+  BuyCandidateSqsBatchSize:
+    Type: Number
+    Default: 1
+    Description: >
+      Issue #319 Phase 1。BuyCandidateQueueのLambdaトリガーBatchSize。
+      Watchlistと同じ理由(1メッセージ=1銘柄、1銘柄の失敗が他銘柄を
+      巻き込まない)で初期値は1とする。
+  HoldingsWatchlistReservedConcurrentExecutions:
+    Type: Number
+    Default: 50
+    Description: >
+      Issue #319 Phase 1。HoldingsWatchlistQueue経由のfan-out先(将来の
+      worker)の同時実行数上限。buy-candidates側の初回natural verification
+      結果とholdings自身の負荷実測を踏まえてProduction activation直前に
+      確定する初期値であり、BuyCandidateReservedConcurrentExecutionsの値を
+      無条件にコピーしたものではない(USER判断、2026-09-18)。
+  HoldingsWatchlistSqsBatchSize:
+    Type: Number
+    Default: 1
+    Description: >
+      Issue #319 Phase 1。HoldingsWatchlistQueueのLambdaトリガーBatchSize。
+      buy-candidates側と同じ理由で初期値は1とする。
+  BuyCandidateSqsDispatchEnabled:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >
+      Issue #533(#319 Phase 2)。true にすると、買い候補分析Lambdaが銘柄単位の
+      fan-outをBuyCandidateQueue経由(SQS)で行う。**既定は false
+      (従来どおり非同期自己再帰呼び出し)。** 有効化(Phase 3)はnatural
+      verification後の別の承認による。
+  HoldingsWatchlistSqsDispatchEnabled:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >
+      Issue #533(#319 Phase 2)。true にすると、保有銘柄分析Lambdaが
+      holding単位のfan-outをHoldingsWatchlistQueue経由(SQS)で行う。
+      **既定は false(従来どおり非同期自己再帰呼び出し)。** 有効化(Phase 3)は
+      natural verification後の別の承認による。
+  RotationObservationScheduleState:
+    Type: String
+    Default: DISABLED
+    AllowedValues: [ENABLED, DISABLED]
+    Description: >
+      Issue #604 P-b4(#128 R2)。資金入替の観測 P の EventBridge Scheduler の State。
+      **既定は DISABLED(何も起動しない)。** ENABLED にするのは、P の mode を SHADOW にする
+      別の ChangeSet・別の USER 承認(P-b4 の B)のときだけ。mode は config/rotation_observation.yaml
+      (出荷 OFF)で決まり、この Parameter とは独立した 2 つ目の Human Gate である。
+  AllowFullMarketScreening:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >
+      本番運用ハードニング(2節)。"true"の場合のみ、staged_rollout.candidate_limitが
+      null(全件処理)の週次バッチ開始を許可する。運用者が明示的に
+      `--parameter-overrides AllowFullMarketScreening=true`を指定しない限り、
+      全件処理は起動時に拒否される(段階導入の安全側デフォルトと対になる二重の安全策)。
+  GithubAppSecretArn:
+    Type: String
+    Default: "arn:aws:secretsmanager:ap-northeast-1:123456789012:secret:jstock/github-app-not-configured"
+    Description: >
+      振り返り機能改修(2026-08)。週次改善レビューのGitHub Issue自動起票に使う
+      GitHub App認証情報({"app_id","installation_id","private_key"}のJSON)を
+      保持するSecrets ManagerシークレットのARN。GitHub App作成・インストール・
+      Secrets登録完了までは、既定値(未作成のダミーARN)のままでよい
+      (config/review_improvement.yamlのissue_creation_enabled=falseにより、
+      このシークレットは実際には参照されない)。実際のARNへ差し替えたら
+      config/review_improvement.yamlをissue_creation_enabled: trueへ変更し
+      再デプロイすること。
+  GithubRepository:
+    Type: String
+    Default: ""
+    Description: >
+      振り返り機能改修(2026-08)。GitHub Issueを作成する対象リポジトリ
+      ("owner/repo"形式)。未設定の間はGitHub Issue自動起票を行わない。
+  SecretResourcePolicyEnabled:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >
+      Issue #680(#133 UNIT2)。jstockが保持するSecrets Managerシークレット群へ、
+      identity policyとは独立したresource policy(第二の防壁。allow-listに
+      無いprincipalをexplicit Denyする)を適用するかのトグル。既定false
+      (未適用。本パラメータ・関連resourceのmerge単独ではAWS上の状態は一切
+      変更されない)。trueへの変更は、AdminPrincipalArn/DeployPrincipalArnを
+      実際の値へ差し替えたうえで、事前確認(IAM Policy Simulatorが使える
+      範囲はprincipalの種別で異なる。docs/operations_manual.md §35.1参照)・
+      USER承認を経たProduction適用のHuman Gateを通してから行うこと。
+  AdminPrincipalArn:
+    Type: String
+    Default: "arn:aws:iam::000000000000:role/not-configured"
+    Description: >
+      Issue #680。SecretResourcePolicyEnabled=trueのときのみ使用する。
+      resource policyのexplicit Denyから除外する、人間の管理者principal
+      (recovery/break-glass兼務。本アカウントには専用のbreak-glass
+      principalが別途存在しないため、管理者roleが実質的にrecovery経路を
+      兼ねる)のARN。SecretResourcePolicyEnabledをtrueにする前に、実際の
+      ARNへ差し替えること(既定値のダミーARNのままtrueにすると、管理者
+      自身がlockoutされる。infra/template.yamlのRulesセクションが
+      この組み合わせをstack操作自体で機械的に拒否する)。
+      ★ ここへ書くのはIAM role自体のARN(arn:aws:iam::<account>:role/<name>)
+      であり、CloudTrail・Console・AccessDeniedExceptionで見るsts::
+      assumed-role形式ではない(別物であり、そのまま貼るとallow-listが
+      機能しない)。管理者がAWS SSO(IAM Identity Center)経由のroleの
+      場合、実際のARNはarn:aws:iam::<account>:role/aws-reserved/
+      sso.amazonaws.com/<region>/AWSReservedSSO_<permission-set>_<hash>
+      という長い形式になり、permission setの削除・再作成で静かに値が
+      変わりうる(docs/operations_manual.md §35.1参照)。
+  DeployPrincipalArn:
+    Type: String
+    Default: "arn:aws:iam::000000000000:user/not-configured"
+    Description: >
+      Issue #680。SecretResourcePolicyEnabled=trueのときのみ使用する。
+      resource policyのexplicit Denyから除外する、Production deployに
+      使うprincipal(#164のscope。長期credentialの是正はIssue #164が
+      別途扱う)のARN。**現状はIAM user自体のARN
+      (arn:aws:iam::<account>:user/<name>)を想定する**(2026-09-28、
+      サブちゃんレビュー指摘F9でfresh確認。#164が問題とする「長期・
+      自動失効なしのcredential」はIAM roleの一時credentialではなく
+      IAM userの長期access keyであることと整合する)。#164でdeploy
+      principal自体が変更された場合、本パラメータの値も同期して
+      更新すること(同期を怠ると次回deploy時にdeploy principal自身が
+      lockoutされうる。また、AdminPrincipalArnとは異なりIAM roleでは
+      ないため、IAM Policy Simulatorのresource policy込みsimulationが
+      使える〔docs/operations_manual.md §35.1参照〕という違いがある)。
+      deploy principalがlockoutされた場合の復旧手順は同§35.2。
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures: [x86_64]
+    Timeout: 300
+    MemorySize: 512
+    Layers:
+      - !Ref DependenciesLayer
+      - !Ref ConfigLayer
+    Environment:
+      Variables:
+        DYNAMODB_TABLE_PREFIX: !Ref TablePrefix
+        JSTOCK_CONFIG_DIR: /opt
+        EDINET_API_KEY: !Sub "{{resolve:secretsmanager:${EdinetApiKeySecretArn}:SecretString}}"
+        LINE_CHANNEL_ACCESS_TOKEN: !Sub "{{resolve:secretsmanager:${LineChannelAccessTokenSecretArn}:SecretString}}"
+        LINE_USER_ID: !Sub "{{resolve:secretsmanager:${LineUserIdSecretArn}:SecretString}}"
+        # Issue #117 Phase R1: ローテーション時の強制再解決マーカー(非秘密)。
+        # 上の3つのdynamic referenceと**同じEnvironmentブロック**に置くことが要件で、
+        # この値が変わればブロック全体が変更されて再解決が起きる。
+        # 値は運用者が明示的に渡す非秘密の版数であり、秘密を入れてはならない。
+        LINE_CREDENTIAL_ROTATION_VERSION: !Ref LineCredentialRotationVersion
+        EDINET_CREDENTIAL_ROTATION_VERSION: !Ref EdinetCredentialRotationVersion
+
+Conditions:
+  # Issue #680(#133 UNIT2): 以下のSecretsManager ResourcePolicyリソース群は、
+  # このConditionがtrueのときのみ作成される。既定(SecretResourcePolicyEnabled=
+  # "false")ではCloudFormationはこれらのresourceを一切作成しない。本PRのmerge・
+  # 通常のstack更新だけではAWS上の状態は変更されない(#533のSQS dispatch
+  # トグルと同型の安全策)。
+  SecretResourcePolicyIsEnabled: !Equals [!Ref SecretResourcePolicyEnabled, "true"]
+
+Rules:
+  # Issue #680(サブちゃんレビュー指摘F1対応): SecretResourcePolicyEnabled=true
+  # かつAdminPrincipalArn/DeployPrincipalArnが既定のダミー値のままだと、5secret
+  # すべてでadmin・deployの両方がDenyされ(allow-listに実ARNが1件も入っていない
+  # ため)、即座に全員lockoutする。この組み合わせを、Parameter Descriptionの
+  # 文章だけに頼らず、stack操作(create-change-set等)時に機械的に拒否する。
+  SecretResourcePolicyRequiresRealPrincipals:
+    RuleCondition: !Equals [!Ref SecretResourcePolicyEnabled, "true"]
+    Assertions:
+      - Assert:
+          !Not [!Equals [!Ref AdminPrincipalArn, "arn:aws:iam::000000000000:role/not-configured"]]
+        AssertDescription: >
+          SecretResourcePolicyEnabled=trueにする前に、AdminPrincipalArnへ実際の
+          管理者principalのARNを設定してください。既定のダミー値のままtrueにすると、
+          resource policyのexplicit Denyがallow-list外の全員(管理者含む)を拒否し、
+          即座にlockoutします。
+      - Assert:
+          !Not [!Equals [!Ref DeployPrincipalArn, "arn:aws:iam::000000000000:user/not-configured"]]
+        AssertDescription: >
+          SecretResourcePolicyEnabled=trueにする前に、DeployPrincipalArnへ実際の
+          deploy principalのARNを設定してください。既定のダミー値のままtrueにすると、
+          resource policyのexplicit Denyがallow-list外の全員(deploy principal含む)を
+          拒否し、次回以降のdeployが即座に失敗します。
+
+Resources:
+  # --- 候補ユニバース本格対応(2026-08): S3キャッシュバケット ------------------
+  # 東証上場銘柄一覧・JPX400構成銘柄のcurrent/archiveレイアウトを保存する
+  # (services/candidate_universe_downloader.py)。非機能要件: 暗号化・バージョニング・
+  # TLS-onlyポリシー・パブリックアクセスブロック・ライフサイクル(archive/の
+  # 世代を1年で失効、非最新バージョンを90日で失効)。
+
+  CandidateUniverseCacheBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-candidate-universe-cache"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldArchiveGenerations
+            Status: Enabled
+            Prefix: archive/
+            ExpirationInDays: 365
+          - Id: ExpireNoncurrentVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 90
+
+  CandidateUniverseCacheBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CandidateUniverseCacheBucket
+      PolicyDocument:
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt CandidateUniverseCacheBucket.Arn
+              - !Sub "${CandidateUniverseCacheBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+
+  # --- 候補ユニバース本格対応(2026-08): SQSキュー ----------------------------
+  # WatchlistScreeningQueue(メイン、BatchSize=1) → maxReceiveCount 3回失敗で
+  # WatchlistTerminalFailureQueue(作業用、自動消費してFAILED確定) →
+  # Handler自体が3回失敗した場合のみWatchlistTerminalFailureDLQ(真正のDLQ、
+  # 何も自動消費しない、ApproximateNumberOfMessagesVisibleへのCloudWatch Alarmを
+  # 運用側で設定すること、4節)。
+
+  WatchlistTerminalFailureDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${AWS::StackName}-watchlist-terminal-failure-dlq"
+      MessageRetentionPeriod: 1209600 # 14日(運用調査用に長めに保持)
+
+  WatchlistTerminalFailureQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${AWS::StackName}-watchlist-terminal-failure"
+      VisibilityTimeout: 120 # WatchlistTerminalFailureHandlerFunctionのTimeout(60秒)+余裕
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt WatchlistTerminalFailureDLQ.Arn
+        maxReceiveCount: 3
+
+  WatchlistScreeningQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${AWS::StackName}-watchlist-screening"
+      VisibilityTimeout: 1080 # 3節: WatchlistWorkerFunctionのLambda Timeout(180秒)の6倍
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt WatchlistTerminalFailureQueue.Arn
+        maxReceiveCount: 3
+
+  # --- Issue #319 Phase 1: buy-candidates / holdings-watchlist SQSキュー -----
+  # ★ Phase 1時点では、いずれのキューもコードから一切参照されない
+  # (Production挙動を変えない基盤実装)。dispatch側の切替(Phase 2)・
+  # worker Lambdaの新設(Phase 2)・Production activation(Phase 3、別Human
+  # Gate)は本段階では行わない。3段構成(メイン→terminal failure→真正DLQ)は
+  # WatchlistScreeningQueue/WatchlistTerminalFailureQueue/
+  # WatchlistTerminalFailureDLQと同じ設計を踏襲する(#319 Phase A設計S-1)。
+
+  BuyCandidateTerminalFailureDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${AWS::StackName}-buy-candidate-terminal-failure-dlq"
+      MessageRetentionPeriod: 1209600 # 14日(WatchlistTerminalFailureDLQと同じ)
+
+  BuyCandidateTerminalFailureQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${AWS::StackName}-buy-candidate-terminal-failure"
+      VisibilityTimeout: 120 # 将来のBuyCandidateTerminalFailureHandlerFunctionを
+                             # 60秒想定として、Watchlistと同じ比率(Timeoutの2倍)で確保
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt BuyCandidateTerminalFailureDLQ.Arn
+        maxReceiveCount: 3
+
+  BuyCandidateQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${AWS::StackName}-buy-candidate-queue"
+      VisibilityTimeout: 5400 # #319 Phase A設計S-1: 対象関数のTimeout(900秒)の6倍
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt BuyCandidateTerminalFailureQueue.Arn
+        maxReceiveCount: 3
+
+  HoldingsWatchlistTerminalFailureDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${AWS::StackName}-holdings-watchlist-terminal-failure-dlq"
+      MessageRetentionPeriod: 1209600
+
+  HoldingsWatchlistTerminalFailureQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${AWS::StackName}-holdings-watchlist-terminal-failure"
+      VisibilityTimeout: 120
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt HoldingsWatchlistTerminalFailureDLQ.Arn
+        maxReceiveCount: 3
+
+  HoldingsWatchlistQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${AWS::StackName}-holdings-watchlist-queue"
+      VisibilityTimeout: 5400 # HoldingsWatchlistFunctionのTimeout(900秒)の6倍
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt HoldingsWatchlistTerminalFailureQueue.Arn
+        maxReceiveCount: 3
+
+  # Issue #318: Lambdaの**非同期呼び出し**(InvocationType="Event")が再試行を
+  # 使い切って失敗した場合の受け皿。現状は行き先が無く、静かに捨てられていた。
+  # ★ このDLQが受けるのは**非同期呼び出しの失敗のみ**である。
+  #   EventBridge Schedulerの delivery failure(Lambdaを起動できなかった場合)は
+  #   **このキューには入らない**。Scheduler側のDLQはSAMの制約により
+  #   Schedule毎に1本ずつ作るか(11本)、実行ロールへsqs:SendMessageを自前で
+  #   与える必要があり、本Issueのscopeに対して過大と判断した(#318のコメント参照)。
+  #   起動されなかったことの検知は**Issue #132**が扱う。
+  # ★ 再投入はしない(再投入は二重実行そのもの)。人が調査するための保管である。
+  AsyncInvokeFailureDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${AWS::StackName}-async-invoke-failure-dlq"
+      MessageRetentionPeriod: 1209600 # 14日(WatchlistTerminalFailureDLQと同じ)
+
+  # --- Lambda Layer(依存パッケージ) -------------------------------------
+
+  DependenciesLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: !Sub "${AWS::StackName}-deps"
+      ContentUri: layer/
+      CompatibleRuntimes:
+        - python3.12
+      RetentionPolicy: Delete
+    Metadata:
+      BuildMethod: python3.12
+
+  ConfigLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: !Sub "${AWS::StackName}-config"
+      ContentUri: ../config/
+      CompatibleRuntimes:
+        - python3.12
+      RetentionPolicy: Delete
+
+  # --- DynamoDBテーブル ----------------------------------------------------
+  # オンデマンド課金(個人利用規模でアクセス頻度が低く予測しづらいため)。
+  # 各テーブルはinfrastructure/collection_store.pyのresolve_table_name()が
+  # 計算する名前(${TablePrefix}-<file_nameから.jsonを除いたもの>)と一致させる。
+
+  HoldingsTable:
+    Type: AWS::DynamoDB::Table
+    # Issue #137: 失うと再生成できないデータのため、stack 削除・置換で
+    # 実体を消さない。保護対象の判定は Phase A のデータ分類に従う。
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      # Issue #137: 誤削除の防止と、直近 35 日への時点復元。
+      DeletionProtectionEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      TableName: !Sub "${TablePrefix}-holdings"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: stock_code
+          AttributeType: S
+      KeySchema:
+        - AttributeName: stock_code
+          KeyType: HASH
+
+  # 保有銘柄オーナー機能移行(データ移行手順M1、2026-08追加): holding_id
+  # (owner×stock_codeの合成キー)をパーティションキーとする新テーブル。
+  # 既存のHoldingsTable(stock_code単一キー)はそのまま残し(削除しない)。
+  # M3(アプリケーション本体切替)以降、PortfolioService/HoldingRepositoryは
+  # このテーブルを参照する(旧HoldingsTableはロールバック用に保持されるのみで、
+  # 実行時には参照されない)。参照するFunctionのIAM Policyへこのテーブルの
+  # ARNを追加し忘れるとAccessDeniedExceptionになる(M4本番検証で実際に発生・
+  # 修正した不備。下記の各FunctionのPolicies参照)。
+  HoldingsTableV2:
+    Type: AWS::DynamoDB::Table
+    # Issue #137: 失うと再生成できないデータのため、stack 削除・置換で
+    # 実体を消さない。保護対象の判定は Phase A のデータ分類に従う。
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      # Issue #137: 誤削除の防止と、直近 35 日への時点復元。
+      DeletionProtectionEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      TableName: !Sub "${TablePrefix}-holdings_v2"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: holding_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: holding_id
+          KeyType: HASH
+
+  PurchaseLotsTable:
+    Type: AWS::DynamoDB::Table
+    # Issue #137: 失うと再生成できないデータのため、stack 削除・置換で
+    # 実体を消さない。保護対象の判定は Phase A のデータ分類に従う。
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      # Issue #137: 誤削除の防止と、直近 35 日への時点復元。
+      DeletionProtectionEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      TableName: !Sub "${TablePrefix}-purchase_lots"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: lot_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: lot_id
+          KeyType: HASH
+
+  WatchlistTable:
+    Type: AWS::DynamoDB::Table
+    # Issue #137: 失うと再生成できないデータのため、stack 削除・置換で
+    # 実体を消さない。保護対象の判定は Phase A のデータ分類に従う。
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      # Issue #137: 誤削除の防止と、直近 35 日への時点復元。
+      DeletionProtectionEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      TableName: !Sub "${TablePrefix}-watchlist"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: stock_code
+          AttributeType: S
+      KeySchema:
+        - AttributeName: stock_code
+          KeyType: HASH
+
+  RecommendationsTable:
+    Type: AWS::DynamoDB::Table
+    # Issue #137: 失うと再生成できないデータのため、stack 削除・置換で
+    # 実体を消さない。保護対象の判定は Phase A のデータ分類に従う。
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      # Issue #137: 誤削除の防止と、直近 35 日への時点復元。
+      DeletionProtectionEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      TableName: !Sub "${TablePrefix}-recommendations"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: recommendation_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: recommendation_id
+          KeyType: HASH
+
+  # 通知検証モード機能(2026-08追加)。投資判断の履歴テーブルではなく、BUY候補
+  # fan-out(buy_candidates_handler.py)の各Lambda呼び出し間でVALIDATION実行時の
+  # Recommendationを受け渡すための一時的な作業領域。本番RecommendationsTableとは
+  # 物理的に分離し、評価/バックテスト/DecisionPerformance等の消費者側コードから
+  # は一切参照されない。_finalize_batch正常完了後に明示的に削除されるが、
+  # Lambda異常終了等で削除されなかった場合の安全網としてTTLで自動削除する
+  # (RecommendationRepository.for_execution_context()参照)。
+  ValidationRecommendationsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${TablePrefix}-validation_recommendations"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: recommendation_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: recommendation_id
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  # --- BUY候補裾野拡大・NEAR BUY監視・通知制御の再設計(2026-08)で追加 -------
+
+  # NEAR BUYの継続監視状態(watch_state_service.py参照)。
+  WatchStateTable:
+    Type: AWS::DynamoDB::Table
+    # Issue #137: 失うと再生成できないデータのため、stack 削除・置換で
+    # 実体を消さない。保護対象の判定は Phase A のデータ分類に従う。
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      # Issue #137: 誤削除の防止と、直近 35 日への時点復元。
+      DeletionProtectionEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      TableName: !Sub "${TablePrefix}-watch_states"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: watch_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: watch_id
+          KeyType: HASH
+
+  # 通知検証モード機能との整合(2026-08追加): VALIDATION実行では本番の
+  # WatchStateを一切書き換えないよう分離する(WatchStateRepository.
+  # for_execution_context()参照)。
+  ValidationWatchStateTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${TablePrefix}-validation_watch_states"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: watch_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: watch_id
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  # 保有銘柄の前回スナップショット。売買イベント検知の差分基準とクールダウン
+  # 期限を保持する(trade_cooldown_service.py参照)。
+  HoldingsSnapshotTable:
+    Type: AWS::DynamoDB::Table
+    # Issue #137: 失うと再生成できないデータのため、stack 削除・置換で
+    # 実体を消さない。保護対象の判定は Phase A のデータ分類に従う。
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      # Issue #137: 誤削除の防止と、直近 35 日への時点復元。
+      DeletionProtectionEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      TableName: !Sub "${TablePrefix}-holdings_snapshots"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: stock_code
+          AttributeType: S
+      KeySchema:
+        - AttributeName: stock_code
+          KeyType: HASH
+
+  ValidationHoldingsSnapshotTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${TablePrefix}-validation_holdings_snapshots"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: stock_code
+          AttributeType: S
+      KeySchema:
+        - AttributeName: stock_code
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  # 保有銘柄オーナー機能移行(データ移行手順M1、2026-08追加): holding_id単位の
+  # TradeCooldown/売買イベント検知状態。M3以降TradeCooldownService(HoldingsSnapshot
+  # Repository)が参照する。参照するFunctionのIAM Policyへの追加が必要
+  # (HoldingsTableV2の注記参照)。
+  HoldingsSnapshotTableV2:
+    Type: AWS::DynamoDB::Table
+    # Issue #137: 失うと再生成できないデータのため、stack 削除・置換で
+    # 実体を消さない。保護対象の判定は Phase A のデータ分類に従う。
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      # Issue #137: 誤削除の防止と、直近 35 日への時点復元。
+      DeletionProtectionEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      TableName: !Sub "${TablePrefix}-holdings_snapshots_v2"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: holding_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: holding_id
+          KeyType: HASH
+
+  ValidationHoldingsSnapshotTableV2:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${TablePrefix}-validation_holdings_snapshots_v2"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: holding_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: holding_id
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  # 売買イベント検知処理(TradeCooldownService.detect_and_apply)の実行順序
+  # 非依存化・冪等性担保用ロック(infrastructure/aws/trade_detection_lock.py
+  # 参照)。PK=business_date(値は"NORMAL:2026-08-14"/"VALIDATION:2026-08-14"の
+  # ようにExecutionModeで名前空間分離される。コードレビュー対応2026-08:
+  # VALIDATIONが先に完了してもNORMALの検知処理をスキップさせないため)。
+  # TTLで自動失効する一時データ。
+  TradeDetectionRunLockTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${TablePrefix}-trade_detection_run_locks"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: business_date
+          AttributeType: S
+      KeySchema:
+        - AttributeName: business_date
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  # Issue #71 F-C11 Phase 1: TradeCooldownServiceが検知した売買イベントを
+  # HoldingsSnapshotEntry更新より前に耐久性のある形で記録する
+  # (trade_event_record_repository.py参照)。sparse GSI(pending-marker-index)
+  # により、未消費(pending_marker属性を持つ)イベントのみを効率的に取得できる
+  # (消費[consumed_at設定・pending_marker削除]はPhase 2のスコープ)。
+  # 失うと再検知できないわけではない(次回実行が同じイベントを再検知できる)が、
+  # 取りこぼされたイベントの復旧(WatchState終了)に必要な唯一の記録であるため
+  # Issue #137と同じ保護方針(Retain + PITR)を適用する。保持期間は未定義
+  # (Issue #138のretention policy整備を待つ。TTLは設定しない)。
+  TradeEventRecordsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      DeletionProtectionEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      TableName: !Sub "${TablePrefix}-trade_event_records"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: event_id
+          AttributeType: S
+        - AttributeName: pending_marker
+          AttributeType: S
+        - AttributeName: detected_at
+          AttributeType: S
+      KeySchema:
+        - AttributeName: event_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: pending-marker-index
+          KeySchema:
+            - AttributeName: pending_marker
+              KeyType: HASH
+            - AttributeName: detected_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+  # 通知検証モード(VALIDATION)用。本番の永続状態・通常運用へ影響させない
+  # という既存方針(HoldingsSnapshotRepository等と同じ)。検証実行の一時データ
+  # のためTTLで自動失効する(TradeEventRecordRepository._VALIDATION_TTL_SECONDS
+  # =2時間)。
+  ValidationTradeEventRecordsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${TablePrefix}-validation_trade_event_records"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: event_id
+          AttributeType: S
+        - AttributeName: pending_marker
+          AttributeType: S
+        - AttributeName: detected_at
+          AttributeType: S
+      KeySchema:
+        - AttributeName: event_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: pending-marker-index
+          KeySchema:
+            - AttributeName: pending_marker
+              KeyType: HASH
+            - AttributeName: detected_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  # cross-pipeline通知重複抑止(コードレビュー対応2026-08、指摘5)。
+  # BUY候補Lambda・保有銘柄Lambdaのどちらから送信した通知でも、当日・同一銘柄の
+  # 最も高い優先度をここへ記録し、低優先度の重複通知をbest-effortで抑止する
+  # (完全な排他制御ではない)。当日限りのデータのためTTLで自動失効する。
+  DailyNotificationPriorityTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${TablePrefix}-daily_notification_priorities"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: record_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: record_id
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  ValidationDailyNotificationPriorityTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${TablePrefix}-validation_daily_notification_priorities"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: record_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: record_id
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  # --- 保有判断スコア方式(2026-08仕様)で追加 ------------------------------
+
+  HoldingDecisionResultsTable:
+    Type: AWS::DynamoDB::Table
+    # Issue #137: 失うと再生成できないデータのため、stack 削除・置換で
+    # 実体を消さない。保護対象の判定は Phase A のデータ分類に従う。
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      # Issue #137: 誤削除の防止と、直近 35 日への時点復元。
+      DeletionProtectionEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      TableName: !Sub "${TablePrefix}-holding_decision_results"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: holding_decision_result_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: holding_decision_result_id
+          KeyType: HASH
+
+  InvestmentThesesTable:
+    Type: AWS::DynamoDB::Table
+    # Issue #137: 失うと再生成できないデータのため、stack 削除・置換で
+    # 実体を消さない。保護対象の判定は Phase A のデータ分類に従う。
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      # Issue #137: 誤削除の防止と、直近 35 日への時点復元。
+      DeletionProtectionEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      TableName: !Sub "${TablePrefix}-investment_theses"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: investment_thesis_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: investment_thesis_id
+          KeyType: HASH
+
+  InvestmentThesisBaselinesTable:
+    Type: AWS::DynamoDB::Table
+    # Issue #137: 失うと再生成できないデータのため、stack 削除・置換で
+    # 実体を消さない。保護対象の判定は Phase A のデータ分類に従う。
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      # Issue #137: 誤削除の防止と、直近 35 日への時点復元。
+      DeletionProtectionEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      TableName: !Sub "${TablePrefix}-investment_thesis_baselines"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: baseline_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: baseline_id
+          KeyType: HASH
+
+  InvestmentThesisBaselineSequencesTable:
+    Type: AWS::DynamoDB::Table
+    # Issue #137: 失うと再生成できないデータのため、stack 削除・置換で
+    # 実体を消さない。保護対象の判定は Phase A のデータ分類に従う。
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      # Issue #137: 誤削除の防止と、直近 35 日への時点復元。
+      DeletionProtectionEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      TableName: !Sub "${TablePrefix}-investment_thesis_baseline_sequences"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: holding_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: holding_id
+          KeyType: HASH
+
+  # 保有銘柄オーナー機能移行(データ移行手順M1、2026-08追加): 既存テーブルの
+  # holding_id値がstock_codeの1:1エイリアスから所有者付き合成キー
+  # (例: "8306"→"本人#8306")へ変わるための新テーブル。既存のcurrent_version
+  # はリセットしない — 旧holding_id(stock_code)に紐づくcurrent_versionを、
+  # M2の移行スクリプトが新holding_id(本人#stock_code)へそのままコピーし、
+  # updated_at等の既存情報もあわせて維持する(旧: holding_id="8306"・
+  # current_version=4 → 新: holding_id="本人#8306"・current_version=4 →
+  # 移行後のallocate_next_baseline_version()は5から採番される)。既存
+  # テーブルはそのまま残す。
+  InvestmentThesisBaselineSequencesTableV2:
+    Type: AWS::DynamoDB::Table
+    # Issue #137: 失うと再生成できないデータのため、stack 削除・置換で
+    # 実体を消さない。保護対象の判定は Phase A のデータ分類に従う。
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      # Issue #137: 誤削除の防止と、直近 35 日への時点復元。
+      DeletionProtectionEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      TableName: !Sub "${TablePrefix}-investment_thesis_baseline_sequences_v2"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: holding_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: holding_id
+          KeyType: HASH
+
+  InvestmentThesisBaselinePointersTable:
+    Type: AWS::DynamoDB::Table
+    # Issue #137: 失うと再生成できないデータのため、stack 削除・置換で
+    # 実体を消さない。保護対象の判定は Phase A のデータ分類に従う。
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      # Issue #137: 誤削除の防止と、直近 35 日への時点復元。
+      DeletionProtectionEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      TableName: !Sub "${TablePrefix}-investment_thesis_baseline_pointers"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: holding_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: holding_id
+          KeyType: HASH
+
+  # 保有銘柄オーナー機能移行(データ移行手順M1、2026-08追加): 新holding_id値で
+  # baseline継続性を追跡する新テーブル。あわせて、create/get/updateの永続化
+  # 形式が一致していなかった既知の不整合(baseline_pointer.py参照、本番検証で
+  # 発見・修正済み)を再現しないよう、data属性全体一致のCAS方式(既に修正済み
+  # の実装)をそのまま踏襲する(新テーブル固有の追加対応は不要)。
+  InvestmentThesisBaselinePointersTableV2:
+    Type: AWS::DynamoDB::Table
+    # Issue #137: 失うと再生成できないデータのため、stack 削除・置換で
+    # 実体を消さない。保護対象の判定は Phase A のデータ分類に従う。
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      # Issue #137: 誤削除の防止と、直近 35 日への時点復元。
+      DeletionProtectionEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      TableName: !Sub "${TablePrefix}-investment_thesis_baseline_pointers_v2"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: holding_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: holding_id
+          KeyType: HASH
+
+  # notification_enabled=false等の安全側フォールバックが機能するよう、書き込みは
+  # CLI経由の人間のみに限定する(HoldingsWatchlistFunction等へはReadPolicyのみ付与)。
+  HoldingDecisionRuntimeConfigTable:
+    Type: AWS::DynamoDB::Table
+    # Issue #137: 失うと再生成できないデータのため、stack 削除・置換で
+    # 実体を消さない。保護対象の判定は Phase A のデータ分類に従う。
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      # Issue #137: 誤削除の防止と、直近 35 日への時点復元。
+      DeletionProtectionEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      TableName: !Sub "${TablePrefix}-holding_decision_runtime_config"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: config_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: config_id
+          KeyType: HASH
+
+  # 保有銘柄オーナー機能移行(2026-08)のM0: BUY/SELLの一時停止フラグ。書き込みは
+  # CLI経由の人間のみ(HoldingDecisionRuntimeConfigTableと同じ運用パターン)。
+  # LineWebhookFunctionは読み取り専用(ConversationServiceが起動時・確定直前に
+  # 参照する)。WATCHはHoldings/PurchaseLotsを一切更新しないため対象外。
+  TradingPauseConfigTable:
+    Type: AWS::DynamoDB::Table
+    # Issue #137: 失うと再生成できないデータのため、stack 削除・置換で
+    # 実体を消さない。保護対象の判定は Phase A のデータ分類に従う。
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      # Issue #137: 誤削除の防止と、直近 35 日への時点復元。
+      DeletionProtectionEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      TableName: !Sub "${TablePrefix}-trading_pause_config"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: config_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: config_id
+          KeyType: HASH
+
+  TransactionsTable:
+    Type: AWS::DynamoDB::Table
+    # Issue #137: 失うと再生成できないデータのため、stack 削除・置換で
+    # 実体を消さない。保護対象の判定は Phase A のデータ分類に従う。
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      # Issue #137: 誤削除の防止と、直近 35 日への時点復元。
+      DeletionProtectionEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      TableName: !Sub "${TablePrefix}-transactions"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: transaction_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: transaction_id
+          KeyType: HASH
+
+  SkippedRecommendationsTable:
+    Type: AWS::DynamoDB::Table
+    # Issue #137: 失うと再生成できないデータのため、stack 削除・置換で
+    # 実体を消さない。保護対象の判定は Phase A のデータ分類に従う。
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      # Issue #137: 誤削除の防止と、直近 35 日への時点復元。
+      DeletionProtectionEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      TableName: !Sub "${TablePrefix}-skipped_recommendations"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: recommendation_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: recommendation_id
+          KeyType: HASH
+
+  NotificationLogTable:
+    Type: AWS::DynamoDB::Table
+    # Issue #137: 失うと再生成できないデータのため、stack 削除・置換で
+    # 実体を消さない。保護対象の判定は Phase A のデータ分類に従う。
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      # Issue #137: 誤削除の防止と、直近 35 日への時点復元。
+      DeletionProtectionEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      TableName: !Sub "${TablePrefix}-notification_log"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: notification_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: notification_id
+          KeyType: HASH
+
+  # --- LINE通知dedupの原子化(Issue #17): 送信決定claimテーブル ---------------
+  # claim_id = identity文字列のSHA-256(64桁hex)。TTL(ttl属性、30日)はcleanup
+  # 専用であり、送信可否・stale判定には使わない(stale判定はアプリ側の
+  # claimed_at比較のみ。DynamoDB TTL削除は最大48時間程度遅延しうるため)。
+  NotificationClaimsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${TablePrefix}-notification_claims"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: claim_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: claim_id
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  EvaluationResultsTable:
+    Type: AWS::DynamoDB::Table
+    # Issue #137: 失うと再生成できないデータのため、stack 削除・置換で
+    # 実体を消さない。保護対象の判定は Phase A のデータ分類に従う。
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      # Issue #137: 誤削除の防止と、直近 35 日への時点復元。
+      DeletionProtectionEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      TableName: !Sub "${TablePrefix}-evaluation_results"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: evaluation_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: evaluation_id
+          KeyType: HASH
+
+  RuleVersionsTable:
+    Type: AWS::DynamoDB::Table
+    # Issue #137: 失うと再生成できないデータのため、stack 削除・置換で
+    # 実体を消さない。保護対象の判定は Phase A のデータ分類に従う。
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      # Issue #137: 誤削除の防止と、直近 35 日への時点復元。
+      DeletionProtectionEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      TableName: !Sub "${TablePrefix}-rule_versions"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: rule_version
+          AttributeType: S
+      KeySchema:
+        - AttributeName: rule_version
+          KeyType: HASH
+
+  RuleProposalsTable:
+    Type: AWS::DynamoDB::Table
+    # Issue #137: 失うと再生成できないデータのため、stack 削除・置換で
+    # 実体を消さない。保護対象の判定は Phase A のデータ分類に従う。
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      # Issue #137: 誤削除の防止と、直近 35 日への時点復元。
+      DeletionProtectionEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      TableName: !Sub "${TablePrefix}-rule_proposals"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: proposal_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: proposal_id
+          KeyType: HASH
+
+  # --- 振り返り機能改修(2026-08): 週次改善レビュー用テーブル3種 -------------
+
+  WeeklyReviewMetricsTable:
+    Type: AWS::DynamoDB::Table
+    # Issue #137: 失うと再生成できないデータのため、stack 削除・置換で
+    # 実体を消さない。保護対象の判定は Phase A のデータ分類に従う。
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      # Issue #137: 誤削除の防止と、直近 35 日への時点復元。
+      DeletionProtectionEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      TableName: !Sub "${TablePrefix}-weekly_review_metrics"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: metrics_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: metrics_id
+          KeyType: HASH
+
+  # Issue #537: 週次評価集計(raw の EvaluationResult から得られる中間集計)。WeeklyReviewMetrics(レビュー結果)
+  # とは別のテーブル。raw は正本として EvaluationResultsTable に残る(削除・TTL は行わない)。
+  # HASH = review_week / RANGE = item_key(集計行 `AGG#...`・週の状態 `#STATE`・一覧 `#INDEX`・制御 `#CONTROL`)。
+  # 1 週の集計行は Query 1 回で取れる(Scan しない)。
+  WeeklyEvaluationAggregateTable:
+    Type: AWS::DynamoDB::Table
+    # Issue #137: 失うと再生成に raw の全件走査が要るデータのため、stack 削除・置換で実体を消さない。
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      DeletionProtectionEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      TableName: !Sub "${TablePrefix}-weekly_evaluation_aggregate"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: review_week
+          AttributeType: S
+        - AttributeName: item_key
+          AttributeType: S
+      KeySchema:
+        - AttributeName: review_week
+          KeyType: HASH
+        - AttributeName: item_key
+          KeyType: RANGE
+
+  ImprovementCandidatesTable:
+    Type: AWS::DynamoDB::Table
+    # Issue #137: 失うと再生成できないデータのため、stack 削除・置換で
+    # 実体を消さない。保護対象の判定は Phase A のデータ分類に従う。
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      # Issue #137: 誤削除の防止と、直近 35 日への時点復元。
+      DeletionProtectionEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      TableName: !Sub "${TablePrefix}-improvement_candidates"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: candidate_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: candidate_id
+          KeyType: HASH
+
+  ImprovementTasksTable:
+    # candidate_key単位で1件のみ存在し、複数週を跨いでGitHub Issue対応状況
+    # (ISSUE_CREATING等)を原子的に更新し続ける(infrastructure.aws.
+    # improvement_task_tracker.py参照)。
+    Type: AWS::DynamoDB::Table
+    # Issue #137: 失うと再生成できないデータのため、stack 削除・置換で
+    # 実体を消さない。保護対象の判定は Phase A のデータ分類に従う。
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      # Issue #137: 誤削除の防止と、直近 35 日への時点復元。
+      DeletionProtectionEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      TableName: !Sub "${TablePrefix}-improvement_tasks"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: candidate_key
+          AttributeType: S
+      KeySchema:
+        - AttributeName: candidate_key
+          KeyType: HASH
+
+  # --- 判定精度向上機能Phase A(2026-08): 自己評価基盤 -------------------------
+
+  DecisionSnapshotsTable:
+    Type: AWS::DynamoDB::Table
+    # Issue #137: 失うと再生成できないデータのため、stack 削除・置換で
+    # 実体を消さない。保護対象の判定は Phase A のデータ分類に従う。
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      # Issue #137: 誤削除の防止と、直近 35 日への時点復元。
+      DeletionProtectionEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      TableName: !Sub "${TablePrefix}-decision_snapshots"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: decision_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: decision_id
+          KeyType: HASH
+
+  # 買い候補サマリー表示改修(2026-08)。将来のLINE詳細理由照会機能に向けた参照用
+  # ストア(BuyCandidateEvaluationRecordRepository参照)。Recommendation/
+  # DecisionSnapshotの代替ではなく、無期限に増加させないため既定90日でTTL削除する。
+  BuyCandidateEvaluationRecordsTable:
+    Type: AWS::DynamoDB::Table
+    # Issue #137: 失うと再生成できないデータのため、stack 削除・置換で
+    # 実体を消さない。保護対象の判定は Phase A のデータ分類に従う。
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      # Issue #137: 誤削除の防止と、直近 35 日への時点復元。
+      DeletionProtectionEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      TableName: !Sub "${TablePrefix}-buy_candidate_evaluation_records"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: evaluation_id
+          AttributeType: S
+        # LINE UI第二弾「対象確認」機能(2026-08)向け。GSI(batch_id-index)の
+        # HASHキー。evaluation_id(batch_id:stock_codeの複合文字列)からは
+        # batch_id単体でのQueryができないため追加した。デプロイ前に書き込まれた
+        # 既存レコードにはbatch_id属性(トップレベル)が無く、DynamoDBのGSIは
+        # スパースインデックスのためそれらはGSIに載らない(実害無し、詳細は
+        # BuyCandidateEvaluationRecordRepository参照)。
+        - AttributeName: batch_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: evaluation_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: batch_id-index
+          KeySchema:
+            - AttributeName: batch_id
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  HoldingEvaluationRecordsTable:
+    # Phase 2-B「銘柄分析」向け(2026-08)。保有銘柄1回の評価ごとに1件、どの
+    # エンジン(Legacy SELL/ProfitTaking/HoldingDecisionScore)が実際の判定担当
+    # だったかを記録する。BuyCandidateEvaluationRecordsTableと対称的な設計。
+    Type: AWS::DynamoDB::Table
+    # Issue #137: 失うと再生成できないデータのため、stack 削除・置換で
+    # 実体を消さない。保護対象の判定は Phase A のデータ分類に従う。
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      # Issue #137: 誤削除の防止と、直近 35 日への時点復元。
+      DeletionProtectionEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      TableName: !Sub "${TablePrefix}-holding_evaluation_records"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: holding_evaluation_id
+          AttributeType: S
+        # GSI(holding_id-index)のHASH/RANGEキー。holding_id(owner#stock_code)
+        # 単体でのQueryができないため追加した(FilterExpressionでのowner絞り込み
+        # は行わない設計、HoldingEvaluationRecordRepository参照)。
+        - AttributeName: holding_id
+          AttributeType: S
+        - AttributeName: evaluated_at
+          AttributeType: S
+      KeySchema:
+        - AttributeName: holding_evaluation_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: holding_id-index
+          KeySchema:
+            - AttributeName: holding_id
+              KeyType: HASH
+            - AttributeName: evaluated_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  # LINE UI第二弾「対象確認」機能(2026-08)向け。単一行(pointer_id="default"
+  # 固定)のみを保持する、直近完了BUY候補batchの永続ポインタ。BatchRunsTable
+  # (TTL6時間、買い候補パイプラインではstatus更新自体を行わない)では
+  # 「最新完了batch」を長期に特定できないため新設した。書き込みは
+  # buy_candidates_handler._finalize_batch()からNORMAL運用かつ全対象銘柄分の
+  # BuyCandidateEvaluationRecord保存成功時のみ行う。TTLは持たせない(常に
+  # 上書きのため肥大化しない)。
+  BuyCandidateBatchCompletionTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${TablePrefix}-buy_candidate_batch_completion"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pointer_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pointer_id
+          KeyType: HASH
+
+  UserFeedbackTable:
+    Type: AWS::DynamoDB::Table
+    # Issue #137: 失うと再生成できないデータのため、stack 削除・置換で
+    # 実体を消さない。保護対象の判定は Phase A のデータ分類に従う。
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      # Issue #137: 誤削除の防止と、直近 35 日への時点復元。
+      DeletionProtectionEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      TableName: !Sub "${TablePrefix}-user_feedback"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: feedback_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: feedback_id
+          KeyType: HASH
+
+  AuditLogTable:
+    Type: AWS::DynamoDB::Table
+    # Issue #137: 失うと再生成できないデータのため、stack 削除・置換で
+    # 実体を消さない。保護対象の判定は Phase A のデータ分類に従う。
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      # Issue #137: 誤削除の防止と、直近 35 日への時点復元。
+      DeletionProtectionEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      TableName: !Sub "${TablePrefix}-audit_log"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: audit_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: audit_id
+          KeyType: HASH
+
+  ShareholderBenefitsTable:
+    Type: AWS::DynamoDB::Table
+    # Issue #137: 失うと再生成できないデータのため、stack 削除・置換で
+    # 実体を消さない。保護対象の判定は Phase A のデータ分類に従う。
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      # Issue #137: 誤削除の防止と、直近 35 日への時点復元。
+      DeletionProtectionEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      TableName: !Sub "${TablePrefix}-shareholder_benefits"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: stock_code
+          AttributeType: S
+      KeySchema:
+        - AttributeName: stock_code
+          KeyType: HASH
+
+  CorporateActionRegistryTable:
+    Type: AWS::DynamoDB::Table
+    # Issue #137: 失うと再生成できないデータのため、stack 削除・置換で
+    # 実体を消さない。保護対象の判定は Phase A のデータ分類に従う。
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      # Issue #137: 誤削除の防止と、直近 35 日への時点復元。
+      DeletionProtectionEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      TableName: !Sub "${TablePrefix}-corporate_action_registry"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: event_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: event_id
+          KeyType: HASH
+
+  # 銘柄名の手動オーバーライド(2026-07 BUYパイプライン第2次修正・要求仕様19節)。
+  StockNameOverridesTable:
+    Type: AWS::DynamoDB::Table
+    # Issue #137: 失うと再生成できないデータのため、stack 削除・置換で
+    # 実体を消さない。保護対象の判定は Phase A のデータ分類に従う。
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      # Issue #137: 誤削除の防止と、直近 35 日への時点復元。
+      DeletionProtectionEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      TableName: !Sub "${TablePrefix}-stock_name_overrides"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: stock_code
+          AttributeType: S
+      KeySchema:
+        - AttributeName: stock_code
+          KeyType: HASH
+
+  EdinetFilingCacheTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${TablePrefix}-edinet_filing_cache"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: stock_code
+          AttributeType: S
+      KeySchema:
+        - AttributeName: stock_code
+          KeyType: HASH
+
+  EdinetDisclosureCacheTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${TablePrefix}-edinet_disclosure_cache"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: stock_code
+          AttributeType: S
+      KeySchema:
+        - AttributeName: stock_code
+          KeyType: HASH
+
+  # EDINET書類一覧(documents.json?date=D)の日付単位キャッシュ(Issue #53)。
+  # 一覧APIは日付単位で「その日の全提出書類」を返すため、銘柄ごとに取得すると
+  # 同じ応答を銘柄数だけ取得することになる(ウォッチリスト評価は最大300銘柄)。
+  # scan_date(JST暦日)をキーに取得結果を共有し、全Lambdaで再利用する。
+  # 物理TTLは450日(document_finderの初期lookback 400暦日より長くしないと、
+  # 新規銘柄追加時に古い日付を大量に再取得する構造へ戻るため)。再取得可能な
+  # キャッシュのみを保持し、業務データは持たない。
+  EdinetDailyDocumentListCacheTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${TablePrefix}-edinet_daily_document_list_cache"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: scan_date
+          AttributeType: S
+      KeySchema:
+        - AttributeName: scan_date
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  # 銘柄単位ファンアウト(_fanout.py)の完了検知用。原子的なADDカウンタとして
+  # infrastructure/aws/batch_tracker.pyから直接操作するため、他テーブルと異なり
+  # {id_field, data: JSON}形式ではなく数値属性を直接持つ。TTLで数時間後に自動削除する。
+  # 通知検証モード機能(2026-08追加)のvalidation_recommendation_ids属性もこのテーブルへ
+  # 追記するが、あくまでfan-out完了検知のための一時的な実行制御データであり、
+  # 通常運用の投資判断履歴(Recommendation/DecisionSnapshot等)とは性質が異なる。
+  BatchRunsTable:
+    Type: AWS::DynamoDB::Table
+    # Issue #137: 失うと再生成できないデータのため、stack 削除・置換で
+    # 実体を消さない。保護対象の判定は Phase A のデータ分類に従う。
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      # Issue #137: 誤削除の防止と、直近 35 日への時点復元。
+      DeletionProtectionEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      TableName: !Sub "${TablePrefix}-batch_runs"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: batch_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: batch_id
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  # 候補ユニバース本格対応(2026-08)。銘柄単位の進捗・冪等性・リース状態を保持する
+  # (PK: batch_id, SK: stock_code)。infrastructure/aws/batch_tracker.pyの
+  # ウォッチリスト専用関数群(query_all_candidate_progress等)が操作する。
+  WatchlistCandidateProgressTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${TablePrefix}-watchlist_candidate_progress"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: batch_id
+          AttributeType: S
+        - AttributeName: stock_code
+          AttributeType: S
+      KeySchema:
+        - AttributeName: batch_id
+          KeyType: HASH
+        - AttributeName: stock_code
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  # 本番運用ハードニング(4節)。yfinance系データ(価格/財務・配当)のキャッシュ。
+  # services/watchlist_data_cache.pyのCachingProviderBundleが読み書きする
+  # (PK: cache_key、汎用CacheEntryをpayload_jsonとして格納)。ウォッチリストの
+  # 4Lambdaハンドラのみが使用し、BUY候補・保有銘柄分析パイプラインは対象外。
+  # DynamoDBネイティブTTLは設定しない(キー空間が銘柄コード数で自然に有界なため、
+  # EdinetFilingCacheTable等の既存キャッシュテーブルと同じ方針。鮮度判定は
+  # get_or_fetch側のcached_at比較のみで行う)。
+  WatchlistPriceCacheTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${TablePrefix}-watchlist_price_cache"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: cache_key
+          AttributeType: S
+      KeySchema:
+        - AttributeName: cache_key
+          KeyType: HASH
+
+  WatchlistFinancialCacheTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${TablePrefix}-watchlist_financial_cache"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: cache_key
+          AttributeType: S
+      KeySchema:
+        - AttributeName: cache_key
+          KeyType: HASH
+
+  # ウォッチリスト自動運用の改善(永続ラウンドロビン方式、2026-08)。新規候補選定の
+  # 唯一の永続カーソル(単一行、rotation_id="default"固定)。infrastructure/aws/
+  # watchlist_rotation_state.pyが楽観ロック(pointer_version)で更新する。TTLは
+  # 設定しない(恒久的な状態のため)。
+  WatchlistScreeningRotationStateTable:
+    Type: AWS::DynamoDB::Table
+    # Issue #137: 失うと再生成できないデータのため、stack 削除・置換で
+    # 実体を消さない。保護対象の判定は Phase A のデータ分類に従う。
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      # Issue #137: 誤削除の防止と、直近 35 日への時点復元。
+      DeletionProtectionEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      TableName: !Sub "${TablePrefix}-watchlist_screening_rotation_state"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: rotation_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: rotation_id
+          KeyType: HASH
+
+  # ウォッチリスト自動運用の改善(自動メンテナンス、計画Part C-4)。AUTO_SCREENING
+  # 銘柄が自動削除された際の再追加クールダウン判定専用。infrastructure/
+  # local_repository/watchlist_removal_history_repository.pyが
+  # readd_cooldown_days基準のDynamoDB Native TTL(ttl属性)で自動失効させる
+  # (クールダウン終了と同時に行が自動的に消える)。
+  WatchlistRemovalHistoryTable:
+    Type: AWS::DynamoDB::Table
+    # Issue #137: 失うと再生成できないデータのため、stack 削除・置換で
+    # 実体を消さない。保護対象の判定は Phase A のデータ分類に従う。
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      # Issue #137: 誤削除の防止と、直近 35 日への時点復元。
+      DeletionProtectionEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      TableName: !Sub "${TablePrefix}-watchlist_removal_history"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: stock_code
+          AttributeType: S
+      KeySchema:
+        - AttributeName: stock_code
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  # 本番検証(2026-08)で発覚した二重起動対応: 約50秒差の2回のDispatcher起動が
+  # 同一rotation windowを二重にSQSへdispatchした事象を受け、rotation cursorの
+  # CAS(WatchlistScreeningRotationStateTable.pointer_version)とは別責務の軽量
+  # leaseを追加した(infrastructure/aws/watchlist_rotation_dispatch_lease.py、
+  # trade_detection_run_locksテーブルと同じ単一行・条件付き更新パターン)。
+  WatchlistRotationDispatchLeaseTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${TablePrefix}-watchlist_rotation_dispatch_lease"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: rotation_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: rotation_id
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  # --- LINEボタン起点会話型UI(2026-08)で追加 -------------------------------
+  # BUY/SELL/WATCHのリッチメニュー/postback対話の一時状態(実装プランv2 3節)。
+  # ttlはDynamoDB Native TTL(物理削除・掃除用途のみ)であり、実際の期限判定は
+  # infrastructure/aws/conversation_state_store.pyがアプリ層で`ttl <= now`を
+  # 判定する(物理削除タイミング=最大48時間程度の残存に依存しない設計)。
+  ConversationStatesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${TablePrefix}-conversation_states"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: user_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: user_id
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  # Issue #595(#128 A6a): owner単位の買付余力(available_cash)。利用者の
+  # 実際の資金管理データであり、失うと再生成できない。
+  # HoldingDecisionRuntimeConfigTable(Issue #137)と同水準の保護を適用する。
+  AvailableCashTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      DeletionProtectionEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      TableName: !Sub "${TablePrefix}-available_cash"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: owner
+          AttributeType: S
+      KeySchema:
+        - AttributeName: owner
+          KeyType: HASH
+
+  # --- Lambda関数(スケジュール実行、schedule.yaml対応) ------------------
+
+  BuyCandidatesFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-buy-candidates"
+      CodeUri: ../src/
+      Handler: jstock_advisor.lambda_handlers.buy_candidates_handler.handler
+      # 24節仕様の再設計(モメンタム・複数手法適正価格・分割調整等)で銘柄あたりの
+      # 実データ取得件数が増えたため、既定の300秒では銘柄数によってはタイムアウトしうる
+      Timeout: 900
+      Environment:
+        Variables:
+          # Issue #725: HANDLED_FAILURE通知(publish_incident_envelope)の到達経路。
+          # WatchlistBatchReconcilerFunction(#506)と同じ配線(Topic ARN + sns:Publish + Topic policy)。
+          INCIDENT_NOTIFICATION_TOPIC_ARN: !Ref IncidentNotificationTopic
+          # Issue #116: Issue #54 Phase B-1のshadow observation
+          # (services/jpx_industry_source.py::JpxIndustrySource)が
+          # CandidateUniverseCacheIO経由でJPX上場銘柄一覧キャッシュを読むために必要。
+          # 本変数が無いとresolve_candidate_universe_bucket()がRuntimeErrorとなり、
+          # jpx_lookup_statusが常にSOURCE_UNAVAILABLE(canonical解決率0%)になる。
+          # **観測専用**であり、BUY判定・screening・portfolio exposureは
+          # classify_industry(provider由来のsector/industry)を使うため影響を受けない。
+          CANDIDATE_UNIVERSE_CACHE_BUCKET: !Ref CandidateUniverseCacheBucket
+          # Issue #533(#319 Phase 2): 既定false(従来どおり非同期自己再帰呼び出し)。
+          BUY_CANDIDATE_SQS_DISPATCH_ENABLED: !Ref BuyCandidateSqsDispatchEnabled
+          BUY_CANDIDATE_QUEUE_URL: !Ref BuyCandidateQueue
+          # Issue #925(kv1): owner の符号を作る鍵の Secret の ARN。値は Secret への !Ref だけ
+          # (鍵の値・名前は template に現れない)。Shadow が動くときだけ読まれる
+          ALLOCATION_SHADOW_REF_KEY_SECRET_ARN: !Ref AllocationShadowOwnerRefKeyV1
+      Policies:
+        # Issue #318: EventInvokeConfigのOnFailure先へ送るために必要。
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt AsyncInvokeFailureDLQ.QueueName
+        # Issue #533(#319 Phase 2): BUY_CANDIDATE_SQS_DISPATCH_ENABLED=true時、
+        # 銘柄単位のfan-outをBuyCandidateQueueへ送信するために必要
+        # (既定falseの間は呼ばれないが、トグルのみで有効化できるようにする)。
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt BuyCandidateQueue.QueueName
+        # コードレビュー対応(2026-08): テーブル数の増加に伴うIAMロールのインライン
+        # ポリシー合計サイズ上限(10240バイト)超過を避けるため、HoldingsWatchlistFunction
+        # と同様にStatementへ集約する(付与している権限自体はCRUD/Read個別指定時と同一)。
+        - Statement:
+            - Sid: DynamoDbCrudAccess
+              Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:DeleteItem
+                - dynamodb:PutItem
+                - dynamodb:Scan
+                - dynamodb:Query
+                - dynamodb:UpdateItem
+                - dynamodb:BatchWriteItem
+                - dynamodb:BatchGetItem
+                - dynamodb:DescribeTable
+                - dynamodb:ConditionCheckItem
+              Resource:
+                - !GetAtt AuditLogTable.Arn
+                - !Sub "${AuditLogTable.Arn}/index/*"
+                - !GetAtt RecommendationsTable.Arn
+                - !Sub "${RecommendationsTable.Arn}/index/*"
+                # 通知検証モード機能(2026-08追加): VALIDATION実行時のみ使用する一時テーブル
+                - !GetAtt ValidationRecommendationsTable.Arn
+                - !Sub "${ValidationRecommendationsTable.Arn}/index/*"
+                - !GetAtt NotificationLogTable.Arn
+                - !Sub "${NotificationLogTable.Arn}/index/*"
+                # LINE通知dedupの原子化(Issue #17): 送信決定claim
+                - !GetAtt NotificationClaimsTable.Arn
+                - !GetAtt EdinetFilingCacheTable.Arn
+                - !Sub "${EdinetFilingCacheTable.Arn}/index/*"
+                - !GetAtt EdinetDisclosureCacheTable.Arn
+                - !Sub "${EdinetDisclosureCacheTable.Arn}/index/*"
+                - !GetAtt EdinetDailyDocumentListCacheTable.Arn
+                - !Sub "${EdinetDailyDocumentListCacheTable.Arn}/index/*"
+                - !GetAtt BatchRunsTable.Arn
+                - !Sub "${BatchRunsTable.Arn}/index/*"
+                - !GetAtt DecisionSnapshotsTable.Arn
+                - !Sub "${DecisionSnapshotsTable.Arn}/index/*"
+                - !GetAtt BuyCandidateEvaluationRecordsTable.Arn
+                - !Sub "${BuyCandidateEvaluationRecordsTable.Arn}/index/*"
+                # LINE UI第二弾「対象確認」機能(2026-08)向け。latest completed
+                # batch pointerの書き込み(_finalize_batch()のみ、NORMAL運用かつ
+                # 全対象銘柄分のEvaluationRecord保存成功時)。
+                - !GetAtt BuyCandidateBatchCompletionTable.Arn
+                - !Sub "${BuyCandidateBatchCompletionTable.Arn}/index/*"
+                - !GetAtt WatchStateTable.Arn
+                - !Sub "${WatchStateTable.Arn}/index/*"
+                - !GetAtt ValidationWatchStateTable.Arn
+                - !Sub "${ValidationWatchStateTable.Arn}/index/*"
+                - !GetAtt HoldingsSnapshotTable.Arn
+                - !Sub "${HoldingsSnapshotTable.Arn}/index/*"
+                - !GetAtt ValidationHoldingsSnapshotTable.Arn
+                - !Sub "${ValidationHoldingsSnapshotTable.Arn}/index/*"
+                # M4本番検証で発覚したIAM不備の修正(2026-08): TradeCooldownService.
+                # detect_and_apply()がHoldingsSnapshotRepository経由でV2テーブルを
+                # 参照する(M3切替済み)。旧HoldingsSnapshotTable/ValidationHoldings
+                # SnapshotTable(直上)は削除せずロールバック用に残し、V2を追加する。
+                - !GetAtt HoldingsSnapshotTableV2.Arn
+                - !Sub "${HoldingsSnapshotTableV2.Arn}/index/*"
+                - !GetAtt ValidationHoldingsSnapshotTableV2.Arn
+                - !Sub "${ValidationHoldingsSnapshotTableV2.Arn}/index/*"
+                - !GetAtt TradeDetectionRunLockTable.Arn
+                - !Sub "${TradeDetectionRunLockTable.Arn}/index/*"
+                - !GetAtt DailyNotificationPriorityTable.Arn
+                - !Sub "${DailyNotificationPriorityTable.Arn}/index/*"
+                - !GetAtt ValidationDailyNotificationPriorityTable.Arn
+                - !Sub "${ValidationDailyNotificationPriorityTable.Arn}/index/*"
+                # Issue #71 F-C11 Phase 1: TradeCooldownService.detect_and_apply()
+                # がTradeEventRecordRepository経由で参照する。
+                - !GetAtt TradeEventRecordsTable.Arn
+                - !Sub "${TradeEventRecordsTable.Arn}/index/*"
+                - !GetAtt ValidationTradeEventRecordsTable.Arn
+                - !Sub "${ValidationTradeEventRecordsTable.Arn}/index/*"
+            # 統合BUY候補パイプライン(2026-07)で保有銘柄を購入判断対象へ統合したため追加
+            - Sid: DynamoDbReadOnlyAccess
+              Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:Scan
+                - dynamodb:Query
+                - dynamodb:BatchGetItem
+                - dynamodb:DescribeTable
+              Resource:
+                - !GetAtt WatchlistTable.Arn
+                - !Sub "${WatchlistTable.Arn}/index/*"
+                - !GetAtt HoldingsTable.Arn
+                - !Sub "${HoldingsTable.Arn}/index/*"
+                # M4本番検証で発覚したIAM不備の修正(2026-08): PortfolioService.
+                # list_holdings()/list_holdings_by_stock()がHoldingRepository経由で
+                # V2テーブルを参照する(M3切替済み)。旧HoldingsTable(直上)は
+                # 削除せずロールバック用に残し、V2を追加する。
+                - !GetAtt HoldingsTableV2.Arn
+                - !Sub "${HoldingsTableV2.Arn}/index/*"
+                - !GetAtt PurchaseLotsTable.Arn
+                - !Sub "${PurchaseLotsTable.Arn}/index/*"
+                - !GetAtt ShareholderBenefitsTable.Arn
+                - !Sub "${ShareholderBenefitsTable.Arn}/index/*"
+                - !GetAtt CorporateActionRegistryTable.Arn
+                - !Sub "${CorporateActionRegistryTable.Arn}/index/*"
+                - !GetAtt RuleVersionsTable.Arn
+                - !Sub "${RuleVersionsTable.Arn}/index/*"
+                - !GetAtt StockNameOverridesTable.Arn
+                - !Sub "${StockNameOverridesTable.Arn}/index/*"
+        # 銘柄単位のファンアウト(_fanout.py)のため、自分自身を非同期呼び出しする権限が必要
+        - Statement:
+            - Effect: Allow
+              Action: lambda:InvokeFunction
+              Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-buy-candidates"
+        # Issue #116: Issue #54 Phase B-1のshadow observation専用の読み取り権限。
+        # SAMのS3ReadPolicyは使わない(GetObjectAcl/GetLifecycleConfiguration等、
+        # 本経路が使わないActionまで付与されるため)。
+        #
+        # CandidateUniverseCacheIO.read_current()はcurrent/<source>/data と
+        # current/<source>/metadata.json の2キーへget_object()するだけであり、
+        # list_objects_v2/head_objectは呼ばない。書き込み(promote())は
+        # WatchlistDispatcherFunction側の責務。
+        #
+        # #116の契約では「キャッシュ未生成」も「S3読み取り不能」もいずれも
+        # SOURCE_UNAVAILABLEとしてfail-softするため、両者を区別しない。
+        # よってNoSuchKey(404)を得る目的だけのs3:ListBucketは付与しない
+        # (最小権限を優先する)。
+        - Statement:
+            - Sid: CandidateUniverseCacheReadForJpxShadow
+              Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub "${CandidateUniverseCacheBucket.Arn}/current/*"
+        # Issue #725: HANDLED_FAILURE通知をIncidentNotificationTopic限定でpublishする
+        # (Resource="*"は付与しない。WatchlistBatchReconcilerFunctionと同じ内容)。
+        - Statement:
+            - Sid: PublishIncidentNotification
+              Effect: Allow
+              Action: sns:Publish
+              Resource:
+                - !Ref IncidentNotificationTopic
+        # Issue #602(#128 R1。USER 承認 = #122 issuecomment-6138462304【4】O1 案): 購入側 Shadow
+        # (Q')が owner 単位の買付余力を読むための、GetItem だけ。
+        # 付与先は Shadow が動く 2 関数(BuyCandidatesFunction / BuyCandidateWorkerFunction。
+        # 後者は前者の処理を import して呼ぶ)。PutItem・UpdateItem・DeleteItem・Scan・Query・
+        # BatchGetItem・index は付けない(call graph の実測: AvailableCashRepository.get →
+        # get_item 1 回。書込・列挙なし)。上の共有 Statement(DynamoDbCrudAccess)には混ぜず、
+        # 専用 Statement にする。Shadow が OFF の間(出荷の既定)は呼ばれない。
+        - Statement:
+            - Sid: AvailableCashReadOnly
+              Effect: Allow
+              Action:
+                - dynamodb:GetItem
+              Resource:
+                - !GetAtt AvailableCashTable.Arn
+        # Issue #925(kv1): 鍵の Secret 1 つの GetSecretValue だけ(他の secret・他の操作・
+        # ワイルドカードを付けない)。Resource は Secret の ARN(Ref)で、名前の取り違えが起きない
+        - Statement:
+            - Sid: OwnerRefKeyReadOnly
+              Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              Resource:
+                - !Ref AllocationShadowOwnerRefKeyV1
+      # Issue #318: _fanout.dispatch_async(InvocationType="Event")による
+      # 自己呼び出しと、Reconcilerからの完了リカバリ呼び出しが**非同期**である。
+      # 既定は「2回再試行/最大6時間」で、行き先が無いため失敗は静かに消えていた。
+      # ★ 本関数(子Lambdaへのfanout自体)はdedupトークンを持たないため、この
+      #   自己呼び出しの再試行は個別銘柄の二重評価になりうる(Issue #71 F-D2。
+      #   未着手)。ここで下げているのは**被害の上限**であって、二重実行の
+      #   可能性そのものではない。
+      # ★ 一方、下記ScheduleV2自体の再試行(この関数の**最初の**起動)による
+      #   batch全体の二重dispatchは、Issue #558でbatch_id決定論化+
+      #   start_batch()のatomicity化により防止済み(Input参照)。
+      EventInvokeConfig:
+        MaximumRetryAttempts: 1
+        MaximumEventAgeInSeconds: 3600
+        DestinationConfig:
+          OnFailure:
+            Type: SQS
+            Destination: !GetAtt AsyncInvokeFailureDLQ.Arn
+      Events:
+        DailyMorning:
+          Type: ScheduleV2
+          Properties:
+            ScheduleExpression: "cron(0 8 ? * MON-FRI *)"
+            ScheduleExpressionTimezone: Asia/Tokyo
+            # Issue #318: 群A。#558: batch_id決定論化によりScheduler retryでの
+            # batch全体二重dispatchは防止済み(下記Input参照)。子Lambda
+            # fanoutの再試行による個別銘柄の二重評価はIssue #71 F-D2のまま
+            # (回数を増やすと積み上がるため据え置き)。
+            RetryPolicy:
+              MaximumRetryAttempts: 1
+              MaximumEventAgeInSeconds: 3600
+            FlexibleTimeWindow:
+              Mode: "OFF"
+            # Issue #558: dispatcher(#65 F-E7)と同じ意味論。Schedulerのcontext
+            # attributeをevent["scheduled_time"]として渡し、derive_scheduled_
+            # batch_id()がbatch_idを決定論的に導出できるようにする(retryで
+            # 同一batch_idになり、start_batch()のatomicityが多重開始を拒否する)。
+            Input: '{"scheduled_time": "<aws.scheduler.scheduled-time>"}'
+
+  BuyCandidateWorkerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      # Issue #533(#319 Phase 2)。BuyCandidateQueue(#532で追加済み)から銘柄単位の
+      # メッセージを受け取り、既存の非同期再帰呼び出し経路(BuyCandidatesFunction
+      # 自身のtask=="buy_candidate"分岐)と等価な処理を行う。BUY_CANDIDATE_SQS_
+      # DISPATCH_ENABLED=falseの間はBuyCandidateQueueへメッセージが送られないため
+      # 本関数は起動されない(トグルのみで有効化できるよう先行して定義する)。
+      FunctionName: !Sub "${AWS::StackName}-buy-candidate-worker"
+      CodeUri: ../src/
+      Handler: jstock_advisor.lambda_handlers.buy_candidate_worker_handler.handler
+      # BuyCandidatesFunctionと同じ理由(24節仕様の再設計後の実データ取得件数増)。
+      Timeout: 900
+      ReservedConcurrentExecutions: !Ref BuyCandidateReservedConcurrentExecutions
+      Environment:
+        Variables:
+          # Issue #725: HANDLED_FAILURE通知(publish_incident_envelope)の到達経路。
+          # WatchlistBatchReconcilerFunction(#506)と同じ配線(Topic ARN + sns:Publish + Topic policy)。
+          INCIDENT_NOTIFICATION_TOPIC_ARN: !Ref IncidentNotificationTopic
+          CANDIDATE_UNIVERSE_CACHE_BUCKET: !Ref CandidateUniverseCacheBucket
+          # Issue #925(kv1): BuyCandidatesFunction と同じ(本関数もその処理を呼ぶ)
+          ALLOCATION_SHADOW_REF_KEY_SECRET_ARN: !Ref AllocationShadowOwnerRefKeyV1
+      Policies:
+        # BuyCandidatesFunctionのDynamoDbCrudAccess/DynamoDbReadOnlyAccessと同一
+        # (_process_single_candidate()を直接importして呼ぶため、同じテーブル
+        # 群への同じ権限が必要。dispatch専用の権限(自己再帰invoke・
+        # AsyncInvokeFailureDLQ送信)は本関数には不要)。
+        - Statement:
+            - Sid: DynamoDbCrudAccess
+              Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:DeleteItem
+                - dynamodb:PutItem
+                - dynamodb:Scan
+                - dynamodb:Query
+                - dynamodb:UpdateItem
+                - dynamodb:BatchWriteItem
+                - dynamodb:BatchGetItem
+                - dynamodb:DescribeTable
+                - dynamodb:ConditionCheckItem
+              Resource:
+                - !GetAtt AuditLogTable.Arn
+                - !Sub "${AuditLogTable.Arn}/index/*"
+                - !GetAtt RecommendationsTable.Arn
+                - !Sub "${RecommendationsTable.Arn}/index/*"
+                - !GetAtt ValidationRecommendationsTable.Arn
+                - !Sub "${ValidationRecommendationsTable.Arn}/index/*"
+                - !GetAtt NotificationLogTable.Arn
+                - !Sub "${NotificationLogTable.Arn}/index/*"
+                - !GetAtt NotificationClaimsTable.Arn
+                - !GetAtt EdinetFilingCacheTable.Arn
+                - !Sub "${EdinetFilingCacheTable.Arn}/index/*"
+                - !GetAtt EdinetDisclosureCacheTable.Arn
+                - !Sub "${EdinetDisclosureCacheTable.Arn}/index/*"
+                - !GetAtt EdinetDailyDocumentListCacheTable.Arn
+                - !Sub "${EdinetDailyDocumentListCacheTable.Arn}/index/*"
+                - !GetAtt BatchRunsTable.Arn
+                - !Sub "${BatchRunsTable.Arn}/index/*"
+                - !GetAtt DecisionSnapshotsTable.Arn
+                - !Sub "${DecisionSnapshotsTable.Arn}/index/*"
+                - !GetAtt BuyCandidateEvaluationRecordsTable.Arn
+                - !Sub "${BuyCandidateEvaluationRecordsTable.Arn}/index/*"
+                - !GetAtt BuyCandidateBatchCompletionTable.Arn
+                - !Sub "${BuyCandidateBatchCompletionTable.Arn}/index/*"
+                - !GetAtt WatchStateTable.Arn
+                - !Sub "${WatchStateTable.Arn}/index/*"
+                - !GetAtt ValidationWatchStateTable.Arn
+                - !Sub "${ValidationWatchStateTable.Arn}/index/*"
+                - !GetAtt HoldingsSnapshotTable.Arn
+                - !Sub "${HoldingsSnapshotTable.Arn}/index/*"
+                - !GetAtt ValidationHoldingsSnapshotTable.Arn
+                - !Sub "${ValidationHoldingsSnapshotTable.Arn}/index/*"
+                - !GetAtt HoldingsSnapshotTableV2.Arn
+                - !Sub "${HoldingsSnapshotTableV2.Arn}/index/*"
+                - !GetAtt ValidationHoldingsSnapshotTableV2.Arn
+                - !Sub "${ValidationHoldingsSnapshotTableV2.Arn}/index/*"
+                - !GetAtt TradeDetectionRunLockTable.Arn
+                - !Sub "${TradeDetectionRunLockTable.Arn}/index/*"
+                - !GetAtt DailyNotificationPriorityTable.Arn
+                - !Sub "${DailyNotificationPriorityTable.Arn}/index/*"
+                - !GetAtt ValidationDailyNotificationPriorityTable.Arn
+                - !Sub "${ValidationDailyNotificationPriorityTable.Arn}/index/*"
+                - !GetAtt TradeEventRecordsTable.Arn
+                - !Sub "${TradeEventRecordsTable.Arn}/index/*"
+                - !GetAtt ValidationTradeEventRecordsTable.Arn
+                - !Sub "${ValidationTradeEventRecordsTable.Arn}/index/*"
+            - Sid: DynamoDbReadOnlyAccess
+              Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:Scan
+                - dynamodb:Query
+                - dynamodb:BatchGetItem
+                - dynamodb:DescribeTable
+              Resource:
+                - !GetAtt WatchlistTable.Arn
+                - !Sub "${WatchlistTable.Arn}/index/*"
+                - !GetAtt HoldingsTable.Arn
+                - !Sub "${HoldingsTable.Arn}/index/*"
+                - !GetAtt HoldingsTableV2.Arn
+                - !Sub "${HoldingsTableV2.Arn}/index/*"
+                - !GetAtt PurchaseLotsTable.Arn
+                - !Sub "${PurchaseLotsTable.Arn}/index/*"
+                - !GetAtt ShareholderBenefitsTable.Arn
+                - !Sub "${ShareholderBenefitsTable.Arn}/index/*"
+                - !GetAtt CorporateActionRegistryTable.Arn
+                - !Sub "${CorporateActionRegistryTable.Arn}/index/*"
+                - !GetAtt RuleVersionsTable.Arn
+                - !Sub "${RuleVersionsTable.Arn}/index/*"
+                - !GetAtt StockNameOverridesTable.Arn
+                - !Sub "${StockNameOverridesTable.Arn}/index/*"
+        # BuyCandidatesFunctionのCandidateUniverseCacheReadForJpxShadowと同一。
+        - Statement:
+            - Sid: CandidateUniverseCacheReadForJpxShadow
+              Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub "${CandidateUniverseCacheBucket.Arn}/current/*"
+        # Issue #725: HANDLED_FAILURE通知をIncidentNotificationTopic限定でpublishする
+        # (Resource="*"は付与しない。WatchlistBatchReconcilerFunctionと同じ内容)。
+        - Statement:
+            - Sid: PublishIncidentNotification
+              Effect: Allow
+              Action: sns:Publish
+              Resource:
+                - !Ref IncidentNotificationTopic
+        # Issue #602(#128 R1。USER 承認 = #122 issuecomment-6138462304【4】O1 案): 購入側 Shadow
+        # (Q')が owner 単位の買付余力を読むための、GetItem だけ。
+        # 付与先は Shadow が動く 2 関数(BuyCandidatesFunction / BuyCandidateWorkerFunction。
+        # 後者は前者の処理を import して呼ぶ)。PutItem・UpdateItem・DeleteItem・Scan・Query・
+        # BatchGetItem・index は付けない(call graph の実測: AvailableCashRepository.get →
+        # get_item 1 回。書込・列挙なし)。上の共有 Statement(DynamoDbCrudAccess)には混ぜず、
+        # 専用 Statement にする。Shadow が OFF の間(出荷の既定)は呼ばれない。
+        - Statement:
+            - Sid: AvailableCashReadOnly
+              Effect: Allow
+              Action:
+                - dynamodb:GetItem
+              Resource:
+                - !GetAtt AvailableCashTable.Arn
+        # Issue #925(kv1): 鍵の Secret 1 つの GetSecretValue だけ(他の secret・他の操作・
+        # ワイルドカードを付けない)。Resource は Secret の ARN(Ref)で、名前の取り違えが起きない
+        - Statement:
+            - Sid: OwnerRefKeyReadOnly
+              Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              Resource:
+                - !Ref AllocationShadowOwnerRefKeyV1
+      Events:
+        BuyCandidateQueue:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt BuyCandidateQueue.Arn
+            BatchSize: !Ref BuyCandidateSqsBatchSize
+            MaximumBatchingWindowInSeconds: 0
+
+  HoldingsWatchlistFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-holdings-watchlist"
+      CodeUri: ../src/
+      Handler: jstock_advisor.lambda_handlers.holdings_watchlist_handler.handler
+      # 保有銘柄27件+ウォッチリストを、24節仕様の再設計後の判定ロジック
+      # (モメンタム・複数手法適正価格・分割調整等)で処理するため、既定の300秒では
+      # 不足する。Lambdaの最大値である900秒まで引き上げる
+      Timeout: 900
+      Environment:
+        Variables:
+          # Issue #725: HANDLED_FAILURE通知(publish_incident_envelope)の到達経路。
+          # WatchlistBatchReconcilerFunction(#506)と同じ配線(Topic ARN + sns:Publish + Topic policy)。
+          INCIDENT_NOTIFICATION_TOPIC_ARN: !Ref IncidentNotificationTopic
+          # Issue #533(#319 Phase 2): 既定false(従来どおり非同期自己再帰呼び出し)。
+          HOLDINGS_WATCHLIST_SQS_DISPATCH_ENABLED: !Ref HoldingsWatchlistSqsDispatchEnabled
+          HOLDINGS_WATCHLIST_QUEUE_URL: !Ref HoldingsWatchlistQueue
+      Policies:
+        # Issue #318: EventInvokeConfigのOnFailure先へ送るために必要。
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt AsyncInvokeFailureDLQ.QueueName
+        # Issue #533(#319 Phase 2): HOLDINGS_WATCHLIST_SQS_DISPATCH_ENABLED=true時、
+        # holding単位のfan-outをHoldingsWatchlistQueueへ送信するために必要
+        # (既定falseの間は呼ばれないが、トグルのみで有効化できるようにする)。
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt HoldingsWatchlistQueue.QueueName
+        # コードレビュー対応(2026-08): テーブル数の増加に伴い、DynamoDBCrudPolicy/
+        # DynamoDBReadPolicyをテーブルごとに個別指定すると、各エントリがロールへ
+        # 個別のインラインポリシーとして追加され、IAMロールのインラインポリシー
+        # 合計サイズ上限(10240バイト)を超過してデプロイに失敗する不具合が生じた。
+        # 同じアクション集合を持つテーブル群をStatementへ集約し、ポリシー
+        # エントリ数を削減する(付与している権限自体はCRUD/Read個別指定時と同一)。
+        - Statement:
+            - Sid: DynamoDbCrudAccess
+              Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:DeleteItem
+                - dynamodb:PutItem
+                - dynamodb:Scan
+                - dynamodb:Query
+                - dynamodb:UpdateItem
+                - dynamodb:BatchWriteItem
+                - dynamodb:BatchGetItem
+                - dynamodb:DescribeTable
+                - dynamodb:ConditionCheckItem
+              Resource:
+                - !GetAtt AuditLogTable.Arn
+                - !Sub "${AuditLogTable.Arn}/index/*"
+                - !GetAtt RecommendationsTable.Arn
+                - !Sub "${RecommendationsTable.Arn}/index/*"
+                # Issue #310: VALIDATION実行では RecommendationRepository.
+                # for_execution_context() が検証用テーブルを指すが、本FunctionのIAMに
+                # だけ含まれておらず、_previous_recommendation()のGetItemが
+                # AccessDeniedになっていた(BuyCandidatesFunction側には元からある)。
+                # 粒度をCRUDとするのは、同じrepositoryインスタンスに対して
+                # holdings_watchlist_handler.pyがsave()を4箇所で呼ぶため
+                # (Readのみだと今度はsave()がAccessDeniedになる。CLAUDE.md 3節:
+                # メソッド名だけを根拠にread-onlyと判断しない)。
+                - !GetAtt ValidationRecommendationsTable.Arn
+                - !Sub "${ValidationRecommendationsTable.Arn}/index/*"
+                - !GetAtt NotificationLogTable.Arn
+                - !Sub "${NotificationLogTable.Arn}/index/*"
+                # LINE通知dedupの原子化(Issue #17): 送信決定claim
+                - !GetAtt NotificationClaimsTable.Arn
+                - !GetAtt EdinetFilingCacheTable.Arn
+                - !Sub "${EdinetFilingCacheTable.Arn}/index/*"
+                - !GetAtt EdinetDisclosureCacheTable.Arn
+                - !Sub "${EdinetDisclosureCacheTable.Arn}/index/*"
+                - !GetAtt EdinetDailyDocumentListCacheTable.Arn
+                - !Sub "${EdinetDailyDocumentListCacheTable.Arn}/index/*"
+                - !GetAtt BatchRunsTable.Arn
+                - !Sub "${BatchRunsTable.Arn}/index/*"
+                - !GetAtt HoldingDecisionResultsTable.Arn
+                - !Sub "${HoldingDecisionResultsTable.Arn}/index/*"
+                - !GetAtt InvestmentThesesTable.Arn
+                - !Sub "${InvestmentThesesTable.Arn}/index/*"
+                - !GetAtt InvestmentThesisBaselinesTable.Arn
+                - !Sub "${InvestmentThesisBaselinesTable.Arn}/index/*"
+                - !GetAtt InvestmentThesisBaselineSequencesTable.Arn
+                - !Sub "${InvestmentThesisBaselineSequencesTable.Arn}/index/*"
+                - !GetAtt InvestmentThesisBaselinePointersTable.Arn
+                - !Sub "${InvestmentThesisBaselinePointersTable.Arn}/index/*"
+                # M4本番検証で発覚したIAM不備の修正(2026-08): InvestmentThesisService
+                # (baseline_sequence.py/baseline_pointer.py)がM3切替済みのV2テーブルを
+                # 参照する。旧テーブル(直上2件)は削除せずロールバック用に残し、V2を追加する。
+                - !GetAtt InvestmentThesisBaselineSequencesTableV2.Arn
+                - !Sub "${InvestmentThesisBaselineSequencesTableV2.Arn}/index/*"
+                - !GetAtt InvestmentThesisBaselinePointersTableV2.Arn
+                - !Sub "${InvestmentThesisBaselinePointersTableV2.Arn}/index/*"
+                - !GetAtt DecisionSnapshotsTable.Arn
+                - !Sub "${DecisionSnapshotsTable.Arn}/index/*"
+                - !GetAtt WatchStateTable.Arn
+                - !Sub "${WatchStateTable.Arn}/index/*"
+                - !GetAtt ValidationWatchStateTable.Arn
+                - !Sub "${ValidationWatchStateTable.Arn}/index/*"
+                - !GetAtt HoldingsSnapshotTable.Arn
+                - !Sub "${HoldingsSnapshotTable.Arn}/index/*"
+                - !GetAtt ValidationHoldingsSnapshotTable.Arn
+                - !Sub "${ValidationHoldingsSnapshotTable.Arn}/index/*"
+                # M4本番検証で発覚したIAM不備の修正(2026-08): TradeCooldownService
+                # (HoldingsSnapshotRepository)がM3切替済みのV2テーブルを参照する。
+                # 旧テーブル(直上2件)は削除せずロールバック用に残し、V2を追加する。
+                - !GetAtt HoldingsSnapshotTableV2.Arn
+                - !Sub "${HoldingsSnapshotTableV2.Arn}/index/*"
+                - !GetAtt ValidationHoldingsSnapshotTableV2.Arn
+                - !Sub "${ValidationHoldingsSnapshotTableV2.Arn}/index/*"
+                - !GetAtt TradeDetectionRunLockTable.Arn
+                - !Sub "${TradeDetectionRunLockTable.Arn}/index/*"
+                - !GetAtt DailyNotificationPriorityTable.Arn
+                - !Sub "${DailyNotificationPriorityTable.Arn}/index/*"
+                - !GetAtt ValidationDailyNotificationPriorityTable.Arn
+                - !Sub "${ValidationDailyNotificationPriorityTable.Arn}/index/*"
+                # Issue #71 F-C11 Phase 1: TradeCooldownService.detect_and_apply()
+                # がTradeEventRecordRepository経由で参照する。
+                - !GetAtt TradeEventRecordsTable.Arn
+                - !Sub "${TradeEventRecordsTable.Arn}/index/*"
+                - !GetAtt ValidationTradeEventRecordsTable.Arn
+                - !Sub "${ValidationTradeEventRecordsTable.Arn}/index/*"
+                # Phase 2-B「銘柄分析」向け(2026-08)。
+                - !GetAtt HoldingEvaluationRecordsTable.Arn
+                - !Sub "${HoldingEvaluationRecordsTable.Arn}/index/*"
+            # --- 保有判断スコア方式(2026-08仕様)の補足: HoldingDecisionRuntimeConfigTable
+            # のみ読み取り専用(書き込みはCLI経由の人間のみ、1節)。他は上記CRUDグループへ含む ---
+            - Sid: DynamoDbReadOnlyAccess
+              Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:Scan
+                - dynamodb:Query
+                - dynamodb:BatchGetItem
+                - dynamodb:DescribeTable
+              Resource:
+                - !GetAtt HoldingsTable.Arn
+                - !Sub "${HoldingsTable.Arn}/index/*"
+                # M4本番検証で発覚したIAM不備の修正(2026-08): PortfolioService.
+                # list_holdings()・HoldingRepository.get(holding_id)がM3切替済みの
+                # V2テーブルを参照する。旧HoldingsTable(直上)は削除せずロールバック
+                # 用に残し、V2を追加する。
+                - !GetAtt HoldingsTableV2.Arn
+                - !Sub "${HoldingsTableV2.Arn}/index/*"
+                - !GetAtt PurchaseLotsTable.Arn
+                - !Sub "${PurchaseLotsTable.Arn}/index/*"
+                - !GetAtt WatchlistTable.Arn
+                - !Sub "${WatchlistTable.Arn}/index/*"
+                - !GetAtt ShareholderBenefitsTable.Arn
+                - !Sub "${ShareholderBenefitsTable.Arn}/index/*"
+                - !GetAtt CorporateActionRegistryTable.Arn
+                - !Sub "${CorporateActionRegistryTable.Arn}/index/*"
+                - !GetAtt RuleVersionsTable.Arn
+                - !Sub "${RuleVersionsTable.Arn}/index/*"
+                - !GetAtt StockNameOverridesTable.Arn
+                - !Sub "${StockNameOverridesTable.Arn}/index/*"
+                - !GetAtt HoldingDecisionRuntimeConfigTable.Arn
+                - !Sub "${HoldingDecisionRuntimeConfigTable.Arn}/index/*"
+        # 銘柄単位のファンアウト(_fanout.py)のため、自分自身を非同期呼び出しする権限が必要
+        - Statement:
+            - Effect: Allow
+              Action: lambda:InvokeFunction
+              Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-holdings-watchlist"
+        # Issue #725: HANDLED_FAILURE通知をIncidentNotificationTopic限定でpublishする
+        # (Resource="*"は付与しない。WatchlistBatchReconcilerFunctionと同じ内容)。
+        - Statement:
+            - Sid: PublishIncidentNotification
+              Effect: Allow
+              Action: sns:Publish
+              Resource:
+                - !Ref IncidentNotificationTopic
+      # Issue #318: _fanout.dispatch_async(InvocationType="Event")による
+      # 自己呼び出しと、Reconcilerからの完了リカバリ呼び出しが**非同期**である。
+      # 既定は「2回再試行/最大6時間」で、行き先が無いため失敗は静かに消えていた。
+      # ★ 本関数(子Lambdaへのfanout自体)はdedupトークンを持たないため、この
+      #   自己呼び出しの再試行は個別銘柄の二重評価になりうる(Issue #71 F-D2。
+      #   未着手)。ここで下げているのは**被害の上限**であって、二重実行の
+      #   可能性そのものではない。
+      # ★ 一方、下記ScheduleV2自体の再試行(この関数の**最初の**起動)による
+      #   batch全体の二重dispatchは、Issue #558でbatch_id決定論化+
+      #   start_batch()のatomicity化により防止済み(Input参照)。
+      EventInvokeConfig:
+        MaximumRetryAttempts: 1
+        MaximumEventAgeInSeconds: 3600
+        DestinationConfig:
+          OnFailure:
+            Type: SQS
+            Destination: !GetAtt AsyncInvokeFailureDLQ.Arn
+      Events:
+        # 買い候補分析(BuyCandidatesFunction)と処理条件・通知タイミングを揃えるため
+        # 08:00に変更(2026-07-31改訂)。以前は16:30(当日終値)だったが、買い判定と
+        # 同時刻にすることで両方とも前営業日終値を基準に同じ条件で評価するようになる。
+        DailyMorning:
+          Type: ScheduleV2
+          Properties:
+            ScheduleExpression: "cron(0 8 ? * MON-FRI *)"
+            ScheduleExpressionTimezone: Asia/Tokyo
+            # Issue #318: 群A。#558: batch_id決定論化によりScheduler retryでの
+            # batch全体二重dispatchは防止済み(下記Input参照)。子Lambda
+            # fanoutの再試行による個別銘柄の二重評価はIssue #71 F-D2のまま
+            # (回数を増やすと積み上がるため据え置き)。
+            RetryPolicy:
+              MaximumRetryAttempts: 1
+              MaximumEventAgeInSeconds: 3600
+            FlexibleTimeWindow:
+              Mode: "OFF"
+            # Issue #558: dispatcher(#65 F-E7)と同じ意味論。Schedulerのcontext
+            # attributeをevent["scheduled_time"]として渡し、derive_scheduled_
+            # batch_id()がbatch_idを決定論的に導出できるようにする(retryで
+            # 同一batch_idになり、start_batch()のatomicityが多重開始を拒否する)。
+            Input: '{"scheduled_time": "<aws.scheduler.scheduled-time>"}'
+
+  HoldingsWatchlistWorkerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      # Issue #533(#319 Phase 2)。HoldingsWatchlistQueue(#532で追加済み)から
+      # holding単位のメッセージを受け取り、既存の非同期再帰呼び出し経路
+      # (HoldingsWatchlistFunction自身のtask=="holding"分岐)と等価な処理を行う。
+      # HOLDINGS_WATCHLIST_SQS_DISPATCH_ENABLED=falseの間はHoldingsWatchlistQueue
+      # へメッセージが送られないため本関数は起動されない。
+      FunctionName: !Sub "${AWS::StackName}-holdings-watchlist-worker"
+      CodeUri: ../src/
+      Handler: jstock_advisor.lambda_handlers.holdings_watchlist_worker_handler.handler
+      Timeout: 900
+      ReservedConcurrentExecutions: !Ref HoldingsWatchlistReservedConcurrentExecutions
+      Environment:
+        Variables:
+          # Issue #725: HANDLED_FAILURE通知(publish_incident_envelope)の到達経路。
+          # WatchlistBatchReconcilerFunction(#506)と同じ配線(Topic ARN + sns:Publish + Topic policy)。
+          INCIDENT_NOTIFICATION_TOPIC_ARN: !Ref IncidentNotificationTopic
+      Policies:
+        # HoldingsWatchlistFunctionのDynamoDbCrudAccess/DynamoDbReadOnlyAccessと同一
+        # (_process_single_holding()を直接importして呼ぶため、同じテーブル群への
+        # 同じ権限が必要。dispatch専用の権限は本関数には不要)。
+        - Statement:
+            - Sid: DynamoDbCrudAccess
+              Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:DeleteItem
+                - dynamodb:PutItem
+                - dynamodb:Scan
+                - dynamodb:Query
+                - dynamodb:UpdateItem
+                - dynamodb:BatchWriteItem
+                - dynamodb:BatchGetItem
+                - dynamodb:DescribeTable
+                - dynamodb:ConditionCheckItem
+              Resource:
+                - !GetAtt AuditLogTable.Arn
+                - !Sub "${AuditLogTable.Arn}/index/*"
+                - !GetAtt RecommendationsTable.Arn
+                - !Sub "${RecommendationsTable.Arn}/index/*"
+                - !GetAtt ValidationRecommendationsTable.Arn
+                - !Sub "${ValidationRecommendationsTable.Arn}/index/*"
+                - !GetAtt NotificationLogTable.Arn
+                - !Sub "${NotificationLogTable.Arn}/index/*"
+                - !GetAtt NotificationClaimsTable.Arn
+                - !GetAtt EdinetFilingCacheTable.Arn
+                - !Sub "${EdinetFilingCacheTable.Arn}/index/*"
+                - !GetAtt EdinetDisclosureCacheTable.Arn
+                - !Sub "${EdinetDisclosureCacheTable.Arn}/index/*"
+                - !GetAtt EdinetDailyDocumentListCacheTable.Arn
+                - !Sub "${EdinetDailyDocumentListCacheTable.Arn}/index/*"
+                - !GetAtt BatchRunsTable.Arn
+                - !Sub "${BatchRunsTable.Arn}/index/*"
+                - !GetAtt HoldingDecisionResultsTable.Arn
+                - !Sub "${HoldingDecisionResultsTable.Arn}/index/*"
+                - !GetAtt InvestmentThesesTable.Arn
+                - !Sub "${InvestmentThesesTable.Arn}/index/*"
+                - !GetAtt InvestmentThesisBaselinesTable.Arn
+                - !Sub "${InvestmentThesisBaselinesTable.Arn}/index/*"
+                - !GetAtt InvestmentThesisBaselineSequencesTable.Arn
+                - !Sub "${InvestmentThesisBaselineSequencesTable.Arn}/index/*"
+                - !GetAtt InvestmentThesisBaselinePointersTable.Arn
+                - !Sub "${InvestmentThesisBaselinePointersTable.Arn}/index/*"
+                - !GetAtt InvestmentThesisBaselineSequencesTableV2.Arn
+                - !Sub "${InvestmentThesisBaselineSequencesTableV2.Arn}/index/*"
+                - !GetAtt InvestmentThesisBaselinePointersTableV2.Arn
+                - !Sub "${InvestmentThesisBaselinePointersTableV2.Arn}/index/*"
+                - !GetAtt DecisionSnapshotsTable.Arn
+                - !Sub "${DecisionSnapshotsTable.Arn}/index/*"
+                - !GetAtt WatchStateTable.Arn
+                - !Sub "${WatchStateTable.Arn}/index/*"
+                - !GetAtt ValidationWatchStateTable.Arn
+                - !Sub "${ValidationWatchStateTable.Arn}/index/*"
+                - !GetAtt HoldingsSnapshotTable.Arn
+                - !Sub "${HoldingsSnapshotTable.Arn}/index/*"
+                - !GetAtt ValidationHoldingsSnapshotTable.Arn
+                - !Sub "${ValidationHoldingsSnapshotTable.Arn}/index/*"
+                - !GetAtt HoldingsSnapshotTableV2.Arn
+                - !Sub "${HoldingsSnapshotTableV2.Arn}/index/*"
+                - !GetAtt ValidationHoldingsSnapshotTableV2.Arn
+                - !Sub "${ValidationHoldingsSnapshotTableV2.Arn}/index/*"
+                - !GetAtt TradeDetectionRunLockTable.Arn
+                - !Sub "${TradeDetectionRunLockTable.Arn}/index/*"
+                - !GetAtt DailyNotificationPriorityTable.Arn
+                - !Sub "${DailyNotificationPriorityTable.Arn}/index/*"
+                - !GetAtt ValidationDailyNotificationPriorityTable.Arn
+                - !Sub "${ValidationDailyNotificationPriorityTable.Arn}/index/*"
+                - !GetAtt TradeEventRecordsTable.Arn
+                - !Sub "${TradeEventRecordsTable.Arn}/index/*"
+                - !GetAtt ValidationTradeEventRecordsTable.Arn
+                - !Sub "${ValidationTradeEventRecordsTable.Arn}/index/*"
+                - !GetAtt HoldingEvaluationRecordsTable.Arn
+                - !Sub "${HoldingEvaluationRecordsTable.Arn}/index/*"
+            - Sid: DynamoDbReadOnlyAccess
+              Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:Scan
+                - dynamodb:Query
+                - dynamodb:BatchGetItem
+                - dynamodb:DescribeTable
+              Resource:
+                - !GetAtt HoldingsTable.Arn
+                - !Sub "${HoldingsTable.Arn}/index/*"
+                - !GetAtt HoldingsTableV2.Arn
+                - !Sub "${HoldingsTableV2.Arn}/index/*"
+                - !GetAtt PurchaseLotsTable.Arn
+                - !Sub "${PurchaseLotsTable.Arn}/index/*"
+                - !GetAtt WatchlistTable.Arn
+                - !Sub "${WatchlistTable.Arn}/index/*"
+                - !GetAtt ShareholderBenefitsTable.Arn
+                - !Sub "${ShareholderBenefitsTable.Arn}/index/*"
+                - !GetAtt CorporateActionRegistryTable.Arn
+                - !Sub "${CorporateActionRegistryTable.Arn}/index/*"
+                - !GetAtt RuleVersionsTable.Arn
+                - !Sub "${RuleVersionsTable.Arn}/index/*"
+                - !GetAtt StockNameOverridesTable.Arn
+                - !Sub "${StockNameOverridesTable.Arn}/index/*"
+                - !GetAtt HoldingDecisionRuntimeConfigTable.Arn
+                - !Sub "${HoldingDecisionRuntimeConfigTable.Arn}/index/*"
+        # Issue #725: HANDLED_FAILURE通知をIncidentNotificationTopic限定でpublishする
+        # (Resource="*"は付与しない。WatchlistBatchReconcilerFunctionと同じ内容)。
+        - Statement:
+            - Sid: PublishIncidentNotification
+              Effect: Allow
+              Action: sns:Publish
+              Resource:
+                - !Ref IncidentNotificationTopic
+      Events:
+        HoldingsWatchlistQueue:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt HoldingsWatchlistQueue.Arn
+            BatchSize: !Ref HoldingsWatchlistSqsBatchSize
+            MaximumBatchingWindowInSeconds: 0
+
+  DisclosureCheckFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-disclosure-check"
+      CodeUri: ../src/
+      Handler: jstock_advisor.lambda_handlers.disclosure_check_handler.handler
+      Timeout: 180
+      Policies:
+        - DynamoDBReadPolicy: { TableName: !Ref HoldingsTable }
+        # M4本番検証で発覚したIAM不備の修正(2026-08): DisclosureCheckService.
+        # analyze()がPortfolioService.list_holdings()経由でM3切替済みのV2テーブルを
+        # 参照する。旧HoldingsTable(直上)は削除せずロールバック用に残し、V2を追加する。
+        - DynamoDBReadPolicy: { TableName: !Ref HoldingsTableV2 }
+        - DynamoDBCrudPolicy: { TableName: !Ref NotificationLogTable }
+        # LINE通知dedupの原子化(Issue #17): 送信決定claim
+        - DynamoDBCrudPolicy: { TableName: !Ref NotificationClaimsTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref EdinetDisclosureCacheTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref EdinetDailyDocumentListCacheTable }
+      Events:
+        Morning:
+          Type: ScheduleV2
+          Properties:
+            ScheduleExpression: "cron(0 10 ? * MON-FRI *)"
+            ScheduleExpressionTimezone: Asia/Tokyo
+            # Issue #318: 群D — ファンアウトせず、二重実行の害が小さい(開示はcontent_hash、定点評価は索引で重複を抑止。月次・四半期は無条件skip)
+            RetryPolicy:
+              MaximumRetryAttempts: 2
+              MaximumEventAgeInSeconds: 3600
+            FlexibleTimeWindow:
+              Mode: "OFF"
+        Midday:
+          Type: ScheduleV2
+          Properties:
+            ScheduleExpression: "cron(30 12 ? * MON-FRI *)"
+            ScheduleExpressionTimezone: Asia/Tokyo
+            # Issue #318: 群D — ファンアウトせず、二重実行の害が小さい(開示はcontent_hash、定点評価は索引で重複を抑止。月次・四半期は無条件skip)
+            RetryPolicy:
+              MaximumRetryAttempts: 2
+              MaximumEventAgeInSeconds: 3600
+            FlexibleTimeWindow:
+              Mode: "OFF"
+        Afternoon:
+          Type: ScheduleV2
+          Properties:
+            ScheduleExpression: "cron(30 15 ? * MON-FRI *)"
+            ScheduleExpressionTimezone: Asia/Tokyo
+            # Issue #318: 群D — ファンアウトせず、二重実行の害が小さい(開示はcontent_hash、定点評価は索引で重複を抑止。月次・四半期は無条件skip)
+            RetryPolicy:
+              MaximumRetryAttempts: 2
+              MaximumEventAgeInSeconds: 3600
+            FlexibleTimeWindow:
+              Mode: "OFF"
+
+  EvaluationFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-evaluation"
+      CodeUri: ../src/
+      Handler: jstock_advisor.lambda_handlers.evaluation_handler.handler
+      # Issue #113: Globals既定の300秒では、蓄積したbacklogをtime budget内で
+      # 安全に消化しきれない。「処理が遅いので力技で延ばす」ためではなく、
+      # N+1 Scan除去・streaming・run scope cacheを行った上で、
+      # get_remaining_time_in_millis()による予算管理のもとで
+      # backlogを消化するための実行枠として900秒を割り当てる
+      # (MemorySizeはstreaming化により512MBのまま据え置く)。
+      Timeout: 900
+      Environment:
+        Variables:
+          # Issue #725: HANDLED_FAILURE通知(publish_incident_envelope)の到達経路。
+          # WatchlistBatchReconcilerFunction(#506)と同じ配線(Topic ARN + sns:Publish + Topic policy)。
+          INCIDENT_NOTIFICATION_TOPIC_ARN: !Ref IncidentNotificationTopic
+          # Issue #537: 既定 false。true のとき、暦日7日の評価の保存が Transaction(EvaluationResult + Aggregate)になる。
+          WEEKLY_AGGREGATE_WRITE_ENABLED: !Ref WeeklyAggregateWriteEnabled
+          WEEKLY_EVALUATION_AGGREGATE_TABLE: !Ref WeeklyEvaluationAggregateTable
+      Policies:
+        - DynamoDBReadPolicy: { TableName: !Ref RecommendationsTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref EvaluationResultsTable }
+        # Issue #537: 評価の保存 Transaction が Aggregate へ書くのは UpdateItem だけ(加算・週の状態・一覧)。
+        # 読み取り・削除・Scan/Query は行わない(最小権限)。
+        - Statement:
+            - Sid: UpdateWeeklyEvaluationAggregate
+              Effect: Allow
+              Action: dynamodb:UpdateItem
+              Resource:
+                - !GetAtt WeeklyEvaluationAggregateTable.Arn
+        # Issue #114 Phase B1: run summaryをAuditLogへ記録する。
+        # 書き込みはAuditLogRepository.save_if_absent()の条件付きPutItemのみで、
+        # 読み取り・削除・Scan/Queryは行わない。DynamoDBCrudPolicyでは
+        # GetItem/Scan/Query/DeleteItem等まで付いてしまうため、
+        # **実際に使うPutItemだけ**を明示する(最小権限)。
+        # なお週次改善レビュー側の読み取り権限は#114 Phase B3で追加する
+        # (B1では読まないため、ここでは付与しない)。
+        - Statement:
+            - Sid: PutEvaluationRunSummaryAudit
+              Effect: Allow
+              Action: dynamodb:PutItem
+              Resource:
+                - !GetAtt AuditLogTable.Arn
+        # Issue #725: HANDLED_FAILURE通知をIncidentNotificationTopic限定でpublishする
+        # (Resource="*"は付与しない。WatchlistBatchReconcilerFunctionと同じ内容)。
+        - Statement:
+            - Sid: PublishIncidentNotification
+              Effect: Allow
+              Action: sns:Publish
+              Resource:
+                - !Ref IncidentNotificationTopic
+      Events:
+        DailyEvening:
+          Type: ScheduleV2
+          Properties:
+            ScheduleExpression: "cron(0 18 ? * MON-FRI *)"
+            ScheduleExpressionTimezone: Asia/Tokyo
+            # Issue #318: 群D — ファンアウトせず、二重実行の害が小さい(開示はcontent_hash、定点評価は索引で重複を抑止。月次・四半期は無条件skip)
+            RetryPolicy:
+              MaximumRetryAttempts: 2
+              MaximumEventAgeInSeconds: 3600
+            FlexibleTimeWindow:
+              Mode: "OFF"
+
+  # Issue #113: 定点評価Lambdaが11日以上「一度も成功していない」ことに
+  # 気づけなかったため、最低限の検知を追加する。本スタックにはこれ以前
+  # CloudWatch AlarmもSNS Topicも1つも存在しなかった。
+  # ★ Issue #132 X-4(#503。段階1)で、AlarmActionsへIncidentNotificationTopicを
+  # 接続した(以前は「通知配信基盤の新設はscope外」として意図的に付けていなかった)。
+  # なお**Lambdaのタイムアウトはerrorsメトリクスに計上される**ため、
+  # このErrors Alarmが1本あれば今回の37回の失敗はすべて検知できていた。
+  # ★ 段階1の完了は自動検知の完成を意味しない(監視対象はLambda12本中1本。
+  # #504の調査: per-item/per-batchの例外を握り潰す設計の6関数の内部異常は、
+  # Errorsに計上されないためこのAlarmでは検知できない。担当は#506)。
+  EvaluationFunctionErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-evaluation-errors"
+      AlarmDescription: >-
+        定点評価Lambdaが失敗した(タイムアウトを含む)。Issue #113参照。
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref EvaluationFunction
+      Statistic: Sum
+      Period: 900
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      # 実行されない時間帯(平日18:00のみ稼働)をALARMにしないため。
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref IncidentNotificationTopic
+
+  # Timeout(900秒)の80%=720秒に達したら、まだ失敗していなくても
+  # 予算超過が近いことを検知する(backlogの発散を早期に捉えるため)。
+  EvaluationFunctionDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-evaluation-duration"
+      AlarmDescription: >-
+        定点評価Lambdaの実行時間がTimeoutの80%(720秒)に達した。Issue #113参照。
+      Namespace: AWS/Lambda
+      MetricName: Duration
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref EvaluationFunction
+      Statistic: Maximum
+      Period: 900
+      EvaluationPeriods: 1
+      Threshold: 720000 # ミリ秒。EvaluationFunctionのTimeout 900秒 × 0.8
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref IncidentNotificationTopic
+
+  # --- 本番ジョブ異常の検知(Issue #132 X-4〔#503〕。段階1) -------------------
+  # CloudWatch Alarm(上記2本)→ SNS → IncidentNotifierFunction → LINE、という
+  # 通知経路1本を新設する。既存Alarmの閾値・メトリクスは変更しない(AlarmActions
+  # の追加のみ)。判定・通知内容・保存形式・領域への影響なし(LOCK_LEVEL 1)。
+
+  # CloudWatch AlarmからSNSへのPublishには、Topic側のリソースポリシーで
+  # cloudwatch.amazonaws.comへの許可が要る(SAMは自動生成しない)。
+  IncidentNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${AWS::StackName}-incident-notifications"
+
+  # Issue #557: PolicyDocumentが複数Statementを持つ場合、SNSのSetTopicAttributes
+  # APIは各StatementのSidが一意であることを要求する(未指定=null同士は「同一」と
+  # 判定される)。この制約はCloudFormationテンプレートのYAML検証(sam validate
+  # --lint)では検出できず、実際のChangeSet EXECUTEがSNS APIへ到達して初めて
+  # HandlerErrorCode: InvalidRequestとして顕在化する(Release W9で発生・
+  # ロールバック済み)。Statementを追加する際は必ず一意なSidを付けること。
+  IncidentNotificationTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref IncidentNotificationTopic
+      PolicyDocument:
+        Statement:
+          - Sid: AllowCloudWatchAlarmPublish
+            Effect: Allow
+            Principal:
+              Service: cloudwatch.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref IncidentNotificationTopic
+            Condition:
+              StringEquals:
+                "aws:SourceAccount": !Ref "AWS::AccountId"
+          # Issue #506(O-1。USER決定〔#506 issuecomment-5805278274〕Option 1):
+          # reconcilerが検知したInternal structured incident payloadも同じTopicを
+          # 通す(発生源に関わらず単一経路)。CloudWatch Alarm以外にpublishを許すのは
+          # このreconciler実行ロールのみ(Resource="*"の付与は行わない)。
+          - Sid: AllowWatchlistBatchReconcilerPublish
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt WatchlistBatchReconcilerFunctionRole.Arn
+            Action: sns:Publish
+            Resource: !Ref IncidentNotificationTopic
+          # Issue #725: HANDLED_FAILURE通知(publish_incident_envelope)を発行する他の8 Lambdaの
+          # 実行ロールを個別に許可する(WatchlistBatchReconcilerと同じ方式。Resource="*"・
+          # ワイルドカードPrincipalは使わない)。Sidは10件すべて一意(#557。重複するとChangeSet EXECUTE時に失敗する)。
+          - Sid: AllowBuyCandidatesPublish
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt BuyCandidatesFunctionRole.Arn
+            Action: sns:Publish
+            Resource: !Ref IncidentNotificationTopic
+          - Sid: AllowBuyCandidateWorkerPublish
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt BuyCandidateWorkerFunctionRole.Arn
+            Action: sns:Publish
+            Resource: !Ref IncidentNotificationTopic
+          - Sid: AllowHoldingsWatchlistPublish
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt HoldingsWatchlistFunctionRole.Arn
+            Action: sns:Publish
+            Resource: !Ref IncidentNotificationTopic
+          - Sid: AllowHoldingsWatchlistWorkerPublish
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt HoldingsWatchlistWorkerFunctionRole.Arn
+            Action: sns:Publish
+            Resource: !Ref IncidentNotificationTopic
+          - Sid: AllowWatchlistDispatcherPublish
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt WatchlistDispatcherFunctionRole.Arn
+            Action: sns:Publish
+            Resource: !Ref IncidentNotificationTopic
+          - Sid: AllowWatchlistWorkerPublish
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt WatchlistWorkerFunctionRole.Arn
+            Action: sns:Publish
+            Resource: !Ref IncidentNotificationTopic
+          - Sid: AllowWatchlistTerminalFailureHandlerPublish
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt WatchlistTerminalFailureHandlerFunctionRole.Arn
+            Action: sns:Publish
+            Resource: !Ref IncidentNotificationTopic
+          - Sid: AllowEvaluationPublish
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt EvaluationFunctionRole.Arn
+            Action: sns:Publish
+            Resource: !Ref IncidentNotificationTopic
+          # Issue #670(HF-5): 売買一時停止の設定の取得失敗(fail-safe)の通知を発行する
+          # LINE webhook関数の実行ロールを個別に許可する(上と同じ方式。Resource="*"・
+          # ワイルドカードPrincipalは使わない)。Sidは11件すべて一意(#557)。
+          - Sid: AllowLineWebhookPublish
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt LineWebhookFunctionRole.Arn
+            Action: sns:Publish
+            Resource: !Ref IncidentNotificationTopic
+
+  # fingerprint(#502 compute_fingerprint()の出力。SHA-256 hex 64桁)をPKとする
+  # claim/dedup状態(infrastructure.aws.incident_state_tracker.py参照)。
+  # 後続の#508(GitHub Issue接続)でも同じテーブルを利用できる構造にするため、
+  # 他の履歴Tableと同じ保護を持つ(NotificationClaimsTableのような一時claimでは
+  # なく、occurrence_count等の運用履歴を失うと再構築できないため)。
+  IncidentStateTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      DeletionProtectionEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      TableName: !Sub "${TablePrefix}-incident_state"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: fingerprint
+          AttributeType: S
+      KeySchema:
+        - AttributeName: fingerprint
+          KeyType: HASH
+
+  IncidentNotifierFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-incident-notifier"
+      CodeUri: ../src/
+      Handler: jstock_advisor.lambda_handlers.incident_notifier_handler.handler
+      Environment:
+        Variables:
+          # Issue #508: GitHub App秘密鍵は環境変数へ直接展開せず、ARNのみを渡し
+          # 実行時にsecretsmanager:GetSecretValueで取得する(WeeklyReviewFunctionと
+          # 同じPattern。値そのものをログ・環境変数へ残さないため)。
+          # config.incident_notification.issue_creation_enabled=falseの間は
+          # 参照されない(config/incident_notification.yaml参照)。
+          GITHUB_APP_SECRET_ARN: !Ref GithubAppSecretArn
+          GITHUB_REPOSITORY: !Ref GithubRepository
+      Policies:
+        # incident_state_tracker.pyが使う操作のみ(最小権限)。Scan/Queryは
+        # 付与しない(GSIが無く、fingerprint単位のGetItem/PutItem/UpdateItem/
+        # DeleteItemだけで足りるため)。
+        - Statement:
+            - Sid: ReadWriteIncidentState
+              Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:PutItem
+                - dynamodb:UpdateItem
+                - dynamodb:DeleteItem
+              Resource:
+                - !GetAtt IncidentStateTable.Arn
+        # Issue #508: GitHub App秘密鍵の取得のみ。PR #563レビュー時のU-2条件
+        # (#133 PARTIAL)どおり、resource-scoped(exact ARN)でありwildcardは
+        # 使わない。WeeklyReviewFunction(#132付録の既存資産)と同一secretを
+        # 共有する(新規secret作成なし)。
+        - Statement:
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: !Ref GithubAppSecretArn
+      Events:
+        AlarmTopic:
+          Type: SNS
+          Properties:
+            Topic: !Ref IncidentNotificationTopic
+
+  # IncidentNotifier自身の異常を検知するAlarm。★ AlarmActionsは意図的に空にする
+  # (同じIncidentNotificationTopicへ流すと自己再帰になる)。self-monitoringの
+  # 残存リスク: このLambda自身が失敗した場合、本段階では誰にも通知されない
+  # (第二の通知経路は本Issueのscope外。baseline: 「本段階では第二の通知経路
+  # までは作らない」)。
+  IncidentNotifierFunctionErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-incident-notifier-errors"
+      AlarmDescription: >-
+        異常通知の中継Lambda自体が失敗した。Issue #503参照。
+        AlarmActionsは意図的に空(同一Topicへの自己再帰を避ける)。
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref IncidentNotifierFunction
+      Statistic: Sum
+      Period: 900
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  # --- 本番ジョブ異常の検知(Issue #132 X-5〔#504〕。段階2) -------------------
+  # 段階1(#503)はEvaluationFunctionのみを監視対象としていた。ここで残る11関数へ
+  # Errors alarmを追加し、Lambda 12本すべてをIncidentNotificationTopicへ接続する
+  # (EvaluationFunctionErrorsAlarmは既に接続済みのため再利用し、ここでは変更しない)。
+  # 各alarmはEvaluationFunctionErrorsAlarmと同一設計(Statistic=Sum, EvaluationPeriods=1,
+  # Threshold=1, TreatMissingData=notBreaching)に統一する。
+  #
+  # ★ 検知範囲の限界(#504調査で確認済み。#506/#507が別途補完する)。
+  #   分類の基準はハンドラ本体の制御フロー(per-item/per-batchの例外を明示的に捕捉し
+  #   re-raiseしない設計かどうか)であり、呼び出し先moduleの個別のexcept節の有無までは
+  #   分類していない(下記の残存リスク参照)。
+  #   グループA(per-item/per-batchの例外を明示的に捕捉しre-raiseしない設計。
+  #   BuyCandidates/HoldingsWatchlist/WatchlistDispatcher/WatchlistWorker/
+  #   WatchlistBatchReconciler/LineWebhook)では、この種の内部異常はLambdaの
+  #   Errorsメトリクスに計上されないため、本alarmだけでは検知できない
+  #   (終端状態の監視は#506/#507の担当)。
+  #   グループB(DisclosureCheck/Evaluation/WeeklyReview/MonthlyReview/
+  #   QuarterlyReview/WatchlistTerminalFailureHandler)は、ハンドラ本体で
+  #   per-item/per-batchの例外を握り潰さないため、グループAより検知範囲が広い。
+  #   ★ ただし「Errorsだけで完全に検知できる関数」は無い: グループBであっても、
+  #   ハンドラが呼ぶ個別module内に独自のexcept Exceptionがあれば、その範囲の異常は
+  #   同様に計上されない(実例: `evaluation_run_audit.py`の監査書き込み失敗は、
+  #   flagに依らず常にexcept Exceptionで握り潰され、EvaluationFunction自体は
+  #   グループBだがこの一点は検知できない)。この限界も#506/#507の担当領域として
+  #   引き継ぐ。
+
+  BuyCandidatesFunctionErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-buy-candidates-errors"
+      AlarmDescription: >-
+        買い候補日次バッチLambdaが失敗した。Issue #504参照。
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref BuyCandidatesFunction
+      Statistic: Sum
+      Period: 900
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref IncidentNotificationTopic
+
+  HoldingsWatchlistFunctionErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-holdings-watchlist-errors"
+      AlarmDescription: >-
+        保有株チェックLambdaが失敗した。Issue #504参照。
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref HoldingsWatchlistFunction
+      Statistic: Sum
+      Period: 900
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref IncidentNotificationTopic
+
+  DisclosureCheckFunctionErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-disclosure-check-errors"
+      AlarmDescription: >-
+        適時開示チェックLambdaが失敗した。Issue #504参照。
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref DisclosureCheckFunction
+      Statistic: Sum
+      Period: 900
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref IncidentNotificationTopic
+
+  WatchlistDispatcherFunctionErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-watchlist-dispatcher-errors"
+      AlarmDescription: >-
+        ウォッチリスト自動追加(dispatcher)Lambdaが失敗した。Issue #504参照。
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref WatchlistDispatcherFunction
+      Statistic: Sum
+      Period: 900
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref IncidentNotificationTopic
+
+  WatchlistWorkerFunctionErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-watchlist-worker-errors"
+      AlarmDescription: >-
+        ウォッチリスト自動追加(worker)Lambdaが失敗した。Issue #504参照。
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref WatchlistWorkerFunction
+      Statistic: Sum
+      Period: 900
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref IncidentNotificationTopic
+
+  WatchlistTerminalFailureHandlerFunctionErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-watchlist-terminal-failure-handler-errors"
+      AlarmDescription: >-
+        ウォッチリスト自動追加(terminal failure handler)Lambdaが失敗した。Issue #504参照。
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref WatchlistTerminalFailureHandlerFunction
+      Statistic: Sum
+      Period: 900
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref IncidentNotificationTopic
+
+  WatchlistBatchReconcilerFunctionErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-watchlist-batch-reconciler-errors"
+      AlarmDescription: >-
+        ウォッチリスト自動追加(reconciler)Lambdaが失敗した。Issue #504参照。
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref WatchlistBatchReconcilerFunction
+      Statistic: Sum
+      Period: 900
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref IncidentNotificationTopic
+
+  WeeklyReviewFunctionErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-weekly-review-errors"
+      AlarmDescription: >-
+        週次改善レビューLambdaが失敗した。Issue #504参照。
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref WeeklyReviewFunction
+      Statistic: Sum
+      Period: 900
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref IncidentNotificationTopic
+
+  # Issue #132 X-6(#505。段階2): Timeout(300秒)の80%=240秒に達したら、まだ失敗して
+  # いなくても予算超過が近いことを検知する(EvaluationFunctionDurationAlarmと同じ考え方)。
+  # 対象はWeeklyReviewFunctionのみ(#377〔PR #539〕のOOM修正後もTimeout自体は変更して
+  # いないため、80%=240秒の計算根拠に変更はない。#539後の実際のDuration実測値による
+  # 再検証は、次回自然実行〔2026-09-28 19:00 JST〕後に行う。人工的な実行はしない)。
+  # 他10関数(WatchlistWorker/WatchlistDispatcher/LineWebhook/BuyCandidates/
+  # HoldingsWatchlist/DisclosureCheck/WatchlistBatchReconciler/MonthlyReview/
+  # QuarterlyReview/WatchlistTerminalFailureHandler)は今回見送り(MANAGER判断)。
+  WeeklyReviewFunctionDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-weekly-review-duration"
+      AlarmDescription: >-
+        週次改善レビューLambdaの実行時間がTimeoutの80%(240秒)に達した。Issue #505参照。
+      Namespace: AWS/Lambda
+      MetricName: Duration
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref WeeklyReviewFunction
+      Statistic: Maximum
+      Period: 900
+      EvaluationPeriods: 1
+      Threshold: 240000 # ミリ秒。WeeklyReviewFunctionのTimeout 300秒 × 0.8
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref IncidentNotificationTopic
+
+  MonthlyReviewFunctionErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-monthly-review-errors"
+      AlarmDescription: >-
+        月次レビューLambdaが失敗した。Issue #504参照。
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref MonthlyReviewFunction
+      Statistic: Sum
+      Period: 900
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref IncidentNotificationTopic
+
+  QuarterlyReviewFunctionErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-quarterly-review-errors"
+      AlarmDescription: >-
+        四半期レビューLambdaが失敗した。Issue #504参照。
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref QuarterlyReviewFunction
+      Statistic: Sum
+      Period: 900
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref IncidentNotificationTopic
+
+  LineWebhookFunctionErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-line-webhook-errors"
+      AlarmDescription: >-
+        LINE WebhookLambdaが失敗した。Issue #504参照。
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref LineWebhookFunction
+      Statistic: Sum
+      Period: 900
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref IncidentNotificationTopic
+
+  # --- DLQ滞留の検知(Issue #349。#132 X-7相当の恒久監視) -----------------------
+  # 真正のDLQ(自動消費者が無く、メッセージは手動のredrive/purgeか14日retentionの
+  # 経過でしか0に戻らない)へメッセージが1件でも見えたら、即座にincident化する
+  # (処理遅延のような一時的な揺らぎではなく、再試行を使い切った終端失敗が
+  # 既に確定した事実であるため、S-6〔#507〕のような持続判定は不要)。
+  # SQSのApproximateNumberOfMessagesVisibleは、キューが動かない時間帯には
+  # データ点が飛ぶことがある(observer roleでの実測。24節)。TreatMissingData=
+  # notBreachingは、この「動きが無い」状態を誤ってALARMにしないための既存の
+  # Errors/Duration alarmと同じ判断根拠であり、実際に閾値を超える値が発行された
+  # 時点のデータ点はAlarmの評価対象になるため検知の信頼性は損なわれない。
+  # USER決定により、dormant(コードから未参照)な2本(BuyCandidate/
+  # HoldingsWatchlist)も、将来Phase 2でdispatch側が切り替わった際の監視漏れを
+  # 防ぐため先行して追加する(現時点では構造的に発火しえない)。
+
+  WatchlistTerminalFailureDLQMessagesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-watchlist-terminal-failure-dlq-messages"
+      AlarmDescription: >-
+        ウォッチリスト評価の終端失敗DLQへメッセージが見えている。Issue #349参照。
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt WatchlistTerminalFailureDLQ.QueueName
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref IncidentNotificationTopic
+
+  AsyncInvokeFailureDLQMessagesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-async-invoke-failure-dlq-messages"
+      AlarmDescription: >-
+        非同期Lambda呼び出し(BuyCandidates/HoldingsWatchlist)の失敗DLQへ
+        メッセージが見えている。Issue #349参照。
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt AsyncInvokeFailureDLQ.QueueName
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref IncidentNotificationTopic
+
+  # ★ dormant(#319 Phase 1。dispatch側の切替=Phase 2は未着手のため、現時点では
+  # コードから一切参照されず、構造的にメッセージが入らない)。Phase 2で
+  # dispatch側が切り替わった際の監視漏れを防ぐため、USER決定により先行して追加する。
+  BuyCandidateTerminalFailureDLQMessagesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-buy-candidate-terminal-failure-dlq-messages"
+      AlarmDescription: >-
+        買い候補探索の終端失敗DLQへメッセージが見えている(#319 Phase 1。
+        Phase 2でdispatch側が切り替わるまでは構造的に発火しない)。Issue #349参照。
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt BuyCandidateTerminalFailureDLQ.QueueName
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref IncidentNotificationTopic
+
+  # ★ dormant(上記と同じ理由。#319 Phase 1)。
+  HoldingsWatchlistTerminalFailureDLQMessagesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-holdings-watchlist-terminal-failure-dlq-messages"
+      AlarmDescription: >-
+        保有株監視の終端失敗DLQへメッセージが見えている(#319 Phase 1。
+        Phase 2でdispatch側が切り替わるまでは構造的に発火しない)。Issue #349参照。
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt HoldingsWatchlistTerminalFailureDLQ.QueueName
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref IncidentNotificationTopic
+
+  # --- ウォッチリスト自動追加(候補ユニバース本格対応・2026-08) ---------------
+  # 旧WatchlistAutoAdditionFunction(単一Lambdaの自己再帰fan-out)を、
+  # Dispatcher→SQS→Worker、TerminalFailureQueue→Handler、毎時Reconcilerという
+  # 4つのLambdaへ分割した(第6版修正プラン)。共通のDynamoDBポリシー・IAM構成:
+  # AuditLog/BatchRuns/WatchlistCandidateProgress/WatchlistへのCRUD、Holdings等の
+  # 除外判定・データ取得用テーブルへの読み取り。
+
+  WatchlistDispatcherFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-watchlist-dispatcher"
+      CodeUri: ../src/
+      Handler: jstock_advisor.lambda_handlers.watchlist_dispatcher_handler.handler
+      Timeout: 300 # 3/18節: dispatch leaseの算出根拠(300秒+60秒余裕=360秒)
+      Environment:
+        Variables:
+          # Issue #725: HANDLED_FAILURE通知(publish_incident_envelope)の到達経路。
+          # WatchlistBatchReconcilerFunction(#506)と同じ配線(Topic ARN + sns:Publish + Topic policy)。
+          INCIDENT_NOTIFICATION_TOPIC_ARN: !Ref IncidentNotificationTopic
+          WATCHLIST_SCREENING_QUEUE_URL: !Ref WatchlistScreeningQueue
+          CANDIDATE_UNIVERSE_CACHE_BUCKET: !Ref CandidateUniverseCacheBucket
+          ALLOW_FULL_MARKET_SCREENING: !Ref AllowFullMarketScreening
+          # 平日毎日起動化(2026-08)対応: NEW_CANDIDATE_SCREENINGの業務finalize
+          # 確定後にWATCHLIST_MAINTENANCEを後続起動する際、自分自身(この関数)を
+          # 非同期invokeする(watchlist_batch_finalizer.maybe_trigger_maintenance)。
+          # Dispatcher自身がfinalizeの最終呼び出し元になるケース(最後のSQS送信
+          # 失敗時等)向けに自己参照名を渡す。
+          WATCHLIST_DISPATCHER_FUNCTION_NAME: !Sub "${AWS::StackName}-watchlist-dispatcher"
+      Policies:
+        # ウォッチリスト自動運用の改善(2026-08)でローテーション状態・削除履歴の
+        # 2テーブルを追加するのを機に、docs/operations_manual.md 11節の指針に
+        # 従いCRUD/ReadをStatementへ集約する(個別DynamoDBCrudPolicyエントリの
+        # 積み上げによるIAMロールのインラインポリシー合計サイズ上限(10240バイト)
+        # 超過を予防する。付与している権限自体は個別指定時と同一)。
+        - Statement:
+            - Sid: DynamoDbCrudAccess
+              Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:DeleteItem
+                - dynamodb:PutItem
+                - dynamodb:Scan
+                - dynamodb:Query
+                - dynamodb:UpdateItem
+                - dynamodb:BatchWriteItem
+                - dynamodb:BatchGetItem
+                - dynamodb:DescribeTable
+                - dynamodb:ConditionCheckItem
+              Resource:
+                - !GetAtt AuditLogTable.Arn
+                - !Sub "${AuditLogTable.Arn}/index/*"
+                - !GetAtt BatchRunsTable.Arn
+                - !Sub "${BatchRunsTable.Arn}/index/*"
+                - !GetAtt WatchlistCandidateProgressTable.Arn
+                - !Sub "${WatchlistCandidateProgressTable.Arn}/index/*"
+                - !GetAtt WatchlistTable.Arn
+                - !Sub "${WatchlistTable.Arn}/index/*"
+                - !GetAtt NotificationLogTable.Arn
+                - !Sub "${NotificationLogTable.Arn}/index/*"
+                # LINE通知dedupの原子化(Issue #17): 送信決定claim
+                - !GetAtt NotificationClaimsTable.Arn
+                - !GetAtt EdinetFilingCacheTable.Arn
+                - !Sub "${EdinetFilingCacheTable.Arn}/index/*"
+                - !GetAtt EdinetDisclosureCacheTable.Arn
+                - !Sub "${EdinetDisclosureCacheTable.Arn}/index/*"
+                - !GetAtt EdinetDailyDocumentListCacheTable.Arn
+                - !Sub "${EdinetDailyDocumentListCacheTable.Arn}/index/*"
+                - !GetAtt WatchlistPriceCacheTable.Arn
+                - !Sub "${WatchlistPriceCacheTable.Arn}/index/*"
+                - !GetAtt WatchlistFinancialCacheTable.Arn
+                - !Sub "${WatchlistFinancialCacheTable.Arn}/index/*"
+                - !GetAtt WatchlistScreeningRotationStateTable.Arn
+                - !Sub "${WatchlistScreeningRotationStateTable.Arn}/index/*"
+                - !GetAtt WatchlistRemovalHistoryTable.Arn
+                - !Sub "${WatchlistRemovalHistoryTable.Arn}/index/*"
+                - !GetAtt WatchlistRotationDispatchLeaseTable.Arn
+                - !Sub "${WatchlistRotationDispatchLeaseTable.Arn}/index/*"
+            - Sid: DynamoDbReadOnlyAccess
+              Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:Scan
+                - dynamodb:Query
+                - dynamodb:BatchGetItem
+                - dynamodb:DescribeTable
+              Resource:
+                - !GetAtt HoldingsTable.Arn
+                - !Sub "${HoldingsTable.Arn}/index/*"
+                # M4本番検証で発覚したIAM不備の修正(2026-08): WatchlistCandidateCollector
+                # の保有銘柄除外判定(list_all())がM3切替済みのV2テーブルを参照する。
+                # 旧HoldingsTable(直上)は削除せずロールバック用に残し、V2を追加する。
+                - !GetAtt HoldingsTableV2.Arn
+                - !Sub "${HoldingsTableV2.Arn}/index/*"
+                - !GetAtt ShareholderBenefitsTable.Arn
+                - !Sub "${ShareholderBenefitsTable.Arn}/index/*"
+                - !GetAtt CorporateActionRegistryTable.Arn
+                - !Sub "${CorporateActionRegistryTable.Arn}/index/*"
+                - !GetAtt StockNameOverridesTable.Arn
+                - !Sub "${StockNameOverridesTable.Arn}/index/*"
+        - S3CrudPolicy: { BucketName: !Ref CandidateUniverseCacheBucket }
+        - SQSSendMessagePolicy: { QueueName: !GetAtt WatchlistScreeningQueue.QueueName }
+        # 平日毎日起動化(2026-08)対応: NEW_CANDIDATE_SCREENINGの業務finalize確定
+        # 後にWATCHLIST_MAINTENANCEを後続起動するための自己invoke権限。関数ARNを
+        # !GetAttで自己参照すると循環依存になるため、FunctionNameと同じ命名規則
+        # (!Sub)で組み立てる。
+        - Statement:
+            - Sid: SelfInvokeForMaintenanceTrigger
+              Effect: Allow
+              Action: lambda:InvokeFunction
+              Resource:
+                - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-watchlist-dispatcher"
+        # Issue #725: HANDLED_FAILURE通知をIncidentNotificationTopic限定でpublishする
+        # (Resource="*"は付与しない。WatchlistBatchReconcilerFunctionと同じ内容)。
+        - Statement:
+            - Sid: PublishIncidentNotification
+              Effect: Allow
+              Action: sns:Publish
+              Resource:
+                - !Ref IncidentNotificationTopic
+      Events:
+        # ウォッチリスト新規候補評価・自動メンテナンスの平日毎日起動化(2026-08)。
+        # NEW_CANDIDATE_SCREENINGは月曜〜金曜06:00 JST(cron自体は祝日判定なし。東証休場日は起動後にhandler側でskip: Issue #440)に起動する。
+        # 市場取引時間外、既存のBUY候補バッチ(平日08:00 JST)より十分前に完了
+        # できる時間帯として選定した。WATCHLIST_MAINTENANCEはもはや独立した
+        # 定期Scheduleを持たず、当日のNEW_CANDIDATE_SCREENINGが業務finalizeを
+        # 正常に完了した直後の後続処理としてのみ起動する
+        # (watchlist_batch_finalizer.maybe_trigger_maintenance、計画Part C-7案A
+        # の後続起動版)。従来の土曜07:00 NEW_CANDIDATE_SCREENING・日曜07:00
+        # WATCHLIST_MAINTENANCEの独立Scheduleはいずれも廃止した。
+        WeekdayMorning:
+          Type: ScheduleV2
+          Properties:
+            ScheduleExpression: "cron(0 6 ? * MON-FRI *)"
+            ScheduleExpressionTimezone: Asia/Tokyo
+            # Issue #318: 群B — ファンアウトするが、rotation dispatch lease(固定rotation_id)が再試行同士を排他する。ただし対象外経路があるため3回以上にはしない
+            RetryPolicy:
+              MaximumRetryAttempts: 2
+              MaximumEventAgeInSeconds: 3600
+            FlexibleTimeWindow:
+              Mode: "OFF"
+            # Issue #65 F-E7: EventBridge Schedulerのcontext attribute
+            # <aws.scheduler.scheduled-time>をLambdaのeventへ渡し、
+            # watchlist_dispatcher_handler.py::_derive_batch_id()がbatch_idを
+            # 決定論的に導出できるようにする。これによりScheduler retryでも
+            # 同一batch_idになり、既存のdispatch lease(batch_id key)が
+            # 多重dispatchを拒否できる。
+            # AWS公式ドキュメントには、この値がretry間で不変であることの明示の
+            # 保証文は無い。ただし<aws.scheduler.execution-id>/
+            # <aws.scheduler.attempt-number>が「試行ごとに変わる」と明記されて
+            # いることとの対比から、scheduled-timeは試行に依存しない値と解釈
+            # できる(妥当な推論。レビュー対応: PR #556 F2)。ドキュメントの例は
+            # Z付き(UTC表記)だが、「常にUTC」という明記も無い。handler側は
+            # offsetなし(naive)で渡ってきた場合のみUTCとみなす既定へ依存する
+            # (watchlist_dispatcher_handler.py::_derive_batch_id()参照)。
+            # deploy後、最初のScheduler起動時のログで実際に渡ってくる値の形式を
+            # 確認すること(verification項目)。
+            Input: '{"scheduled_time": "<aws.scheduler.scheduled-time>"}'
+
+  WatchlistWorkerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-watchlist-worker"
+      CodeUri: ../src/
+      Handler: jstock_advisor.lambda_handlers.watchlist_worker_handler.handler
+      Timeout: 180 # 3節
+      ReservedConcurrentExecutions: !Ref WatchlistReservedConcurrentExecutions
+      Environment:
+        Variables:
+          # Issue #725: HANDLED_FAILURE通知(publish_incident_envelope)の到達経路。
+          # WatchlistBatchReconcilerFunction(#506)と同じ配線(Topic ARN + sns:Publish + Topic policy)。
+          INCIDENT_NOTIFICATION_TOPIC_ARN: !Ref IncidentNotificationTopic
+          # 平日毎日起動化(2026-08)対応: NEW_CANDIDATE_SCREENING最後の候補完了が
+          # このWorkerで確定した場合、maybe_finalize()経由でwatchlist_batch_
+          # finalizer.maybe_trigger_maintenance()がWatchlistDispatcherFunctionを
+          # 非同期invokeする(最も頻度が高い後続起動経路)。
+          WATCHLIST_DISPATCHER_FUNCTION_NAME: !Sub "${AWS::StackName}-watchlist-dispatcher"
+          # Issue #816: 銘柄名の解決(StockDisplayNameResolver)がJPX上場銘柄一覧キャッシュを読むために必要。
+          # 本変数が無いとresolve_candidate_universe_bucket()がRuntimeErrorとなり、
+          # 銘柄名が外部provider・銘柄コードへfallbackする(WatchlistDispatcherFunctionは配線済み)。
+          CANDIDATE_UNIVERSE_CACHE_BUCKET: !Ref CandidateUniverseCacheBucket
+      Policies:
+        # WatchlistDispatcherFunctionと同じ理由(docs/operations_manual.md 11節)で
+        # CRUD/ReadをStatementへ集約する。rotation commitとremoval historyの
+        # 書き込みはWorker呼び出し連鎖内のfinalizeで発生するため、Worker自身にも
+        # 2テーブルへのCRUD権限が必要(計画Part A-5/C-4)。
+        - Statement:
+            - Sid: DynamoDbCrudAccess
+              Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:DeleteItem
+                - dynamodb:PutItem
+                - dynamodb:Scan
+                - dynamodb:Query
+                - dynamodb:UpdateItem
+                - dynamodb:BatchWriteItem
+                - dynamodb:BatchGetItem
+                - dynamodb:DescribeTable
+                - dynamodb:ConditionCheckItem
+              Resource:
+                - !GetAtt AuditLogTable.Arn
+                - !Sub "${AuditLogTable.Arn}/index/*"
+                - !GetAtt BatchRunsTable.Arn
+                - !Sub "${BatchRunsTable.Arn}/index/*"
+                - !GetAtt WatchlistCandidateProgressTable.Arn
+                - !Sub "${WatchlistCandidateProgressTable.Arn}/index/*"
+                - !GetAtt WatchlistTable.Arn
+                - !Sub "${WatchlistTable.Arn}/index/*"
+                - !GetAtt NotificationLogTable.Arn
+                - !Sub "${NotificationLogTable.Arn}/index/*"
+                # LINE通知dedupの原子化(Issue #17): 送信決定claim
+                - !GetAtt NotificationClaimsTable.Arn
+                - !GetAtt EdinetFilingCacheTable.Arn
+                - !Sub "${EdinetFilingCacheTable.Arn}/index/*"
+                - !GetAtt EdinetDisclosureCacheTable.Arn
+                - !Sub "${EdinetDisclosureCacheTable.Arn}/index/*"
+                - !GetAtt EdinetDailyDocumentListCacheTable.Arn
+                - !Sub "${EdinetDailyDocumentListCacheTable.Arn}/index/*"
+                - !GetAtt WatchlistPriceCacheTable.Arn
+                - !Sub "${WatchlistPriceCacheTable.Arn}/index/*"
+                - !GetAtt WatchlistFinancialCacheTable.Arn
+                - !Sub "${WatchlistFinancialCacheTable.Arn}/index/*"
+                - !GetAtt WatchlistScreeningRotationStateTable.Arn
+                - !Sub "${WatchlistScreeningRotationStateTable.Arn}/index/*"
+                - !GetAtt WatchlistRemovalHistoryTable.Arn
+                - !Sub "${WatchlistRemovalHistoryTable.Arn}/index/*"
+                - !GetAtt WatchlistRotationDispatchLeaseTable.Arn
+                - !Sub "${WatchlistRotationDispatchLeaseTable.Arn}/index/*"
+            - Sid: DynamoDbReadOnlyAccess
+              Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:Scan
+                - dynamodb:Query
+                - dynamodb:BatchGetItem
+                - dynamodb:DescribeTable
+              Resource:
+                - !GetAtt HoldingsTable.Arn
+                - !Sub "${HoldingsTable.Arn}/index/*"
+                - !GetAtt ShareholderBenefitsTable.Arn
+                - !Sub "${ShareholderBenefitsTable.Arn}/index/*"
+                - !GetAtt CorporateActionRegistryTable.Arn
+                - !Sub "${CorporateActionRegistryTable.Arn}/index/*"
+                - !GetAtt StockNameOverridesTable.Arn
+                - !Sub "${StockNameOverridesTable.Arn}/index/*"
+        # 平日毎日起動化(2026-08)対応: NEW_CANDIDATE_SCREENING最後の候補完了時、
+        # maybe_trigger_maintenance()がWatchlistDispatcherFunctionを非同期invoke
+        # する(WatchlistDispatcherFunction定義側の同名Statementと同じ理由)。
+        - Statement:
+            - Sid: InvokeDispatcherForMaintenanceTrigger
+              Effect: Allow
+              Action: lambda:InvokeFunction
+              Resource:
+                - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-watchlist-dispatcher"
+        # Issue #816: 銘柄名の解決(StockDisplayNameResolver。finalizeの追加対象の通知文面)が
+        # CandidateUniverseCacheIO経由でJPX上場銘柄一覧キャッシュ(S3)を読むために必要。
+        # BuyCandidatesFunctionのCandidateUniverseCacheReadForJpxShadow(#116)と同じ最小権限:
+        # s3:GetObjectのみ・current/*限定。ListBucket/書き込み/ワイルドカードは付与しない。
+        # キャッシュ未生成の403(ListBucket無しのためNoSuchKeyでなくAccessDeniedになる)は
+        # resolverがfail-softで吸収する(銘柄名は従来どおり外部provider・銘柄コードへfallback)。
+        - Statement:
+            - Sid: CandidateUniverseCacheReadForJpxStockName
+              Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub "${CandidateUniverseCacheBucket.Arn}/current/*"
+        # Issue #725: HANDLED_FAILURE通知をIncidentNotificationTopic限定でpublishする
+        # (Resource="*"は付与しない。WatchlistBatchReconcilerFunctionと同じ内容)。
+        - Statement:
+            - Sid: PublishIncidentNotification
+              Effect: Allow
+              Action: sns:Publish
+              Resource:
+                - !Ref IncidentNotificationTopic
+      Events:
+        ScreeningQueue:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt WatchlistScreeningQueue.Arn
+            BatchSize: !Ref WatchlistSqsBatchSize
+            MaximumBatchingWindowInSeconds: 0
+
+  WatchlistTerminalFailureHandlerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-watchlist-terminal-failure-handler"
+      CodeUri: ../src/
+      Handler: jstock_advisor.lambda_handlers.watchlist_terminal_failure_handler.handler
+      Timeout: 60
+      Environment:
+        Variables:
+          # Issue #725: HANDLED_FAILURE通知(publish_incident_envelope)の到達経路。
+          # WatchlistBatchReconcilerFunction(#506)と同じ配線(Topic ARN + sns:Publish + Topic policy)。
+          INCIDENT_NOTIFICATION_TOPIC_ARN: !Ref IncidentNotificationTopic
+          # Issue #816: 銘柄名の解決(StockDisplayNameResolver)がJPX上場銘柄一覧キャッシュを読むために必要。
+          # 本変数が無いとresolve_candidate_universe_bucket()がRuntimeErrorとなり、
+          # 銘柄名が外部provider・銘柄コードへfallbackする(WatchlistDispatcherFunctionは配線済み)。
+          CANDIDATE_UNIVERSE_CACHE_BUCKET: !Ref CandidateUniverseCacheBucket
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref AuditLogTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref BatchRunsTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref WatchlistCandidateProgressTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref WatchlistTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref NotificationLogTable }
+        # LINE通知dedupの原子化(Issue #17): 送信決定claim
+        - DynamoDBCrudPolicy: { TableName: !Ref NotificationClaimsTable }
+        - DynamoDBReadPolicy: { TableName: !Ref HoldingsTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref EdinetFilingCacheTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref EdinetDisclosureCacheTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref EdinetDailyDocumentListCacheTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref WatchlistPriceCacheTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref WatchlistFinancialCacheTable }
+        - DynamoDBReadPolicy: { TableName: !Ref ShareholderBenefitsTable }
+        - DynamoDBReadPolicy: { TableName: !Ref CorporateActionRegistryTable }
+        - DynamoDBReadPolicy: { TableName: !Ref StockNameOverridesTable }
+        # Issue #816: 銘柄名の解決(StockDisplayNameResolver。finalizeの追加対象の通知文面)が
+        # CandidateUniverseCacheIO経由でJPX上場銘柄一覧キャッシュ(S3)を読むために必要。
+        # BuyCandidatesFunctionのCandidateUniverseCacheReadForJpxShadow(#116)と同じ最小権限:
+        # s3:GetObjectのみ・current/*限定。ListBucket/書き込み/ワイルドカードは付与しない。
+        # キャッシュ未生成の403(ListBucket無しのためNoSuchKeyでなくAccessDeniedになる)は
+        # resolverがfail-softで吸収する(銘柄名は従来どおり外部provider・銘柄コードへfallback)。
+        - Statement:
+            - Sid: CandidateUniverseCacheReadForJpxStockName
+              Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub "${CandidateUniverseCacheBucket.Arn}/current/*"
+        # Issue #725: HANDLED_FAILURE通知をIncidentNotificationTopic限定でpublishする
+        # (Resource="*"は付与しない。WatchlistBatchReconcilerFunctionと同じ内容)。
+        - Statement:
+            - Sid: PublishIncidentNotification
+              Effect: Allow
+              Action: sns:Publish
+              Resource:
+                - !Ref IncidentNotificationTopic
+      Events:
+        TerminalFailureQueue:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt WatchlistTerminalFailureQueue.Arn
+            BatchSize: 10
+
+  WatchlistBatchReconcilerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-watchlist-batch-reconciler"
+      CodeUri: ../src/
+      Handler: jstock_advisor.lambda_handlers.watchlist_batch_reconciler_handler.handler
+      Timeout: 300
+      Environment:
+        Variables:
+          # 平日毎日起動化(2026-08)対応: retry_finalize()経由、または
+          # list_stale_maintenance_triggers()によるinvoke失敗リトライ経由で
+          # maybe_trigger_maintenance()がWatchlistDispatcherFunctionを
+          # 非同期invokeする。
+          WATCHLIST_DISPATCHER_FUNCTION_NAME: !Sub "${AWS::StackName}-watchlist-dispatcher"
+          # Issue #57 Phase B2: finalizeが未完了のbuy/holdingsバッチを検出した際、
+          # 当該Lambdaへ「締めくくり処理のみ」の非同期invokeを発行する
+          # (recovery_action=FINALIZE_ONLY)。銘柄評価等のworker処理は再実行しない。
+          BUY_CANDIDATES_FUNCTION_NAME: !Sub "${AWS::StackName}-buy-candidates"
+          HOLDINGS_WATCHLIST_FUNCTION_NAME: !Sub "${AWS::StackName}-holdings-watchlist"
+          # Issue #506(O-1): missed schedule / 候補ユニバース連続失敗の検知結果を
+          # Internal structured incident payloadとしてpublishする先。
+          INCIDENT_NOTIFICATION_TOPIC_ARN: !Ref IncidentNotificationTopic
+          # Issue #507(S-6): queue backlog(OldestMessageAge)検知の対象キュー、
+          # throttle_rate(補助指標)観測対象のworker関数名。
+          WATCHLIST_SCREENING_QUEUE_NAME: !GetAtt WatchlistScreeningQueue.QueueName
+          WATCHLIST_WORKER_FUNCTION_NAME: !Sub "${AWS::StackName}-watchlist-worker"
+          # Issue #816: 銘柄名の解決(StockDisplayNameResolver)がJPX上場銘柄一覧キャッシュを読むために必要。
+          # 本変数が無いとresolve_candidate_universe_bucket()がRuntimeErrorとなり、
+          # 銘柄名が外部provider・銘柄コードへfallbackする(WatchlistDispatcherFunctionは配線済み)。
+          CANDIDATE_UNIVERSE_CACHE_BUCKET: !Ref CandidateUniverseCacheBucket
+      Policies:
+        # 本番検証(2026-08)で発覚: retry_finalize()経由でDispatcher/Worker
+        # と同じ_finalize_completed()/_maybe_commit_rotation()を呼ぶため、
+        # 従来から本来はWatchlistScreeningRotationStateTable/
+        # WatchlistRemovalHistoryTableへのCRUD権限が必要だったが付与漏れが
+        # あった(今回、二重dispatch防止leaseテーブルの追加を機に同時是正)。
+        # Dispatcher/Worker同様、個別DynamoDBCrudPolicy積み上げによるIAM
+        # インラインポリシーサイズ上限予防のためStatementへ集約する
+        # (docs/operations_manual.md 11節)。
+        - Statement:
+            - Sid: DynamoDbCrudAccess
+              Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:DeleteItem
+                - dynamodb:PutItem
+                - dynamodb:Scan
+                - dynamodb:Query
+                - dynamodb:UpdateItem
+                - dynamodb:BatchWriteItem
+                - dynamodb:BatchGetItem
+                - dynamodb:DescribeTable
+                - dynamodb:ConditionCheckItem
+              Resource:
+                - !GetAtt AuditLogTable.Arn
+                - !Sub "${AuditLogTable.Arn}/index/*"
+                - !GetAtt BatchRunsTable.Arn
+                - !Sub "${BatchRunsTable.Arn}/index/*"
+                - !GetAtt WatchlistCandidateProgressTable.Arn
+                - !Sub "${WatchlistCandidateProgressTable.Arn}/index/*"
+                - !GetAtt WatchlistTable.Arn
+                - !Sub "${WatchlistTable.Arn}/index/*"
+                - !GetAtt NotificationLogTable.Arn
+                - !Sub "${NotificationLogTable.Arn}/index/*"
+                # LINE通知dedupの原子化(Issue #17): 送信決定claim
+                - !GetAtt NotificationClaimsTable.Arn
+                - !GetAtt EdinetFilingCacheTable.Arn
+                - !Sub "${EdinetFilingCacheTable.Arn}/index/*"
+                - !GetAtt EdinetDisclosureCacheTable.Arn
+                - !Sub "${EdinetDisclosureCacheTable.Arn}/index/*"
+                - !GetAtt EdinetDailyDocumentListCacheTable.Arn
+                - !Sub "${EdinetDailyDocumentListCacheTable.Arn}/index/*"
+                - !GetAtt WatchlistPriceCacheTable.Arn
+                - !Sub "${WatchlistPriceCacheTable.Arn}/index/*"
+                - !GetAtt WatchlistFinancialCacheTable.Arn
+                - !Sub "${WatchlistFinancialCacheTable.Arn}/index/*"
+                - !GetAtt WatchlistScreeningRotationStateTable.Arn
+                - !Sub "${WatchlistScreeningRotationStateTable.Arn}/index/*"
+                - !GetAtt WatchlistRemovalHistoryTable.Arn
+                - !Sub "${WatchlistRemovalHistoryTable.Arn}/index/*"
+                - !GetAtt WatchlistRotationDispatchLeaseTable.Arn
+                - !Sub "${WatchlistRotationDispatchLeaseTable.Arn}/index/*"
+            - Sid: DynamoDbReadOnlyAccess
+              Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:Scan
+                - dynamodb:Query
+                - dynamodb:BatchGetItem
+                - dynamodb:DescribeTable
+              Resource:
+                - !GetAtt HoldingsTable.Arn
+                - !Sub "${HoldingsTable.Arn}/index/*"
+                - !GetAtt ShareholderBenefitsTable.Arn
+                - !Sub "${ShareholderBenefitsTable.Arn}/index/*"
+                - !GetAtt CorporateActionRegistryTable.Arn
+                - !Sub "${CorporateActionRegistryTable.Arn}/index/*"
+                - !GetAtt StockNameOverridesTable.Arn
+                - !Sub "${StockNameOverridesTable.Arn}/index/*"
+            # Issue #529 corrective fix: PR #572でreconcile_pending_trade_events()
+            # (trade_event_reconciliation_service.py)を追加した際、本関数の
+            # IAM policyへTradeEventRecordsTableの付与が漏れていた
+            # (2026-09-27自然実行でdynamodb:Query AccessDeniedExceptionとして
+            # 検出。#529 issuecomment参照)。list_pending_with_raw()が
+            # pending-marker-index経由のQueryとGetItem、mark_consumed()が
+            # PutItem(CAS)を呼ぶため、この3 actionのみを付与する。
+            - Sid: TradeEventReconciliationAccess
+              Effect: Allow
+              Action:
+                - dynamodb:Query
+                - dynamodb:GetItem
+                - dynamodb:PutItem
+              Resource:
+                - !GetAtt TradeEventRecordsTable.Arn
+                - !Sub "${TradeEventRecordsTable.Arn}/index/*"
+            # 同上(#529): end_for_trade_events()(watch_state_service.py)が
+            # get_active()/get_with_raw()(GetItem)とreplace_if_raw_matches()
+            # (PutItem、CAS)をWatchStateTableへ発行する。Query/Scanは呼ばない
+            # ため付与しない。現在pending件数は0のため未再現だが、
+            # コード到達性から明示的なfix対象とする(推測ではなくcode read
+            # による確認)。
+            - Sid: WatchStateEndForTradeEventsAccess
+              Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:PutItem
+              Resource:
+                - !GetAtt WatchStateTable.Arn
+        # 平日毎日起動化(2026-08)対応: WatchlistDispatcherFunction定義側の
+        # 同名Statementと同じ理由(maybe_trigger_maintenanceの再試行invoke)。
+        - Statement:
+            - Sid: InvokeDispatcherForMaintenanceTrigger
+              Effect: Allow
+              Action: lambda:InvokeFunction
+              Resource:
+                - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-watchlist-dispatcher"
+        # Issue #57 Phase B2: buy/holdingsのfinalize recovery。締めくくり処理のみを
+        # 再実行させるため当該Lambdaを非同期invokeする(recovery_action=FINALIZE_ONLY)。
+        # ワイルドカードは使わず、対象2関数のARNだけを列挙する。
+        - Statement:
+            - Sid: InvokeForCompletionFinalizeRecovery
+              Effect: Allow
+              Action: lambda:InvokeFunction
+              Resource:
+                - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-buy-candidates"
+                - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-holdings-watchlist"
+        # Issue #816: 銘柄名の解決(StockDisplayNameResolver。finalizeの追加対象の通知文面)が
+        # CandidateUniverseCacheIO経由でJPX上場銘柄一覧キャッシュ(S3)を読むために必要。
+        # BuyCandidatesFunctionのCandidateUniverseCacheReadForJpxShadow(#116)と同じ最小権限:
+        # s3:GetObjectのみ・current/*限定。ListBucket/書き込み/ワイルドカードは付与しない。
+        # キャッシュ未生成の403(ListBucket無しのためNoSuchKeyでなくAccessDeniedになる)は
+        # resolverがfail-softで吸収する(銘柄名は従来どおり外部provider・銘柄コードへfallback)。
+        - Statement:
+            - Sid: CandidateUniverseCacheReadForJpxStockName
+              Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub "${CandidateUniverseCacheBucket.Arn}/current/*"
+        # Issue #506(O-1): missed schedule / 候補ユニバース連続失敗の検知結果を
+        # IncidentNotificationTopic限定でpublishする(Resource="*"は付与しない)。
+        - Statement:
+            - Sid: PublishIncidentNotification
+              Effect: Allow
+              Action: sns:Publish
+              Resource:
+                - !Ref IncidentNotificationTopic
+        # Issue #507(S-6): queue backlog(OldestMessageAge)・throttle_rate(補助指標)の
+        # 観測。CloudWatch GetMetricDataのみで完結し(SQS/Lambda双方のメトリクスを
+        # CloudWatch経由で読む)、SQS/Lambdaへの直接API呼び出しは行わない。
+        # 読み取り専用のみで書き込み・削除権限は一切含まない。
+        # ★ cloudwatch:GetMetricDataはCloudWatch側がリソースレベル権限自体を
+        #   サポートしていない(メトリクスはARNを持たない。AWSの既知の制約であり
+        #   本プロジェクト固有の設計判断ではない)ため、Resource="*"が必須。
+        # ★ #507レビューF2是正: 当初sqs:GetQueueAttributesも付与していたが、
+        #   実装(_fetch_watchlist_worker_metrics)はCloudWatch GetMetricDataだけで
+        #   OldestMessageAgeを取得しており、boto3.client("sqs")を一度も構築しない
+        #   (実測: src全体でこのハンドラからのsqs:GetQueueAttributes呼び出しは
+        #   0件)。未使用の権限を持たせない(最小権限の原則)ため削除した。
+        - Statement:
+            - Sid: ObserveWatchlistWorkerMetrics
+              Effect: Allow
+              Action: cloudwatch:GetMetricData
+              Resource: "*"
+      Events:
+        Hourly:
+          Type: ScheduleV2
+          Properties:
+            ScheduleExpression: "rate(1 hour)"
+            # Issue #318: 群C — 毎時起動。次の回が1時間後に必ず来るため、遅れて走るより次へ委ねる。1800秒=間隔の半分で前後の回が重ならない
+            RetryPolicy:
+              MaximumRetryAttempts: 1
+              MaximumEventAgeInSeconds: 1800
+            FlexibleTimeWindow:
+              Mode: "OFF"
+
+  WeeklyReviewFunction:
+    # 振り返り機能改修(2026-08): 全期間合算レポートのLINE自動送信(旧
+    # ReviewReportService経由)から、前週に確定した評価を分析し改善候補を検出・
+    # GitHub Issue自動起票する週次改善レビュー(WeeklyImprovementReviewService)へ
+    # 置き換えた。RuleProposalsTableは新ロジックでは参照しない(手動CLI
+    # `jstock rules propose`専用のまま)。
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-weekly-review"
+      CodeUri: ../src/
+      Handler: jstock_advisor.lambda_handlers.weekly_review_handler.handler
+      Environment:
+        Variables:
+          # Issue #537: 既定 false。true かつ backfill が COMPLETE のとき、集計済みの Aggregate を読む。
+          WEEKLY_AGGREGATE_READ_ENABLED: !Ref WeeklyAggregateReadEnabled
+          WEEKLY_EVALUATION_AGGREGATE_TABLE: !Ref WeeklyEvaluationAggregateTable
+          # GitHub App秘密鍵は環境変数へ直接展開せず、ARNのみを渡し実行時に
+          # secretsmanager:GetSecretValueで取得する(値そのものをログ・環境変数へ
+          # 残さないため)。GitHub App未設定の間はissue_creation_enabled=falseに
+          # より参照されない(config/review_improvement.yaml参照)。
+          GITHUB_APP_SECRET_ARN: !Ref GithubAppSecretArn
+          GITHUB_REPOSITORY: !Ref GithubRepository
+      Policies:
+        - DynamoDBReadPolicy: { TableName: !Ref EvaluationResultsTable }
+        - DynamoDBReadPolicy: { TableName: !Ref RecommendationsTable }
+        - DynamoDBReadPolicy: { TableName: !Ref RuleVersionsTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref WeeklyReviewMetricsTable }
+        # Issue #537: 週次レビューが Aggregate に対して行うのは、Query / GetItem(週の集計・状態・一覧・制御)と、
+        # marker の解消(UpdateItem)だけ。Scan・PutItem・DeleteItem は付与しない(最小権限。全件 Scan をしないことの担保)。
+        - Statement:
+            - Sid: ReadAndResolveWeeklyEvaluationAggregate
+              Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:Query
+                - dynamodb:UpdateItem
+              Resource:
+                - !GetAtt WeeklyEvaluationAggregateTable.Arn
+        - DynamoDBCrudPolicy: { TableName: !Ref ImprovementCandidatesTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref ImprovementTasksTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref AuditLogTable }
+        - Statement:
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: !Ref GithubAppSecretArn
+      Events:
+        MondayEvening:
+          Type: ScheduleV2
+          Properties:
+            # 前週(月〜日 JST)を完全に確定させてから分析するため、その日の
+            # point_in_time_evaluation(平日18:00)完了後に実行する。
+            ScheduleExpression: "cron(0 19 ? * MON *)"
+            ScheduleExpressionTimezone: Asia/Tokyo
+            # Issue #318: 群D — ファンアウトしない。ただし本関数だけは根拠が他の6本と違う。
+            # 週次はGitHub Issueを自動起票し、**新規作成できたときだけ**LINEを送る。
+            # 重複を防いでいるのはcontent_hashでも索引でもなく、ImprovementTaskStatus.
+            # ISSUE_CREATING(新規作成中の原子的なclaim)である。claim期限切れ(stale)を
+            # 検出した場合もGitHub側の実在確認を先に行ってから復旧・再claimするため、
+            # 再試行で同じIssueが二重起票されることはない(enums.py ImprovementTaskStatus)。
+            # ★ ただしCONFIGURATION_ERROR/ISSUE_CREATION_FAILEDのLINE送信は**claimの外**に
+            #   あり、再試行で同じ失敗を繰り返せば**エラー通知は重複する**(retry=2なので上限3通)。
+            #   実害は小さいが「害が小さい」と書く以上、何が重複しうるかを明示しておく。
+            RetryPolicy:
+              MaximumRetryAttempts: 2
+              MaximumEventAgeInSeconds: 3600
+            FlexibleTimeWindow:
+              Mode: "OFF"
+
+  MonthlyReviewFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-monthly-review"
+      CodeUri: ../src/
+      Handler: jstock_advisor.lambda_handlers.monthly_review_handler.handler
+      Policies:
+        - DynamoDBReadPolicy: { TableName: !Ref EvaluationResultsTable }
+        - DynamoDBReadPolicy: { TableName: !Ref RecommendationsTable }
+        - DynamoDBReadPolicy: { TableName: !Ref RuleProposalsTable }
+      Events:
+        # 毎週土曜に起動し、当月第1土曜日かはLambda側(_scheduling.py)で判定する
+        SaturdayMorning:
+          Type: ScheduleV2
+          Properties:
+            ScheduleExpression: "cron(0 10 ? * SAT *)"
+            ScheduleExpressionTimezone: Asia/Tokyo
+            # Issue #318: 群D — ファンアウトせず、二重実行の害が小さい(開示はcontent_hash、定点評価は索引で重複を抑止。月次・四半期は無条件skip)
+            RetryPolicy:
+              MaximumRetryAttempts: 2
+              MaximumEventAgeInSeconds: 3600
+            FlexibleTimeWindow:
+              Mode: "OFF"
+
+  QuarterlyReviewFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-quarterly-review"
+      CodeUri: ../src/
+      Handler: jstock_advisor.lambda_handlers.quarterly_review_handler.handler
+      Events:
+        # 毎週土曜に起動し、1/4/7/10月の第1土曜日かはLambda側で判定する
+        SaturdayMorning:
+          Type: ScheduleV2
+          Properties:
+            ScheduleExpression: "cron(0 11 ? * SAT *)"
+            ScheduleExpressionTimezone: Asia/Tokyo
+            # Issue #318: 群D — ファンアウトせず、二重実行の害が小さい(開示はcontent_hash、定点評価は索引で重複を抑止。月次・四半期は無条件skip)
+            RetryPolicy:
+              MaximumRetryAttempts: 2
+              MaximumEventAgeInSeconds: 3600
+            FlexibleTimeWindow:
+              Mode: "OFF"
+
+  # --- LINE Webhook(API Gateway経由、チャット起点の売買記録・ウォッチ登録) --
+
+  LineWebhookFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-line-webhook"
+      CodeUri: ../src/
+      Handler: jstock_advisor.lambda_handlers.line_webhook_handler.handler
+      Timeout: 30
+      Environment:
+        Variables:
+          LINE_CHANNEL_SECRET: !Sub "{{resolve:secretsmanager:${LineChannelSecretSecretArn}:SecretString}}"
+          # コードレビュー2026-08-17指摘: 会話型UIの確認画面がbuild_stock_display_name_resolver()
+          # 経由で銘柄名解決を試みるが、本関数にS3/StockNameOverridesTableへのアクセス権が
+          # 無かったため常に全ソース失敗しstock_codeへフォールバックしていた
+          # (画面上「8306(8306)」のように表示される不具合)。JPXソース用のバケット名を渡す。
+          CANDIDATE_UNIVERSE_CACHE_BUCKET: !Ref CandidateUniverseCacheBucket
+          # Issue #670(HF-5): 売買一時停止の設定を取得できずfail-safe(一時停止)へ倒れたとき、
+          # HANDLED_FAILUREをUSERへ通知する(services/trading_pause_service.py)。下の
+          # PublishIncidentNotification Statementとセット。
+          INCIDENT_NOTIFICATION_TOPIC_ARN: !Ref IncidentNotificationTopic
+      Policies:
+        # LINEボタン起点会話型UI(2026-08)のconversation_commit.pyがTransactWriteItems
+        # で複数テーブルを原子的に更新する(実装プランv2 3節)。TransactWriteItemsは
+        # 各アイテムの個別アクション(PutItem/DeleteItem/UpdateItem/ConditionCheckItem)
+        # のみをIAMが評価し、専用のTransactWriteItemsアクションは存在しない
+        # (watchlist_worker_handler.pyのDynamoDbCrudAccess Statementで確認済みの
+        # 既存パターンをそのまま踏襲)。DynamoDBCrudPolicyショートハンドはConditionCheckItem
+        # を含まないため、カスタムStatementへ集約する。
+        - Statement:
+            - Sid: DynamoDbCrudAccess
+              Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:DeleteItem
+                - dynamodb:PutItem
+                - dynamodb:Scan
+                - dynamodb:Query
+                - dynamodb:UpdateItem
+                - dynamodb:BatchWriteItem
+                - dynamodb:BatchGetItem
+                - dynamodb:DescribeTable
+                - dynamodb:ConditionCheckItem
+              Resource:
+                - !GetAtt TransactionsTable.Arn
+                - !Sub "${TransactionsTable.Arn}/index/*"
+                - !GetAtt SkippedRecommendationsTable.Arn
+                - !Sub "${SkippedRecommendationsTable.Arn}/index/*"
+                - !GetAtt WatchlistTable.Arn
+                - !Sub "${WatchlistTable.Arn}/index/*"
+                - !GetAtt HoldingsTable.Arn
+                - !Sub "${HoldingsTable.Arn}/index/*"
+                # M4本番検証で発覚したIAM不備の修正(2026-08): conversation_service.py
+                # (get_holding)・conversation_commit.py(TransactWriteItems)がM3切替
+                # 済みのV2テーブルを参照する。旧HoldingsTable(直上)は削除せず
+                # ロールバック用に残し、V2を追加する。
+                - !GetAtt HoldingsTableV2.Arn
+                - !Sub "${HoldingsTableV2.Arn}/index/*"
+                - !GetAtt PurchaseLotsTable.Arn
+                - !Sub "${PurchaseLotsTable.Arn}/index/*"
+                - !GetAtt ConversationStatesTable.Arn
+                - !Sub "${ConversationStatesTable.Arn}/index/*"
+        # Issue #595(#128 A6a): 買付余力の参照・棚卸し更新(AvailableCashService
+        # 経由)。call graph実測(#592実装内容)により、実際に使うアクションは
+        # GetItem(get/get_raw)・PutItem(conditional_put_transact_item()が
+        # 生成するConditionExpression付きPut。ConditionCheck項目を別途置いて
+        # いないためConditionCheckItemは不要)の2つのみと確認できたため、
+        # 上のDynamoDbCrudAccess Statement(10 action)には含めず、専用
+        # Statementへ最小権限で切り出す(サブちゃんレビュー対応。
+        # TradingPauseConfigConditionCheckAccessと同じ「共有Statementに
+        # 混ぜず専用Statementを追加する」既存の流儀を踏襲)。
+        - Statement:
+            - Sid: AvailableCashAccess
+              Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:PutItem
+              Resource:
+                - !GetAtt AvailableCashTable.Arn
+        - DynamoDBReadPolicy: { TableName: !Ref RecommendationsTable }
+        # StockDisplayNameResolverのoverrideソース(手動上書き名称)・JPXソース用
+        # (指摘対応、上記CANDIDATE_UNIVERSE_CACHE_BUCKET環境変数とあわせて追加)。
+        - DynamoDBReadPolicy: { TableName: !Ref StockNameOverridesTable }
+        # LINE UI第二弾(ウォッチリスト/対象確認、2026-08)向け。直近購入判定・
+        # 対象確認一覧の読み取り専用アクセス(いずれも書き込みは行わない)。
+        - DynamoDBReadPolicy: { TableName: !Ref BuyCandidateEvaluationRecordsTable }
+        - DynamoDBReadPolicy: { TableName: !Ref BuyCandidateBatchCompletionTable }
+        # Phase 2-B「銘柄分析」向け(2026-08)。SELL/HOLD側の直近評価参照
+        # (どのエンジンが判定担当だったかの照会)、読み取り専用。
+        - DynamoDBReadPolicy: { TableName: !Ref HoldingEvaluationRecordsTable }
+        # レビュー対応(2026-08、本番デプロイ後確認で発覚): Legacy SELL担当の
+        # 純粋HOLD銘柄分析(authoritative_audit_log_id経由でAuditLogEntryを直接
+        # 取得する経路)にAuditLogTableへの読み取り権限が付与されておらず、
+        # AccessDeniedExceptionとなっていた不備を修正。読み取り専用(Write権限は
+        # 付与しない)。
+        - DynamoDBReadPolicy: { TableName: !Ref AuditLogTable }
+        # 保有銘柄オーナー機能移行: BUY/SELL一時停止フラグ。書き込みはCLI経由の
+        # 人間のみ(DynamoDBReadPolicyでは不足。commit_buy/commit_sellの
+        # TransactWriteItemsがConditionCheckとして参照するためdynamodb:
+        # ConditionCheckItemが必須で、DynamoDBReadPolicyのマネージドポリシー
+        # テンプレートには含まれないため、専用Statementで明示的に付与する
+        # コードレビュー対応)。
+        - Statement:
+            - Sid: TradingPauseConfigConditionCheckAccess
+              Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:ConditionCheckItem
+                - dynamodb:DescribeTable
+              Resource:
+                - !GetAtt TradingPauseConfigTable.Arn
+                - !Sub "${TradingPauseConfigTable.Arn}/index/*"
+        - S3ReadPolicy: { BucketName: !Ref CandidateUniverseCacheBucket }
+        # Issue #670(HF-5): HANDLED_FAILURE通知をIncidentNotificationTopic限定でpublishする
+        # (Resource="*"は付与しない。#725の他関数と同じ内容。**このIAM追加は本番へ反映
+        # されるまで効かない**ので、反映前はenv変数も無く通知は送られない)。
+        - Statement:
+            - Sid: PublishIncidentNotification
+              Effect: Allow
+              Action: sns:Publish
+              Resource:
+                - !Ref IncidentNotificationTopic
+      Events:
+        Webhook:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref WebhookApi
+            Path: /webhook
+            Method: POST
+
+  WebhookApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: prod
+
+  # --- Secrets Manager resource policy(#680。#133 UNIT2) ---------------------
+  # identity policy側の設定ミスに依存しない、secret自体の第二の防壁。
+  # allow-list(ADMIN/DEPLOY principal、および対象secretがGithubAppSecretArnの
+  # 場合のみ、実際にsecretsmanager:GetSecretValueを行う2 runtime role)に
+  # 無いprincipalからの、値の取得・書き換え・resource policy自体の操作を
+  # explicit Denyする。「Denyしたい相手を名指しする」のではなく
+  # 「許可したい相手をCondition[StringNotEquals]で除外する」形にすることで、
+  # 将来新しいprincipalが誤って広範な権限を持って作られた場合にも、
+  # allow-listに追加されていない限り自動的にDeny対象となる(#133 Phase Aの
+  # 「resource policyが無ければ第二の防壁にならない」という診断への対応)。
+  #
+  # ★ lockout防止の設計上の要点:
+  #   - Denyの対象からADMIN/DEPLOYを常に除外する(management principalが
+  #     自分自身をlockoutしない)。管理者role・deploy userのARNは
+  #     SecretResourcePolicyEnabled=true適用前に、AdminPrincipalArn/
+  #     DeployPrincipalArnパラメータへ実際の値を設定すること。
+  #   - explicit DenyはIAM側のAllow(管理者権限を含む)より常に優先される
+  #     (AWSの評価規則)。「管理者だから暗黙に復旧できる」という前提には
+  #     頼らず、policy自身のCondition除外リストへ管理者を明記することで
+  #     復旧経路を担保する。
+  #   - Production適用前の事前確認は、principalの種別で手段が異なる
+  #     (2026-09-28、サブちゃんレビュー指摘F7/F9で判明。IAM Policy
+  #     Simulatorのresource policy込みend-to-end simulationはIAM role
+  #     には非対応)。ADMIN(SSO role)・RUNTIME 2 role(Lambda実行role)は
+  #     roleのためこの制約を受けるが、DEPLOYはIAM userのため
+  #     iam:SimulatePrincipalPolicyのResourcePolicyパラメータで実際に
+  #     end-to-end simulationができる。詳細な確認手順は
+  #     docs/operations_manual.md §35.1(本PRでは未実施。Production適用の
+  #     別Human Gateで行う)。
+  # --- 資金入替の観測 P(Issue #604 P-b4 A2。#128 R2)-------------------------------
+  # USER 決定 #604 …6195577714(統合文書 …6188895158 §9 どおりに承認)。出荷は
+  # Scheduler = DISABLED かつ mode = OFF(何も動かない)。BUY / SELL・既存の Lambda・Role・queue・
+  # finalize・設定は変更しない。P は読取専用の観測で、書込は AuditLog への『日の集計』1 件 / 日だけ。
+  # ★ 本番有効化(Scheduler ENABLED + mode SHADOW)は別の ChangeSet・別の USER 承認 ★
+  RotationObservationFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-rotation-observation"
+      CodeUri: ../src/
+      Handler: jstock_advisor.lambda_handlers.rotation_observation_handler.handler
+      # 総予算 50 秒(読取 40 + 書込の予約 10)≦ Timeout 60 秒の 0.9(契約テストが固定)。
+      Timeout: 60
+      MemorySize: 512
+      # 同時実行 1・非同期の再試行 0(次の回が再評価する設計。記録は先勝ちで冪等)。DLQ なし。
+      ReservedConcurrentExecutions: 1
+      EventInvokeConfig:
+        MaximumRetryAttempts: 0
+      # P 固有の環境変数は 0 件(mode は設定ファイル。Globals 由来の変数だけ)
+      Policies:
+        # ★ 最小権限(契約テストが Action・Resource の完全一致で固定)★
+        # 付けない: UpdateItem・DeleteItem・BatchWriteItem・TransactWriteItems・SQS・他の Lambda の Invoke・
+        #           Secrets Manager・LINE・他の表・ワイルドカードの Resource
+        - Statement:
+            - Sid: ReadBatchRuns
+              Effect: Allow
+              Action: dynamodb:GetItem
+              Resource:
+                - !GetAtt BatchRunsTable.Arn
+            - Sid: ReadRecommendations
+              Effect: Allow
+              Action: dynamodb:BatchGetItem
+              Resource:
+                - !GetAtt RecommendationsTable.Arn
+            - Sid: QueryHoldingEvaluationRecordsIndex
+              Effect: Allow
+              Action: dynamodb:Query
+              Resource:
+                - !Sub "${HoldingEvaluationRecordsTable.Arn}/index/holding_id-index"
+            # 保有の一覧(約 28 件の小さな表)を引く唯一の既存の方法。1 表だけ・200 件 / 3 ページ /
+            # 時間の上限・部分結果で判断しない(コード側の契約テストで固定)。
+            # ★ 観測用 profile の 1 回きりの Scan の承認とは別の、恒久的な Scan の承認(USER #604 …6195577714)★
+            - Sid: ScanHoldingsTableV2
+              Effect: Allow
+              Action: dynamodb:Scan
+              Resource:
+                - !GetAtt HoldingsTableV2.Arn
+            - Sid: PutObservationAudit
+              Effect: Allow
+              Action: dynamodb:PutItem
+              Resource:
+                - !GetAtt AuditLogTable.Arn
+      Events:
+        # 平日 08:15・08:30・08:45(保有バッチの 08:00〜08:03 の山の後)。祝日は runner が何もしない
+        EarlyRuns:
+          Type: ScheduleV2
+          Properties:
+            ScheduleExpression: "cron(15,30,45 8 ? * MON-FRI *)"
+            ScheduleExpressionTimezone: Asia/Tokyo
+            State: !Ref RotationObservationScheduleState
+            RoleArn: !GetAtt RotationObservationSchedulerRole.Arn
+            RetryPolicy:
+              MaximumRetryAttempts: 0
+              MaximumEventAgeInSeconds: 3600
+            FlexibleTimeWindow:
+              Mode: "OFF"
+        # 最後の回 09:00(BatchRuns の TTL の上限 13:00 JST の内側。runner が構築時に検証)
+        LastRun:
+          Type: ScheduleV2
+          Properties:
+            ScheduleExpression: "cron(0 9 ? * MON-FRI *)"
+            ScheduleExpressionTimezone: Asia/Tokyo
+            State: !Ref RotationObservationScheduleState
+            RoleArn: !GetAtt RotationObservationSchedulerRole.Arn
+            RetryPolicy:
+              MaximumRetryAttempts: 0
+              MaximumEventAgeInSeconds: 3600
+            FlexibleTimeWindow:
+              Mode: "OFF"
+
+  # P の Scheduler の起動用 Role(★ この stack で初めての明示の RoleArn ★。既存の ScheduleV2 は SAM の自動生成)。
+  # 信頼ポリシーの Principal は scheduler.amazonaws.com だけ・権限は P の関数 1 つへの lambda:InvokeFunction だけ。
+  RotationObservationSchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeRotationObservationFunction
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: InvokeRotationObservationFunction
+                Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource:
+                  - !GetAtt RotationObservationFunction.Arn
+
+  # 既存の保有バッチの Errors Alarm と同じ形。TreatMissingData: notBreaching を明示(出荷時 DISABLED で
+  # 1 回も起動しない間も ALARM にならない)。runner が failed を返すと Lambda が失敗する = ここが鳴る。
+  RotationObservationFunctionErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-rotation-observation-errors"
+      AlarmDescription: >-
+        資金入替の観測 P の Lambda が失敗した(記録に失敗・想定外の例外・タイムアウト)。Issue #604 P-b4 参照。
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref RotationObservationFunction
+      Statistic: Sum
+      Period: 900
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref IncidentNotificationTopic
+
+  GithubAppSecretResourcePolicy:
+    Type: AWS::SecretsManager::ResourcePolicy
+    Condition: SecretResourcePolicyIsEnabled
+    Properties:
+      SecretId: !Ref GithubAppSecretArn
+      ResourcePolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyUnlessIntendedPrincipal
+            Effect: Deny
+            Principal: "*"
+            Action:
+              - secretsmanager:GetSecretValue
+              - secretsmanager:PutSecretValue
+              - secretsmanager:DeleteSecret
+              - secretsmanager:UpdateSecret
+              - secretsmanager:RotateSecret
+              - secretsmanager:PutResourcePolicy
+              - secretsmanager:DeleteResourcePolicy
+            Resource: !Ref GithubAppSecretArn
+            Condition:
+              StringNotEquals:
+                aws:PrincipalArn:
+                  - !Ref AdminPrincipalArn
+                  - !Ref DeployPrincipalArn
+                  - !GetAtt IncidentNotifierFunctionRole.Arn
+                  - !GetAtt WeeklyReviewFunctionRole.Arn
+
+  EdinetApiKeySecretResourcePolicy:
+    Type: AWS::SecretsManager::ResourcePolicy
+    Condition: SecretResourcePolicyIsEnabled
+    Properties:
+      SecretId: !Ref EdinetApiKeySecretArn
+      ResourcePolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyUnlessIntendedPrincipal
+            Effect: Deny
+            Principal: "*"
+            Action:
+              - secretsmanager:GetSecretValue
+              - secretsmanager:PutSecretValue
+              - secretsmanager:DeleteSecret
+              - secretsmanager:UpdateSecret
+              - secretsmanager:RotateSecret
+              - secretsmanager:PutResourcePolicy
+              - secretsmanager:DeleteResourcePolicy
+            Resource: !Ref EdinetApiKeySecretArn
+            Condition:
+              StringNotEquals:
+                aws:PrincipalArn:
+                  - !Ref AdminPrincipalArn
+                  - !Ref DeployPrincipalArn
+
+  LineChannelAccessTokenSecretResourcePolicy:
+    Type: AWS::SecretsManager::ResourcePolicy
+    Condition: SecretResourcePolicyIsEnabled
+    Properties:
+      SecretId: !Ref LineChannelAccessTokenSecretArn
+      ResourcePolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyUnlessIntendedPrincipal
+            Effect: Deny
+            Principal: "*"
+            Action:
+              - secretsmanager:GetSecretValue
+              - secretsmanager:PutSecretValue
+              - secretsmanager:DeleteSecret
+              - secretsmanager:UpdateSecret
+              - secretsmanager:RotateSecret
+              - secretsmanager:PutResourcePolicy
+              - secretsmanager:DeleteResourcePolicy
+            Resource: !Ref LineChannelAccessTokenSecretArn
+            Condition:
+              StringNotEquals:
+                aws:PrincipalArn:
+                  - !Ref AdminPrincipalArn
+                  - !Ref DeployPrincipalArn
+
+  LineUserIdSecretResourcePolicy:
+    Type: AWS::SecretsManager::ResourcePolicy
+    Condition: SecretResourcePolicyIsEnabled
+    Properties:
+      SecretId: !Ref LineUserIdSecretArn
+      ResourcePolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyUnlessIntendedPrincipal
+            Effect: Deny
+            Principal: "*"
+            Action:
+              - secretsmanager:GetSecretValue
+              - secretsmanager:PutSecretValue
+              - secretsmanager:DeleteSecret
+              - secretsmanager:UpdateSecret
+              - secretsmanager:RotateSecret
+              - secretsmanager:PutResourcePolicy
+              - secretsmanager:DeleteResourcePolicy
+            Resource: !Ref LineUserIdSecretArn
+            Condition:
+              StringNotEquals:
+                aws:PrincipalArn:
+                  - !Ref AdminPrincipalArn
+                  - !Ref DeployPrincipalArn
+
+  LineChannelSecretSecretResourcePolicy:
+    Type: AWS::SecretsManager::ResourcePolicy
+    Condition: SecretResourcePolicyIsEnabled
+    Properties:
+      SecretId: !Ref LineChannelSecretSecretArn
+      ResourcePolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyUnlessIntendedPrincipal
+            Effect: Deny
+            Principal: "*"
+            Action:
+              - secretsmanager:GetSecretValue
+              - secretsmanager:PutSecretValue
+              - secretsmanager:DeleteSecret
+              - secretsmanager:UpdateSecret
+              - secretsmanager:RotateSecret
+              - secretsmanager:PutResourcePolicy
+              - secretsmanager:DeleteResourcePolicy
+            Resource: !Ref LineChannelSecretSecretArn
+            Condition:
+              StringNotEquals:
+                aws:PrincipalArn:
+                  - !Ref AdminPrincipalArn
+                  - !Ref DeployPrincipalArn
+
+  # --- Issue #925(kv1): owner の符号を作る鍵の Secret と、その観測 ---------------------------
+  # ★ 論理 ID `AllocationShadowOwnerRefKeyV1` と Name は変えない ★。変えると置換(= 新しい鍵が
+  # 静かに生成され、過去の符号と結べなくなる = 実質的な鍵の紛失)になる。Retain のため stack を
+  # 消しても Secret は残り、同名の再作成は失敗する(運用手順書 §37 付近の注記を参照)。
+  # 変更が要るときは新しい版(V2)を別の論理 ID で追加する。鍵の値は GenerateSecretString が作り、
+  # 人は見ない(英数字 64 文字 = 約 381 ビット)。template・ログ・環境変数に値は現れない。
+  AllocationShadowOwnerRefKeyV1:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Name: !Sub "${AWS::StackName}/allocation-shadow-owner-ref-key-v1"
+      Description: owner の符号(owner_ref)を HMAC で作る鍵(kv1)。Issue #925。変更・削除しない
+      GenerateSecretString:
+        SecretStringTemplate: '{"key_version": 1}'
+        GenerateStringKey: key
+        PasswordLength: 64
+        ExcludePunctuation: true
+
+  # 第二の防壁(リソースポリシー)。既存の Condition に相乗りし、既定(false)では作られない。
+  # 有効化は #680 の既存の Gate(AdminPrincipalArn / DeployPrincipalArn の実値・事前確認・
+  # USER の別承認)に合流する。許可する principal = Admin / Deploy / 実行 role 2 本。
+  AllocationShadowOwnerRefKeyResourcePolicy:
+    Type: AWS::SecretsManager::ResourcePolicy
+    Condition: SecretResourcePolicyIsEnabled
+    Properties:
+      SecretId: !Ref AllocationShadowOwnerRefKeyV1
+      ResourcePolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyUnlessIntendedPrincipal
+            Effect: Deny
+            Principal: "*"
+            Action:
+              - secretsmanager:GetSecretValue
+              - secretsmanager:PutSecretValue
+              - secretsmanager:DeleteSecret
+              - secretsmanager:UpdateSecret
+              - secretsmanager:RotateSecret
+              - secretsmanager:PutResourcePolicy
+              - secretsmanager:DeleteResourcePolicy
+            Resource: !Ref AllocationShadowOwnerRefKeyV1
+            Condition:
+              StringNotEquals:
+                aws:PrincipalArn:
+                  - !Ref AdminPrincipalArn
+                  - !Ref DeployPrincipalArn
+                  - !GetAtt BuyCandidatesFunctionRole.Arn
+                  - !GetAtt BuyCandidateWorkerFunctionRole.Arn
+
+  # 鍵が取れなかった日の観測(2 系統)。ログの固定の印を数えるだけで、ログの本文は読まない。
+  #   設定の不備 = デプロイ・権限・資源の不備(1 件で即時に気づくべき)
+  #   異常       = 一時的な障害・値の不正(件数で見る)
+  # ★ 対象のログ group は BuyCandidatesFunction だけ ★。BuyCandidateWorkerFunction の log group は
+  # (BuyCandidateSqsDispatchEnabled=false の間は一度も動かないため)まだ存在せず、MetricFilter を
+  # 付けると ChangeSet の EXECUTE が失敗する。fan-out を有効にする前に、運用手順書の手順で追加する。
+  AllocationShadowKeyConfigIssueFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${BuyCandidatesFunction}"
+      FilterPattern: '"ALLOCATION_SHADOW_KEY_UNAVAILABLE_CONFIG"'
+      MetricTransformations:
+        - MetricNamespace: !Sub "${AWS::StackName}/AllocationShadow"
+          MetricName: KeyConfigIssue
+          MetricValue: "1"
+
+  AllocationShadowKeyAnomalyFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${BuyCandidatesFunction}"
+      FilterPattern: '"ALLOCATION_SHADOW_KEY_UNAVAILABLE_ANOMALY"'
+      MetricTransformations:
+        - MetricNamespace: !Sub "${AWS::StackName}/AllocationShadow"
+          MetricName: KeyAnomaly
+          MetricValue: "1"
+
+  AllocationShadowKeyConfigIssueAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-allocation-shadow-key-config-issue"
+      AlarmDescription: >-
+        鍵の取得が設定の不備で失敗した(未設定・権限なし・Secret なし)。Issue #925参照。
+      Namespace: !Sub "${AWS::StackName}/AllocationShadow"
+      MetricName: KeyConfigIssue
+      Statistic: Sum
+      Period: 3600
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref IncidentNotificationTopic
+
+  AllocationShadowKeyAnomalyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-allocation-shadow-key-anomaly"
+      AlarmDescription: >-
+        鍵の取得が一時的な障害・値の不正で失敗した(タイムアウト・形式不正・その他)。
+        1 日に 3 件以上。Issue #925参照。
+      Namespace: !Sub "${AWS::StackName}/AllocationShadow"
+      MetricName: KeyAnomaly
+      Statistic: Sum
+      Period: 86400
+      EvaluationPeriods: 1
+      Threshold: 3
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref IncidentNotificationTopic
+
+Outputs:
+  WebhookUrl:
+    Description: >
+      LINE DevelopersコンソールのWebhook URLに設定するエンドポイント。
+      デプロイ後、この値を「https://<ここ>/webhook」の形でMessaging API設定に登録する。
+      検証(Verify)を押す前に、4つのSecrets Managerシークレットへ値を投入しておくこと。
+    Value: !Sub "https://${WebhookApi}.execute-api.${AWS::Region}.amazonaws.com/prod"

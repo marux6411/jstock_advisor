@@ -1,0 +1,538 @@
+"""HoldingDecisionResultからRecommendationを構築する(実装プラン11節・16節)。
+
+should_notify=trueの場合のみ呼ばれる。売却価格候補の算出(現在株価が必要)は
+ここで初めて行い、保有判断スコア自体の算出には一切混ぜない(15節)。
+"""
+
+from __future__ import annotations
+
+import logging
+import math
+import uuid
+from collections.abc import Mapping
+
+from jstock_advisor.config.models import AppConfig
+from jstock_advisor.domain.entities.common import SellPriceLevels
+from jstock_advisor.domain.entities.enums import (
+    ConfidenceLevel,
+    HoldingDecisionCategory,
+    HoldingDecisionConfidenceLevel,
+    PriceFieldBasis,
+    RecommendationScope,
+    RecommendationType,
+)
+from jstock_advisor.domain.entities.exit_price_range import ExitPriceRangeResult
+from jstock_advisor.domain.entities.holding import Holding
+from jstock_advisor.domain.entities.holding_decision import HoldingDecisionResult, ReasonImpact
+from jstock_advisor.domain.entities.recommendation import Recommendation
+from jstock_advisor.domain.shadow_observation import isolated_shadow_observation
+from jstock_advisor.domain.signals.earnings_surprise import (
+    earnings_surprise_config_values,
+    earnings_surprise_result_to_metrics,
+)
+from jstock_advisor.domain.signals.earnings_trend import (
+    earnings_trend_config_values,
+    earnings_trend_result_to_metrics,
+)
+from jstock_advisor.domain.signals.entry_price_range import (
+    entry_price_range_config_values,
+    entry_price_range_result_to_metrics,
+)
+from jstock_advisor.domain.signals.environment import (
+    environment_config_values,
+    environment_result_to_metrics,
+)
+from jstock_advisor.domain.signals.exit_price_range import (
+    exit_price_range_config_values,
+    exit_price_range_result_to_metrics,
+)
+from jstock_advisor.domain.signals.historical_valuation import (
+    historical_valuation_config_values,
+    historical_valuation_result_to_metrics,
+)
+from jstock_advisor.domain.signals.holding_decision_gate_confirmation import (
+    CONFIRMATION_RULE_VERSION,
+)
+from jstock_advisor.domain.signals.holding_decision_renotification import (
+    EarningsDataFreshness,
+    GateConfirmation,
+    HdNotifyState,
+    SellReference,
+    serialize_hd_state,
+)
+from jstock_advisor.domain.signals.market_environment import (
+    market_environment_config_values,
+    market_environment_result_to_metrics,
+)
+from jstock_advisor.domain.signals.record_date_resolution import (
+    resolve_benefit_record_date_recurring_label,
+    resolve_benefit_record_date_source_type,
+)
+from jstock_advisor.domain.signals.sector_environment import (
+    sector_environment_config_values,
+    sector_environment_result_to_metrics,
+)
+from jstock_advisor.domain.signals.timing_score import (
+    timing_score_config_values,
+    timing_score_result_to_metrics,
+)
+from jstock_advisor.services.financial_freshness_integration import (
+    FINANCIAL_STALE_USER_WARNING,
+    FinancialFreshnessAssessment,
+    assess_financial_freshness,
+)
+from jstock_advisor.services.sell_price_recommendation_service import recommend_sell_prices
+from jstock_advisor.services.stock_snapshot_service import StockSnapshot
+
+logger = logging.getLogger(__name__)
+
+_REASON_CODE_LABELS: dict[str, str] = {
+    "financial_health_equity_ratio": "自己資本比率の水準",
+    "financial_health_debt_excess": "債務超過の有無",
+    "cash_generation_cf_income_ratio": "営業CFと営業利益の対応",
+    "cash_generation_cf_streak": "営業CFの黒字継続性",
+    "profitability_roe": "簡易予想ROEの水準",
+    "profitability_eps_stability": "EPSの安定性",
+    "stability_operating_income": "営業利益の安定性",
+    "stability_deficit": "赤字の有無",
+    "governance_going_concern": "継続企業の前提",
+    "governance_listing_risk": "上場維持リスク",
+    "dividend_policy": "配当方針の維持",
+    "total_yield": "配当+優待の総合利回り",
+    "benefit_condition": "株主優待条件の維持",
+    "profit_cf_premise": "中長期的な利益・CF前提の維持",
+    "financial_premise": "財務健全性に関する投資前提の維持",
+    "custom_conditions": "個別に登録した銘柄固有の投資理由",
+    "business_cashflow_deterioration": "業績・キャッシュフローの悪化",
+    "shareholder_return_deterioration": "株主還元の悪化",
+    "financial_crisis": "財務危機の兆候",
+    "governance_and_listing_risk": "不祥事・法規制・上場維持リスク",
+    "structural_change": "大型希薄化・買収・構造変化",
+}
+
+_CATEGORY_TO_RECOMMENDATION_TYPE: dict[HoldingDecisionCategory, RecommendationType] = {
+    HoldingDecisionCategory.SELL_CONSIDERATION: RecommendationType.SELL_CONSIDERATION,
+    HoldingDecisionCategory.STRONG_SELL_CONSIDERATION: RecommendationType.STRONG_SELL_CONSIDERATION,
+}
+
+_CONFIDENCE_MAP: dict[HoldingDecisionConfidenceLevel, ConfidenceLevel] = {
+    HoldingDecisionConfidenceLevel.HIGH: ConfidenceLevel.HIGH,
+    HoldingDecisionConfidenceLevel.MEDIUM: ConfidenceLevel.MEDIUM,
+    HoldingDecisionConfidenceLevel.LOW: ConfidenceLevel.LOW,
+}
+
+
+def _reason_label(reason: ReasonImpact) -> str:
+    return _REASON_CODE_LABELS.get(reason.reason_code, reason.reason_code)
+
+
+# Issue #890 PR-2: 再通知の条件 R2(悪化のみにする場合)が使う『判定の重さ』。
+# 重いほど大きい整数で、既存の 3 種類の通知の重さの順(売却検討 < 強い売却検討 < 緊急確認)を
+# そのまま表す。新しい数の導入ではなく、既存の種別の順序の写し。
+_DECISION_SEVERITY: dict[RecommendationType, int] = {
+    RecommendationType.SELL_CONSIDERATION: 1,
+    RecommendationType.STRONG_SELL_CONSIDERATION: 2,
+    RecommendationType.URGENT_HOLDING_REVIEW: 3,
+}
+
+# 売却目安価格(R5 の参照)として使う price field。適正価格の弱気水準に由来する価格
+# (basis = TARGET_PRICE)だけを使う。監視用・即時執行目安・現在値は使わない。
+_SELL_REFERENCE_FIELD: dict[RecommendationType, str] = {
+    RecommendationType.SELL_CONSIDERATION: "stop_review_price",
+    RecommendationType.STRONG_SELL_CONSIDERATION: "full_profit_consideration_price",
+}
+
+
+def _to_confirmation(value: str) -> GateConfirmation:
+    try:
+        return GateConfirmation(value)
+    except ValueError:
+        return GateConfirmation.UNVERIFIED
+
+
+def _sell_reference(
+    recommendation_type: RecommendationType, sell_prices: SellPriceLevels
+) -> SellReference | None:
+    field_name = _SELL_REFERENCE_FIELD.get(recommendation_type)
+    if field_name is None:
+        return None
+    level = getattr(sell_prices, field_name)
+    if level is None or level.basis is not PriceFieldBasis.TARGET_PRICE:
+        return None
+    price = float(level.price)
+    if not (math.isfinite(price) and price > 0):
+        return None
+    return SellReference(kind=field_name, price=price)
+
+
+def _build_hd_renotify_state(
+    result: HoldingDecisionResult,
+    recommendation_type: RecommendationType,
+    sell_prices: SellPriceLevels,
+    snapshot: StockSnapshot,
+    config: AppConfig,
+    freshness: FinancialFreshnessAssessment,
+    gate_confirmations: Mapping[str, str],
+) -> dict[str, object]:
+    """再通知の比較に使う『この通知の時点の状態』(保存形式 hd_renotify_state。版 1)を作る。
+
+    PR-1(domain/signals/holding_decision_renotification.py)が定義した形式で書く。値だけで、
+    銘柄・金額・株数は持たない。発動した hard gate の理由コードのうち、確認状態が渡されなかった
+    ものは UNVERIFIED(数えない側)にする。
+    """
+    confirmations = frozenset(
+        (code, _to_confirmation(gate_confirmations.get(code, GateConfirmation.UNVERIFIED.value)))
+        for code in result.hard_gate.reason_codes
+    )
+    market_price = float(snapshot.current_price)
+    state = HdNotifyState(
+        scoring_model_version=str(config.holding_decision.scoring_model_version),
+        base_score=result.base_score,
+        final_score=result.final_score,
+        recommendation_type=recommendation_type.value,
+        category=result.category.value,
+        decision_severity=_DECISION_SEVERITY.get(recommendation_type),
+        gate_confirmations=confirmations,
+        earnings_key=freshness.latest_financial_period_end,
+        earnings_freshness=EarningsDataFreshness(freshness.result.verdict.value),
+        sell_reference=_sell_reference(recommendation_type, sell_prices),
+        market_price=market_price if math.isfinite(market_price) and market_price > 0 else None,
+        confirmation_rule_version=CONFIRMATION_RULE_VERSION,
+    )
+    return serialize_hd_state(state)
+
+
+def build_holding_decision_recommendation(
+    holding: Holding,
+    result: HoldingDecisionResult,
+    snapshot: StockSnapshot,
+    rule_version: str,
+    config: AppConfig,
+    exit_price_range: ExitPriceRangeResult,
+    recommendation_id: str | None = None,
+    gate_confirmations: tuple[tuple[str, str], ...] = (),
+) -> Recommendation:
+    """should_notify=true(=このHoldingDecisionResultは通知対象)の場合にのみ呼ぶ。
+
+    gate_confirmations(Issue #890 PR-2)は、評価(HoldingDecisionService)が返した hard gate の
+    理由コードごとの確認状態。再通知の比較に使う `hd_renotify_state` を config_values_used に
+    記録するためだけに使い、通知の内容・判定には使わない。
+
+    configは判定精度向上機能Phase B(Historical Valuation Score)のconfig_values_
+    used記録専用(コードレビュー対応)。保有判断スコア自体の算出には一切使わない
+    (15節の既存原則を維持)。
+
+    exit_price_range(判定精度向上機能次フェーズSTEP2)は呼び出し元
+    (lambda_handlers/holdings_watchlist_handler.py)が既に算出済みの値を
+    そのまま受け取る。本関数自身はEntry/Exit Price Rangeを一切算出しない
+    (Shadow計測の算出責務は呼び出し元に一元化する設計原則)。
+    """
+    if result.hard_gate.triggered:
+        recommendation_type = RecommendationType.URGENT_HOLDING_REVIEW
+    else:
+        recommendation_type = _CATEGORY_TO_RECOMMENDATION_TYPE.get(
+            result.category, RecommendationType.SELL_CONSIDERATION
+        )
+
+    sell_prices = recommend_sell_prices(
+        current_price=snapshot.current_price,
+        category=result.category,
+        hard_gate_triggered=result.hard_gate.triggered,
+        fair_value_range=snapshot.fair_value_range,
+    )
+
+    # Issue #67 F-I2: 上のrecommend_sell_prices()が実際に使うfair_value_range
+    # (usable_for_trading_judgmentを条件に売却価格の決定へ使用している)を、
+    # 利確側(profit_taking_service.py)と同じ規約でRecommendationへ保存する。
+    # 保存し忘れていたため、価格を提示できなかった理由がレコードに残らず
+    # (#21が解こうとした失敗モードの再発)、DecisionSnapshotへも伝播しない
+    # 状態だった。
+    fv_range = snapshot.fair_value_range
+    fair_value_spread_ratio = (
+        float(fv_range.bull / fv_range.bear)
+        if fv_range.bear is not None and fv_range.bull is not None and fv_range.bear > 0
+        else None
+    )
+
+    reasons = [_reason_label(r) for r in result.negative_reasons]
+    counter_factors = [_reason_label(r) for r in result.positive_reasons]
+
+    action_summary = (
+        "重大条件のため保有判断スコアへ上限補正を適用しています。速やかに内容を確認してください。"
+        if result.hard_gate.triggered
+        else (
+            f"保有判断スコア{result.display_value}点。"
+            "投資前提の悪化が疑われるため売却を検討してください。"
+        )
+    )
+
+    next_review_conditions = ["次回決算発表後に再評価する"]
+
+    # Issue #468(U17): 財務データが報告サイクル上の最新でない(STALE)場合の留意事項。
+    # 売却を促す理由(reasons)でも保有を支持する要因(counter_factors)でもないため、
+    # 混ぜず key_risks(留意事項)へ入れる(SELL・利確と同じ格納先)。文言は既存の共通定数。
+    # 判定は評価時(HoldingDecisionService)と同じ関数・同じ入力(評価時刻 = evaluated_at)。
+    # FRESH・UNKNOWNは空(空のままなら通知本文にも節を出さない)。
+    financial_freshness = assess_financial_freshness(
+        snapshot.financial, result.evaluated_at, config
+    )
+    key_risks = [FINANCIAL_STALE_USER_WARNING] if financial_freshness.is_stale else []
+
+    # Issue #890 PR-2: 再通知の比較に使う『この通知の時点の状態』。builder は通知経路(ACTIVE)
+    # でしか呼ばれないため、検証モード(SHADOW)ではこの記録は作られない。
+    # shadow 計測ではなく、PR-3 で通知の判断に読まれる記録なので、isolated_shadow_observation
+    # (#405 の隔離の数え上げの対象)は使わない。失敗しても通知の記録(Recommendation)の構築を
+    # 止めない(止めると保有判断の通知そのものが失われる)ため、ここで捕捉し、形が不正な印を残す。
+    # 比較側(extract_hd_state)は、この印を『比べられない(STATE_MALFORMED)』として扱う。
+    try:
+        hd_renotify_state: dict[str, object] = _build_hd_renotify_state(
+            result,
+            recommendation_type,
+            sell_prices,
+            snapshot,
+            config,
+            financial_freshness,
+            dict(gate_confirmations),
+        )
+    except Exception as exc:  # noqa: BLE001 - 記録の失敗を通知の構築へ伝播させない
+        logger.warning(
+            "hd_renotify_state could not be built and was recorded as failed: error=%s",
+            type(exc).__name__,
+        )
+        hd_renotify_state = {"computation_failed": True, "error_type": type(exc).__name__}
+
+    # Issue #384 PR-5: 記録専用(DecisionSnapshot/Recommendation記録用)の
+    # *_to_metrics()整形がRecommendation構築のinline引数として本流に
+    # 直接置かれており、いずれかが例外を出すとbuild_holding_decision_
+    # recommendation()自体が失敗し、呼び出し元(HoldingDecision通知)全体が
+    # 失われるリスクがあった(#384本体・#22 C2・#371と同型)。9関数はいずれも
+    # dict[str, object]を返すため、PR-1で抽出済みのisolated_shadow_
+    # observation()(dict専用契約)でそのまま隔離できる(新規helperの追加は
+    # 不要)。命名・fallback形式はPR-2(sell_signal_service.py/profit_taking_
+    # service.py)の同一9関数への適用とまったく同じパターンを踏襲する。
+    historical_valuation_metrics = isolated_shadow_observation(
+        "historical_valuation_metrics",
+        lambda: historical_valuation_result_to_metrics(snapshot.historical_valuation),
+    )
+    timing_metrics = isolated_shadow_observation(
+        "timing_metrics",
+        lambda: timing_score_result_to_metrics(
+            snapshot.timing, snapshot.momentum, snapshot.current_price
+        ),
+    )
+    earnings_surprise_metrics = isolated_shadow_observation(
+        "earnings_surprise_metrics",
+        lambda: earnings_surprise_result_to_metrics(snapshot.earnings_surprise),
+    )
+    earnings_trend_metrics = isolated_shadow_observation(
+        "earnings_trend_metrics",
+        lambda: earnings_trend_result_to_metrics(snapshot.earnings_trend),
+    )
+    entry_price_range_metrics = isolated_shadow_observation(
+        "entry_price_range_metrics",
+        lambda: entry_price_range_result_to_metrics(
+            snapshot.entry_price_range,
+            snapshot.fair_value_range,
+            snapshot.historical_valuation,
+            snapshot.timing,
+            snapshot.momentum,
+            config.entry_exit_price.entry,
+        ),
+    )
+    exit_price_range_metrics = isolated_shadow_observation(
+        "exit_price_range_metrics",
+        lambda: exit_price_range_result_to_metrics(
+            exit_price_range,
+            snapshot.fair_value_range,
+            snapshot.historical_valuation,
+            snapshot.timing,
+            holding.average_purchase_price,
+            config.entry_exit_price.exit,
+        ),
+    )
+    market_metrics = isolated_shadow_observation(
+        "market_metrics",
+        lambda: market_environment_result_to_metrics(snapshot.market_environment),
+    )
+    sector_metrics = isolated_shadow_observation(
+        "sector_metrics",
+        lambda: sector_environment_result_to_metrics(snapshot.sector_environment),
+    )
+    environment_metrics = isolated_shadow_observation(
+        "environment_metrics",
+        lambda: environment_result_to_metrics(
+            snapshot.environment, snapshot.market_environment, snapshot.sector_environment
+        ),
+    )
+
+    return Recommendation(
+        recommendation_id=recommendation_id or str(uuid.uuid4()),
+        # Issue #580: 1件の保有についての推奨。
+        scope_type=RecommendationScope.SINGLE_HOLDING,
+        owner=holding.owner,
+        holding_id=holding.holding_id,
+        stock_code=holding.stock_code,
+        stock_name=snapshot.financial.stock_name or holding.stock_name,
+        recommended_at=result.evaluated_at,
+        recommendation_type=recommendation_type,
+        raw_recommendation_type=recommendation_type,
+        sell_prices=sell_prices,
+        price_at_recommendation=snapshot.current_price,
+        price_as_of_date=snapshot.price_as_of_date,
+        average_purchase_price_at_recommendation=holding.average_purchase_price,
+        shares_at_recommendation=holding.shares,
+        dividend_yield_pct_at_recommendation=snapshot.dividend_yield_pct,
+        shareholder_benefit_yield_pct_at_recommendation=snapshot.benefit_yield_pct,
+        total_yield_pct_at_recommendation=snapshot.total_yield_pct,
+        fair_value_at_recommendation=snapshot.fair_value,
+        # Issue #67 F-I2: fair value 6フィールド + #21の3フィールド。
+        # profit_taking_service.pyと完全に同じ規約(enumは.value、
+        # fair_value_methodsはmethod/fair_value/confidence/exclusion_reasonの
+        # dict列)で転記する。
+        fair_value_bear=fv_range.bear,
+        fair_value_neutral=fv_range.neutral,
+        fair_value_bull=fv_range.bull,
+        fair_value_overall_confidence=fv_range.overall_confidence,
+        fair_value_methods=[
+            {
+                "method": m.method,
+                "fair_value": str(m.fair_value) if m.fair_value is not None else None,
+                "confidence": m.confidence.value,
+                "exclusion_reason": m.exclusion_reason,
+            }
+            for m in (fv_range.methods_used + fv_range.methods_excluded)
+        ],
+        fair_value_spread_ratio=fair_value_spread_ratio,
+        fair_value_usable_for_trading_judgment=fv_range.usable_for_trading_judgment,
+        fair_value_unusable_reason_code=(
+            fv_range.unusable_reason_code.value
+            if fv_range.unusable_reason_code is not None
+            else None
+        ),
+        fair_value_unusable_reason=fv_range.unusable_reason,
+        reasons=reasons,
+        counter_factors=counter_factors,
+        key_risks=key_risks,
+        confidence=_CONFIDENCE_MAP.get(result.confidence, ConfidenceLevel.LOW),
+        next_earnings_date=snapshot.next_earnings_date,
+        # Issue #67 F-I4: 決算日は「日付」だけでは確度を復元できない。同じ
+        # snapshotが既に持っているstatus(検証結果)とraw(検証前の生値)を対で
+        # 転記する。★日付を再解決しない・入力に無いrawはNoneのまま。
+        # statusがUNAVAILABLEでもrawが残ることがあり(取得はできたが検証を
+        # 通らなかった場合)、rawを落とすと「解釈不能」と「欠落」が区別できなくなる。
+        earnings_date_status=snapshot.earnings_date_status,
+        earnings_date_raw=snapshot.earnings_date_raw,
+        # Issue #67 F-I5: 権利確定日の「由来」をBUY・利確と同じ意味で保存する。
+        # ★resolverへ渡すのは判定に使ったsnapshot由来の値だけであり、保存時に
+        # 現在日付で解決し直さない。確定日があるときlabelがNoneになるのは正しい。
+        benefit_record_date_recurring_label=resolve_benefit_record_date_recurring_label(
+            snapshot.benefit, snapshot.financial.fiscal_year_end_month
+        ),
+        benefit_record_date_source_type=resolve_benefit_record_date_source_type(snapshot.benefit),
+        # Issue #67 F-I1: 判定に使った財務データのprovenance(#20 Phase B2-A)。
+        # ★snapshot構築時点の事実の転記のみで、取得し直して補完しない。
+        # 入力がNoneなら保存もNone(「未取得」と「転記漏れ」を混同しない)。
+        financial_input_provenance=snapshot.financial_input_provenance,
+        rule_version=rule_version,
+        config_values_used={
+            # Issue #67 F-I6: rule_versionへ「ルール版」(RuleVersionService管理)
+            # を格納するよう是正した(呼び出し元の変更)のに伴い、従来
+            # rule_versionへ入っていたscoring_model_versionを明示キーとして
+            # 保存する(2つの版概念を分離。値そのものはholding_decision_
+            # result_id経由でHoldingDecisionResult側からも復元可能だが、
+            # Recommendation側にも直接残すことで参照を1段減らす)。
+            "scoring_model_version": str(config.holding_decision.scoring_model_version),
+            "holding_decision_result_id": result.holding_decision_result_id,
+            "base_score": result.base_score,
+            "final_score": result.final_score,
+            "category": result.category.value,
+            "hard_gate_triggered": result.hard_gate.triggered,
+            "hard_gate_adjustment_applied": result.hard_gate.adjustment_applied,
+            "hd_renotify_state": hd_renotify_state,
+            "company_quality_score": result.company_quality.score,
+            "investment_thesis_score": result.investment_thesis.score,
+            "risk_deduction_score": result.risk_deduction.score,
+            "historical_valuation": historical_valuation_config_values(config.historical_valuation),
+            "timing_score": timing_score_config_values(config.timing_score),
+            "earnings_surprise": earnings_surprise_config_values(config.earnings_surprise),
+            "earnings_trend": earnings_trend_config_values(config.earnings_trend),
+            "entry_price_range": entry_price_range_config_values(config.entry_exit_price.entry),
+            "exit_price_range": exit_price_range_config_values(config.entry_exit_price.exit),
+            "market_environment": market_environment_config_values(
+                config.market_sector_environment.market
+            ),
+            "sector_environment": sector_environment_config_values(
+                config.market_sector_environment.sector
+            ),
+            "environment": environment_config_values(config.market_sector_environment.environment),
+        },
+        data_sources=list(snapshot.data_sources),
+        recommended_action_summary=action_summary,
+        next_review_conditions=next_review_conditions,
+        holding_risks=reasons,
+        # 判定精度向上機能Phase B: DecisionSnapshot記録専用(Shadow計測)。
+        historical_valuation_score=snapshot.historical_valuation.score,
+        historical_valuation_confidence=snapshot.historical_valuation.confidence,
+        historical_valuation_coverage=snapshot.historical_valuation.coverage,
+        historical_valuation_reason_codes=snapshot.historical_valuation.reason_codes,
+        historical_valuation_metrics=historical_valuation_metrics,
+        # 判定精度向上機能Phase B第二弾: DecisionSnapshot記録専用(Shadow計測)。
+        timing_score=snapshot.timing.score,
+        timing_confidence=snapshot.timing.confidence,
+        timing_coverage=snapshot.timing.coverage,
+        timing_reason_codes=snapshot.timing.reason_codes,
+        timing_metrics=timing_metrics,
+        # 判定精度向上機能Phase C: DecisionSnapshot記録専用(Shadow計測)。
+        earnings_surprise_score=snapshot.earnings_surprise.score,
+        earnings_surprise_confidence=snapshot.earnings_surprise.confidence,
+        earnings_surprise_coverage=snapshot.earnings_surprise.coverage,
+        earnings_surprise_reason_codes=snapshot.earnings_surprise.reason_codes,
+        earnings_surprise_metrics=earnings_surprise_metrics,
+        earnings_trend_score=snapshot.earnings_trend.score,
+        earnings_trend_confidence=snapshot.earnings_trend.confidence,
+        earnings_trend_coverage=snapshot.earnings_trend.coverage,
+        earnings_trend_reason_codes=snapshot.earnings_trend.reason_codes,
+        earnings_trend_metrics=earnings_trend_metrics,
+        # 判定精度向上機能次フェーズSTEP2: DecisionSnapshot記録専用
+        # (Shadow計測)。Entryはsnapshot算出済みの値をそのままコピー、
+        # Exitは呼び出し元が算出済みのexit_price_rangeをコピーする
+        # (本関数自身は算出しない)。
+        entry_price_range_state=snapshot.entry_price_range.state,
+        entry_price_range_confidence=snapshot.entry_price_range.confidence,
+        entry_price_range_coverage=snapshot.entry_price_range.coverage,
+        entry_price_range_reason_codes=snapshot.entry_price_range.reason_codes,
+        entry_price_range_metrics=entry_price_range_metrics,
+        entry_price_range_starter_price=snapshot.entry_price_range.starter_entry_price,
+        entry_price_range_preferred_price=snapshot.entry_price_range.preferred_entry_price,
+        entry_price_range_strong_price=snapshot.entry_price_range.strong_entry_price,
+        entry_price_range_max_price=snapshot.entry_price_range.max_entry_price,
+        entry_price_range_stop_review_price=snapshot.entry_price_range.stop_review_price,
+        exit_price_range_state=exit_price_range.state,
+        exit_price_range_confidence=exit_price_range.confidence,
+        exit_price_range_coverage=exit_price_range.coverage,
+        exit_price_range_reason_codes=exit_price_range.reason_codes,
+        exit_price_range_metrics=exit_price_range_metrics,
+        exit_price_range_partial_low_price=exit_price_range.partial_profit_take_low_price,
+        exit_price_range_partial_high_price=exit_price_range.partial_profit_take_high_price,
+        exit_price_range_strong_price=exit_price_range.strong_profit_take_price,
+        exit_price_range_downside_review_price=exit_price_range.downside_review_price,
+        exit_price_range_exit_review_price=exit_price_range.exit_review_price,
+        # 判定精度向上機能Phase D: DecisionSnapshot記録専用(Shadow計測)。
+        # Entry/Exit同様、snapshotで算出済みの値をコピーするだけ(本Builder
+        # 自身は算出しない)。
+        market_score=snapshot.market_environment.score,
+        market_confidence=snapshot.market_environment.confidence,
+        market_coverage=snapshot.market_environment.coverage,
+        market_reason_codes=snapshot.market_environment.reason_codes,
+        market_metrics=market_metrics,
+        sector_score=snapshot.sector_environment.score,
+        sector_confidence=snapshot.sector_environment.confidence,
+        sector_coverage=snapshot.sector_environment.coverage,
+        sector_reason_codes=snapshot.sector_environment.reason_codes,
+        sector_metrics=sector_metrics,
+        environment_score=snapshot.environment.score,
+        environment_confidence=snapshot.environment.confidence,
+        environment_coverage=snapshot.environment.coverage,
+        environment_reason_codes=snapshot.environment.reason_codes,
+        environment_metrics=environment_metrics,
+    )

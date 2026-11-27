@@ -1,0 +1,76 @@
+# 適正価格・推奨買値の算出設定（要求仕様 10節）
+
+version: 1
+
+fair_value_methods:
+  # 利用可能な方式のみ使用する。算出できない方式は自動的にスキップされる。
+  enabled_methods:
+    - "target_yield"    # 目標利回り方式
+    - "per"              # PER方式
+    - "pbr"               # PBR方式
+    - "historical_range"   # 過去株価レンジ方式
+    - "dcf"                # 簡易DCF方式(固定割引率)
+  # 最終適正価格の集約方法: "median"(中央値, 初期値) または "mean"(平均) または "weighted"
+  aggregation_method: "median"
+  # aggregation_method が "weighted" の場合の重み(合計1.0)
+  method_weights:
+    target_yield: 0.2
+    per: 0.2
+    pbr: 0.2
+    historical_range: 0.2
+    dcf: 0.2
+
+target_yield_method:
+  # 配当基準価格 = 予想年間配当金 ÷ 目標配当利回り
+  # スクリーニングの下限(3.5%)より高めに設定し、値上がり余地を確保する
+  target_dividend_yield_pct: 4.0
+  # 総合利回り基準価格の算出にも同じ目標値を使用する
+  target_total_yield_pct: 4.0
+
+per_method:
+  # 過去PER中央値の算出に用いる期間(年)。5年データが無い場合は3年にフォールバック
+  lookback_years_primary: 5
+  lookback_years_fallback: 3
+
+pbr_method:
+  lookback_years_primary: 5
+  lookback_years_fallback: 3
+
+historical_range_method:
+  # 52週安値・過去3年安値・支持線候補のうち利用可能なものを使用
+  lookback_years: 3
+  use_52_week_low: true
+  use_support_levels: true
+
+# 旧: recommended_buy_price(固定95%/90%/85%方式)は2026-07 BUYパイプライン再設計で
+# 廃止した。買付価格3段階は config/buy_decision_rules.yaml の margin_of_safety
+# (信頼度・リスクに応じた動的な安全余裕率)から算出する。
+
+dcf_method:
+  # 完全なCAPM(リスクフリーレート・株式リスクプレミアム・ベータ)を算出する
+  # データソースが無いため、固定割引率による簡易DCFとする(要求仕様8節)。
+  # 割引率が固定である旨を明示するため、この手法のconfidenceは常にMEDIUM上限。
+  discount_rate_pct: 8.0
+  terminal_growth_rate_pct: 1.0
+  projection_years: 5
+
+fair_value_usability:
+  # 手法間の最大値/最小値がこの倍率以上離れている場合、適正価格を売買判定に使用しない
+  max_method_spread_ratio: 2.0
+  # 有効な手法数がこれ未満の場合、適正価格を売買判定に使用しない
+  min_methods_required: 2
+
+# --- Issue #179(2026-09): 外れ値除外の境界帯 ---
+# 52週安値フィルタ(除外閾値 = 直近52週安値 x 0.50)は、閾値をわずかに下回った
+# だけの算出値を、極端な誤りと同じように完全に切り捨てていた。閾値の直前と直後で
+# 採否が反転するため、算出値をわずかに動かすだけで適正価格が跳ぶ。
+# そこで閾値のすぐ下に「境界帯」を設け、その帯の中では捨てずに他方式の中央値へ
+# 寄せて使う。帯の外(より低い側)は従来どおり完全に除外する。
+#
+# 除外閾値そのもの(0.50)はコード定数のままであり、config への移行は Issue #180 の
+# scope である。ここでは #179 が新設した境界帯の下限だけを config 化する。
+outlier_transition:
+  # u = 算出値 ÷ 除外閾値。u がこの値以上 1.0 未満なら線形補間(TRANSITION)、
+  # この値未満なら完全除外(HARD_REJECT)。1.0 以上はそもそも除外されない。
+  # 0.90 は「除外閾値の 10% 以内」= 直近52週安値の 45%〜50% の帯を意味する。
+  below_52_week_low_min_ratio: 0.90

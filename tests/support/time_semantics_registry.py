@@ -1,0 +1,452 @@
+"""時刻依存テストの registry(Issue #145)。
+
+## なぜ test ではなくここに置くか
+
+registry は `test_time_semantics_guard.py` の中にあったが、Issue #277 で
+`conftest.py` からも参照する必要が生じた。conftest から**テストモジュールを
+import する**のは収集経路として不健全である(収集時にテスト本体が実行される)。
+そのため、データと語彙だけをここへ**純粋に移動**した。
+
+## この移動で変えていないこと
+
+**識別子を 1 文字も変えていない。** 先頭のアンダースコアも残している。
+byte 一致の移動であることを diff で確認できるようにするためである
+(公開名へ改名するなら、それは別の変更として行う)。
+ロジックも 1 行も変えていない。検証(V1-V8 / O1-O9)は guard 側に残る。
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+_FORBIDDEN = "FORBIDDEN"
+_ALLOWED_EXISTING = "ALLOWED_EXISTING"
+_VALID_POLICIES = frozenset({_FORBIDDEN, _ALLOWED_EXISTING})
+
+_VALID_TRIGGERS = frozenset({"T1", "T2", "T3", "T4"})
+
+_SOLO_PREFIX = "SOLO:"
+
+
+def cohort_marker_name(cohort: str) -> str:
+    """cohort 名から pytest の marker 名を作る（Issue #277）。
+
+    pytest の -m は marker 名でしか選べないため、1 cohort = 1 marker 名とする
+    （引数つき marker は -m の式に入らない）。SOLO 接頭辞のコロンは marker 名に
+    使えない文字なので置き換える。
+
+    導出規則を registry と同じモジュールに置いているのは、cohort の正本が
+    ここだからである。付与する conftest 側にも、検証する guard 側にも置かない
+    （どちらへ置いても、正本から離れた場所に規則の写しができる）。
+
+    ★ 本モジュールで唯一の公開名である。他は Issue #145 当時の名前を
+      そのまま保っている（先頭アンダースコア）。
+    """
+    if cohort.startswith(_SOLO_PREFIX):
+        return "cohort_solo_" + cohort[len(_SOLO_PREFIX) :]
+    return "cohort_" + cohort
+
+
+@dataclass(frozen=True)
+class _Entry:
+    """registry の 1 エントリ。
+
+    module            repository root からの相対 path
+    triggers          T1-T4(docs/development_workflow.md 3.5節の決定表)
+    cohort            同一プロセスで組み合わせ実行する単位。
+                      共有状態による相互干渉を検出するための括り。
+                      相手が存在しない場合のみ `SOLO:<name>` を使う
+    wall_clock_policy FORBIDDEN / ALLOWED_EXISTING
+    rationale         ALLOWED_EXISTING では必須
+    related_issue     ALLOWED_EXISTING では必須(解消の owner)
+    """
+
+    module: str
+    triggers: tuple[str, ...]
+    cohort: str
+    wall_clock_policy: str
+    rationale: str = ""
+    related_issue: str = ""
+
+
+# --- cohort の定義根拠 ----------------------------------------------------------
+#
+# holding_decision_runtime_config cohort:
+#   `holding_decision_runtime_config_service` のモジュールレベル
+#   `_cached_config` / `_cached_at` を共有する。テスト間でリセットされないため、
+#   先行モジュールが設定した mode が後続モジュールへ漏れる(Issue #148)。
+#   所属は名前の類似ではなく、**当該 service を実際に構築・操作するか**で判定した。
+#
+# market_session cohort:
+#   市場セッションの日付 semantics と mock provider の系列を共有する。
+#   可変のグローバル状態は持たないが、片方を変更したらもう片方も同時に
+#   確認すべき「co-update の単位」である(Issue #52 / #143)。
+
+_REGISTRY: tuple[_Entry, ...] = (
+    _Entry(
+        module="tests/unit/test_holdings_watchlist_handler.py",
+        triggers=("T4",),
+        cohort="holding_decision_runtime_config",
+        wall_clock_policy=_ALLOWED_EXISTING,
+        rationale=(
+            "既存の wall-clock 由来 fixture(_fresh_price_as_of_date の既定値)。"
+            "Issue #145 では修正せず、owner Issue で固定 clock 化するまで"
+            "明示的な例外として追跡する。"
+        ),
+        related_issue="#148",
+    ),
+    _Entry(
+        module="tests/unit/test_holdings_watchlist_handler_integration.py",
+        triggers=("T4",),
+        cohort="holding_decision_runtime_config",
+        wall_clock_policy=_FORBIDDEN,
+    ),
+    _Entry(
+        module="tests/unit/test_holding_decision_regression.py",
+        triggers=("T4",),
+        cohort="holding_decision_runtime_config",
+        wall_clock_policy=_FORBIDDEN,
+    ),
+    _Entry(
+        module="tests/unit/test_holding_decision_runtime_config.py",
+        triggers=("T4",),
+        cohort="holding_decision_runtime_config",
+        wall_clock_policy=_FORBIDDEN,
+    ),
+    _Entry(
+        module="tests/unit/test_holding_decision_service_audit_fields.py",
+        triggers=("T4",),
+        cohort="holding_decision_runtime_config",
+        wall_clock_policy=_FORBIDDEN,
+    ),
+    _Entry(
+        module="tests/unit/test_issue_52_session_aware_future_date.py",
+        triggers=("T1", "T2"),
+        cohort="market_session",
+        wall_clock_policy=_FORBIDDEN,
+    ),
+    _Entry(
+        module="tests/unit/test_issue_143_test_clock_determinism.py",
+        triggers=("T1", "T4"),
+        cohort="market_session",
+        wall_clock_policy=_FORBIDDEN,
+    ),
+    # Issue #440: 東証休場日gate(_market_holiday)。T3 = 営業日判定(BusinessCalendar)の
+    # 新規consumer、T4 = 全テストの既定clock意味論を変える(tests/unit/conftest.pyの
+    # autouse fixtureが`_market_holiday.is_market_closed`を既定「営業日」へ中和し、
+    # `real_market_calendar` markerを持つテストだけ実カレンダーへ戻す)。
+    # cohort = gateを持つ3 handlerのうち、holdings以外の2系統 + gate自身のテスト。
+    # holdings系(test_holdings_watchlist_handler*.py)は既存のholding_decision_runtime_config
+    # cohortに在籍するため、そちらが担う(1 moduleは1 cohortにしか属せない)。
+    # 2 handlerテスト自体はwall clockを直接呼ばない(handler()内部が読む)ため FORBIDDEN。
+    # 共有するのは可変のmodule-level stateではなく「conftestの既定中和とその解除」であり、
+    # 順序依存はない(monkeypatchはtest単位で元へ戻る。逆順実行で確認済み)。
+    _Entry(
+        module="tests/unit/test_market_holiday_gate.py",
+        triggers=("T3", "T4"),
+        cohort="market_holiday_gate",
+        wall_clock_policy=_FORBIDDEN,
+    ),
+    _Entry(
+        module="tests/unit/test_buy_candidates_handler.py",
+        triggers=("T4",),
+        cohort="market_holiday_gate",
+        wall_clock_policy=_FORBIDDEN,
+    ),
+    _Entry(
+        module="tests/unit/test_watchlist_dispatcher_handler.py",
+        triggers=("T4",),
+        cohort="market_holiday_gate",
+        wall_clock_policy=_FORBIDDEN,
+    ),
+    # Issue #389(#66 F-L3): 営業日ホライズン評価のday-zero(v1=UTC暦日/
+    # v2=JST暦日)切替。T3 = recommended_at(時刻由来値)を受け取って
+    # v1/v2を業務分岐するconsumer(resolve_business_day_zero())。
+    # T4 = 境界値(V2_CUTOVER_AT前後)を固定clockで検証する新規fixtureを
+    # 導入した。V2_CUTOVER_AT・resolve_business_day_zero()自体は
+    # market_session.py/business_calendar.py/jst.py/price_freshness.py
+    # 本体には無く(それらを呼び出すだけ)、T1には該当しない。
+    # 可変のmodule-level stateを持たないため、cohortの相手はいない(SOLO)。
+    _Entry(
+        module="tests/unit/test_recommendation_evaluation_service.py",
+        triggers=("T3", "T4"),
+        cohort="SOLO:recommendation_evaluation_v2_cutover",
+        wall_clock_policy=_FORBIDDEN,
+    ),
+    _Entry(
+        module="tests/unit/test_calibration_dataset_service.py",
+        triggers=("T3", "T4"),
+        cohort="SOLO:calibration_dataset_v2_cutover",
+        wall_clock_policy=_FORBIDDEN,
+    ),
+    # Issue #475(#472の修正): build_stock_snapshotの価格窓・52週安値の基準日を
+    # UTC暦日からJST暦日へ統一。T3 = evaluation_date(時刻由来値)を受け取って
+    # 価格履歴window・compute_historical_range_price()・compute_52_week_low()の
+    # 呼び出し先を分岐させるconsumer(stock_snapshot_service.py自体はT1の対象
+    # 〔domain/jst.py等〕ではない)。T4 = JST/UTC暦日境界を跨ぐ固定clock
+    # (08:00 JST/10:00 JST)を新規に導入した。可変のmodule-level stateを
+    # 持たないため、cohortの相手はいない(SOLO)。
+    _Entry(
+        module="tests/unit/test_issue_475_stock_snapshot_jst_date_window.py",
+        triggers=("T3", "T4"),
+        cohort="SOLO:stock_snapshot_jst_price_window",
+        wall_clock_policy=_FORBIDDEN,
+    ),
+    # Issue #690: build_stock_snapshot()を非営業日(土日・祝日・5連休・GW・年末年始)の
+    # nowで通したend-to-endの検証。T3 = evaluation_date(時刻由来値)を受け取って
+    # business_days_to_earnings・earnings_date_statusを分岐させるconsumer(
+    # stock_snapshot_service.py自体はdiffなし。テストの対象)。T4 = 非営業日・UTC/JST
+    # 暦日境界の固定clockとliteralの期待日を新規に導入した。可変のmodule-level stateを
+    # 持たないため、cohortの相手はいない(SOLO。先例 #475)。
+    _Entry(
+        module="tests/unit/test_issue_690_stock_snapshot_non_business_now.py",
+        triggers=("T3", "T4"),
+        cohort="SOLO:stock_snapshot_non_business_now",
+        wall_clock_policy=_FORBIDDEN,
+    ),
+    # Issue #578(#66 16C): JpxCandidateUniverseProvider自身(provider層)の
+    # staleness判定基準日を、UTC 00:00からJST 00:00へ統一。T2 = provider自身の
+    # 値決定ロジック(source_dateの起点をprovider内部で決める。consumerが渡す
+    # 値を選ぶ変更ではないためT3ではない)。T4 = JST/UTC基準の食い違いが実際に
+    # 判定を変える9時間windowを跨ぐ固定clockを新規に導入した。可変の
+    # module-level stateを持たないため、cohortの相手はいない(SOLO)。
+    _Entry(
+        module="tests/unit/test_issue_578_jpx_staleness_jst.py",
+        triggers=("T2", "T4"),
+        cohort="SOLO:jpx_staleness_jst_basis",
+        wall_clock_policy=_FORBIDDEN,
+    ),
+    # サブちゃんレビュー対応Phase1 F5: Issue #223由来の既存module。#578で
+    # test_new_hard_stop_is_2026_10_30_jst -> test_new_hard_stop_is_2026_10_29_jst
+    # (期待する境界日そのもの)を書き換えたにもかかわらずregistry未登録だった。
+    # T2 = `_check_staleness()`(provider自身の値決定ロジック)を直接呼ぶ
+    # consumer。T4 = 固定clock(`_jst_0600_run()`)と期待日を#578で変更した。
+    # 可変のmodule-level stateを持たないため、cohortの相手はいない(SOLO)。
+    _Entry(
+        module="tests/unit/test_issue_223_universe_staleness_observability.py",
+        triggers=("T2", "T4"),
+        cohort="SOLO:jpx_universe_staleness_observability",
+        wall_clock_policy=_FORBIDDEN,
+    ),
+    # Issue #612(#66 16C): watchlist_dispatcher_handler.py::_cache_age_days()の
+    # staleness監査基準日を、UTC 00:00からJST 00:00へ統一(#578と同じ変換を
+    # 適用)。T2 = _cache_age_days()自身(_universe_observation()経由で呼ばれる
+    # provider寄りの値決定ロジック)を直接呼ぶconsumer。T4 = 固定clock
+    # (`_jst_0600_run()`)と期待値(cache_age_days)を#612で書き換えた。
+    # 可変のmodule-level stateを持たないため、cohortの相手はいない(SOLO)。
+    _Entry(
+        module="tests/unit/test_issue_69_u1_jpx_vintage_gap.py",
+        triggers=("T2", "T4"),
+        cohort="SOLO:jpx_vintage_gap_cache_age_jst_basis",
+        wall_clock_policy=_FORBIDDEN,
+    ),
+    # Issue #373: 手動CLI(watchlist-screening run)の要約に出す『候補一覧データの
+    # 経過日数』(公開日のJST 0時からの暦日・切り捨て)。T4 = JST/UTC暦日境界の9時間
+    # window(14:59/15:00/15:30 UTC)を跨ぐ固定clockとliteralの期待日数を新規に導入
+    # した(T1〜T3は該当なし: 表示用の算術のみで業務分岐しない)。可変の
+    # module-level stateを持たないため、cohortの相手はいない(SOLO。先例 #578/#690)。
+    _Entry(
+        module="tests/unit/test_issue_373_watchlist_screening_cli_universe_age.py",
+        triggers=("T4",),
+        cohort="SOLO:watchlist_screening_cli_universe_age",
+        wall_clock_policy=_FORBIDDEN,
+    ),
+    # Issue #890 PR-3: 保有判断の通知の再送判断(_notification_status_for_send)の
+    # 保有判断の分岐。T3 = 既存のJST暦日差(>= resend_after_days)を periodic_due として
+    # 判断に渡すconsumer(経過日数の計算そのものは変えていない)。T4 = 固定clock(_NOW =
+    # 2026-09-09 08:00 UTC)と、そこからの経過日数N-1/N/N+1の期待値を新規に導入した
+    # (PR #899 の独立reviewでT4該当と指摘された。先例 #873 / #373)。可変のmodule-level
+    # stateを持たないため、cohortの相手はいない(SOLO)。characterizationのmoduleは
+    # 固定clockの定義元、wiringのmoduleはそれをimportして日数を振る。
+    _Entry(
+        module="tests/unit/test_hd_renotification_wiring_characterization.py",
+        triggers=("T3", "T4"),
+        cohort="SOLO:hd_renotification_wiring_characterization",
+        wall_clock_policy=_FORBIDDEN,
+    ),
+    _Entry(
+        module="tests/unit/test_hd_renotification_wiring.py",
+        triggers=("T3", "T4"),
+        cohort="SOLO:hd_renotification_wiring",
+        wall_clock_policy=_FORBIDDEN,
+    ),
+    # Issue #603(Q'。購入側 Shadow の『枠』): Lambda の残り時間のガード(120 秒。119.9 / 120.0 /
+    # 120.1 秒の境界)と、協調的な期限(30 秒。29.9 / 30.0 秒の境界)。T4 = 注入した clock
+    # (_Clock)と remaining_time_ms、literal の期待値を新規に導入した(T1〜T3 は該当なし:
+    # 暦日・営業日・時刻の業務分岐を持たない)。wall clock・freezegun は使わない。可変の
+    # module-level state を持たないため、cohort の相手はいない(SOLO。先例 #373 / #890)。
+    _Entry(
+        module="tests/unit/test_allocation_shadow_service.py",
+        triggers=("T4",),
+        cohort="SOLO:allocation_shadow_service",
+        wall_clock_policy=_FORBIDDEN,
+    ),
+    # 同上。handler 側の配線(残り時間の受け渡しと、残り 119.9 秒でスキップが記録されること)。
+    _Entry(
+        module="tests/unit/test_allocation_shadow_wiring.py",
+        triggers=("T4",),
+        cohort="SOLO:allocation_shadow_wiring",
+        wall_clock_policy=_FORBIDDEN,
+    ),
+    # Issue #926(incident の GitHub Issue 起票の抑止): 前回作成からの最小間隔の境界(ちょうど /
+    # 1 分前)と、上限の窓 = JST の日付の切替(UTC と JST で日付が違う時刻・翌日で予算が戻る)。
+    # T3 = 時刻由来の値(now)で業務分岐する consumer(本 PR の guard・tracker・service)。
+    # T4 = 固定の日時(_NOW / 境界の時刻)と literal の期待値を新規に導入した(PR #928 の独立 review で
+    # T4 該当と指摘された)。wall clock・freezegun は使わない(now は呼び出し元から注入)。可変の
+    # module-level state を持たないため、cohort の相手はいない(SOLO。先例 #603 / #890 / #373)。
+    _Entry(
+        module="tests/unit/test_issue_926_incident_issue_guard.py",
+        triggers=("T3", "T4"),
+        cohort="SOLO:incident_issue_guard",
+        wall_clock_policy=_FORBIDDEN,
+    ),
+    _Entry(
+        module="tests/unit/test_issue_926_incident_state_tracker_guard.py",
+        triggers=("T3", "T4"),
+        cohort="SOLO:incident_state_tracker_guard",
+        wall_clock_policy=_FORBIDDEN,
+    ),
+    _Entry(
+        module="tests/unit/test_issue_926_incident_github_issue_guard_service.py",
+        triggers=("T3", "T4"),
+        cohort="SOLO:incident_github_issue_guard_service",
+        wall_clock_policy=_FORBIDDEN,
+    ),
+    _Entry(
+        module="tests/unit/test_issue_926_incident_notifier_handler_guard.py",
+        triggers=("T3", "T4"),
+        cohort="SOLO:incident_notifier_handler_guard",
+        wall_clock_policy=_FORBIDDEN,
+    ),
+    # Issue #603 PR-F1(購入側 Shadow の入力の組み立て): 最終棚卸しからの日数 = JST の暦日の差。
+    # JST 23:59 / 00:00 と、UTC では同じ日付になる時刻の境界。T3 = 時刻由来の値(now)で結果が変わる
+    # 純粋関数。T4 = 固定の日時と literal の期待値を新規に導入。wall clock・freezegun は使わない
+    # (now は引数)。可変の module-level state を持たないため cohort の相手はいない(SOLO)。
+    _Entry(
+        module="tests/unit/test_allocation_inputs_contract.py",
+        triggers=("T3", "T4"),
+        cohort="SOLO:allocation_inputs",
+        wall_clock_policy=_FORBIDDEN,
+    ),
+)
+
+# V8: registry から静かに削除して guard を無効化する経路を塞ぐ。
+# 固定するのは**モジュールの在籍**であり、テスト総数などの時点依存の件数ではない。
+#
+# ★ 登録は 2 か所(Issue #874)★ `_REGISTRY` に entry を足したら、同じ module をここにも足す。
+# V8 は『known のうち registry から欠けたもの』(静かな削除)と、
+# 『registry にあって known に無いもの』(足し忘れ。後から静かに消えても気づけない)の両方向を落とす。
+_KNOWN_TIME_SENSITIVE_MODULES = frozenset(
+    {
+        "tests/unit/test_holdings_watchlist_handler.py",
+        "tests/unit/test_holdings_watchlist_handler_integration.py",
+        "tests/unit/test_holding_decision_regression.py",
+        "tests/unit/test_holding_decision_runtime_config.py",
+        "tests/unit/test_holding_decision_service_audit_fields.py",
+        "tests/unit/test_issue_52_session_aware_future_date.py",
+        "tests/unit/test_issue_143_test_clock_determinism.py",
+        "tests/unit/test_recommendation_evaluation_service.py",
+        "tests/unit/test_calibration_dataset_service.py",
+        "tests/unit/test_market_holiday_gate.py",
+        "tests/unit/test_buy_candidates_handler.py",
+        "tests/unit/test_watchlist_dispatcher_handler.py",
+        "tests/unit/test_issue_475_stock_snapshot_jst_date_window.py",
+        "tests/unit/test_issue_578_jpx_staleness_jst.py",
+        "tests/unit/test_issue_223_universe_staleness_observability.py",
+        "tests/unit/test_issue_69_u1_jpx_vintage_gap.py",
+        "tests/unit/test_allocation_inputs_contract.py",
+        "tests/unit/test_allocation_shadow_service.py",
+        "tests/unit/test_allocation_shadow_wiring.py",
+        "tests/unit/test_hd_renotification_wiring.py",
+        "tests/unit/test_hd_renotification_wiring_characterization.py",
+        "tests/unit/test_issue_373_watchlist_screening_cli_universe_age.py",
+        "tests/unit/test_issue_690_stock_snapshot_non_business_now.py",
+        "tests/unit/test_issue_926_incident_github_issue_guard_service.py",
+        "tests/unit/test_issue_926_incident_issue_guard.py",
+        "tests/unit/test_issue_926_incident_notifier_handler_guard.py",
+        "tests/unit/test_issue_926_incident_state_tracker_guard.py",
+    }
+)
+
+
+def _cohort_members(cohort: str) -> tuple[_Entry, ...]:
+    return tuple(e for e in _REGISTRY if e.cohort == cohort)
+
+
+# --- order-sensitive cohort ------------------------------------------------------
+#
+# cohort のメンバを揃えるだけでは、共有 module-global state による汚染を
+# 検出できない場合がある。汚染には**方向**があるためである。
+#
+# 実測(Issue #148):
+#   integration -> handler   handler 側 11 件が失敗する
+#   handler -> integration   失敗しない
+#
+# pytest の収集順(アルファベット)は handler -> integration であり、
+# full CI ではこの汚染方向を通らない。したがって「cohort を同一プロセスで
+# 実行する」だけでは不十分で、**既知・高リスクな順序を明示的に宣言**する必要がある。
+#
+# 全順列(cohort が 5 件なら 120 通り)は要求しない。組合せ爆発になるうえ、
+# 大半は検証価値が無い。宣言された順序のみを対象とする。
+
+
+@dataclass(frozen=True)
+class _OrderCase:
+    """cohort 内で明示的に検証する実行順序。
+
+    name                 識別子
+    cohort               所属 cohort(cohort 外のモジュールは参照できない)
+    modules              実行順。各要素は次のいずれか(Issue #744)
+                           - `<module の path>` … そのモジュールのテスト全体
+                           - `<module の path>::<テスト関数名>` … そのモジュールの 1 テスト
+                             (pytest の node id と同じ形。parametrize の `[...]` は付けない)
+                         path 部は registry 登録済みのモジュールのみ。node id の『テスト関数名』が
+                         そのファイルに実在することは guard(O8)が固定する。
+                         テスト単位を許すのは、汚染は『特定の 1 テストが残した状態』で起きるため、
+                         モジュール単位の順序では、汚染を残さないテストが最後に走って汚染が隠れるから
+                         である(#744: 宣言の順序は、保護を外しても落ちない空振りだった)。
+    known_failure_issue  この順序で既知の失敗が出る場合、その owner Issue。
+                         「red だが既知」で済ませず、失敗集合の一致を確認するための印。
+                         失敗が出ない順序(回帰の検出が目的の case)では空にする。
+    """
+
+    name: str
+    cohort: str
+    modules: tuple[str, ...]
+    known_failure_issue: str = ""
+
+
+# 順序依存が既知、または合理的に疑われる cohort。
+# ここに挙げた cohort は ORDER_CASES を最低 1 件持たなければならない(O6)。
+_ORDER_SENSITIVE_COHORTS = frozenset({"holding_decision_runtime_config"})
+
+_ORDER_CASES: tuple[_OrderCase, ...] = (
+    _OrderCase(
+        name="ORDER_CASE_CANONICAL",
+        cohort="holding_decision_runtime_config",
+        modules=(
+            "tests/unit/test_holdings_watchlist_handler.py",
+            "tests/unit/test_holdings_watchlist_handler_integration.py",
+        ),
+    ),
+    # Issue #744: #148 の汚染(RuntimeConfig の module-global cache が test 間で漏れる)の
+    # 回帰を検出する case。汚染を残す 1 テスト(ACTIVE mode を書き込んで終わる)を先に、
+    # 汚染を受ける側の module を後に実行する。
+    #
+    # 以前の宣言は『integration の module 全体 → handler の module 全体』で、#148 の是正
+    # (#519 の autouse fixture)を外しても通る空振りだった(integration の最後のテストが
+    # 汚染を残さない形になったため。#744 の調査)。2026-10-08 の origin/main での実測:
+    #   この順序 + fixture あり  → 59 passed
+    #   この順序 + fixture 無効化 → 14 failed, 45 passed
+    # known_failure_issue は持たない(保護がある今は『通る』のが期待で、保護を外すと
+    # 失敗する、という回帰の検出が目的)。実行は自動化しない(development_workflow.md 3.5.4)。
+    _OrderCase(
+        name="ORDER_CASE_148_CONTAMINATION",
+        cohort="holding_decision_runtime_config",
+        modules=(
+            "tests/unit/test_holdings_watchlist_handler_integration.py"
+            "::test_active_mode_general_corporate_new_engine_notifies",
+            "tests/unit/test_holdings_watchlist_handler.py",
+        ),
+    ),
+)

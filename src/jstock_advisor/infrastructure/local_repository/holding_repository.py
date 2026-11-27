@@ -1,0 +1,140 @@
+"""保有銘柄(PurchaseLot / Holding)のローカルリポジトリ。
+
+PurchaseLotが正データであり、Holdingは平均購入単価等を計算済みでキャッシュした
+非正規化データである。ロットが変更されたら portfolio_service 側で
+domain.entities.holding.summarize_lots を使って Holding を再計算し upsert する。
+
+M3(保有銘柄オーナー機能アプリ切替): HoldingRepositoryの主キーはstock_codeから
+holding_id(= owner + "#" + stock_code)へ変更した。物理ファイル/テーブルも
+M2で移行済みのholdings_v2.jsonを参照する。PurchaseLotRepositoryのPK自体は
+lot_idのまま変更していない(M2でowner/holding_idを既存purchase_lots.jsonへ
+in-place追加済みのため、ファイル自体も変更しない)が、主な検索単位を
+stock_codeからholding_id(list_by_holding)へ変更する。
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+from jstock_advisor.domain.entities.holding import Holding, PurchaseLot
+from jstock_advisor.infrastructure.collection_store import CollectionStore, build_collection_store
+
+
+class PurchaseLotRepository:
+    def __init__(self, store_dir: Path | None = None) -> None:
+        self._store: CollectionStore[PurchaseLot] = build_collection_store(
+            PurchaseLot, "purchase_lots.json", "lot_id", store_dir
+        )
+
+    def list_all(self) -> list[PurchaseLot]:
+        return self._store.list_all()
+
+    def list_by_holding(self, holding_id: str) -> list[PurchaseLot]:
+        lots = self._store.find(lambda lot: lot.holding_id == holding_id)
+        return sorted(lots, key=lambda lot: lot.purchase_date)
+
+    def list_by_stock(self, stock_code: str) -> list[PurchaseLot]:
+        """owner横断検索用(BUY候補側でのstock横断cooldown判定等)。SELL/FIFO/
+        平均取得単価計算にはlist_by_holding()を使うこと。"""
+        lots = self._store.find(lambda lot: lot.stock_code == stock_code)
+        return sorted(lots, key=lambda lot: lot.purchase_date)
+
+    def get(self, lot_id: str) -> PurchaseLot | None:
+        return self._store.get(lot_id)
+
+    def get_raw_data(self, lot_id: str) -> str | None:
+        return self._store.get_raw_data(lot_id)
+
+    def upsert(self, lot: PurchaseLot) -> None:
+        self._store.upsert(lot)
+
+    def insert_if_absent(self, lot: PurchaseLot) -> bool:
+        """Issue #530: 既存があれば触らずFalse、無ければ追加してTrue(CAS)。"""
+        return self._store.insert_if_absent(lot)
+
+    def replace_if_raw_matches(self, lot_id: str, expected_raw_data: str, lot: PurchaseLot) -> bool:
+        """Issue #530: 保存中の生JSONがexpected_raw_dataと完全一致する場合のみ
+        置き換える(楽観ロック)。"""
+        return self._store.replace_if_raw_matches(lot_id, expected_raw_data, lot)
+
+    def delete_if_raw_matches(self, lot_id: str, expected_raw_data: str) -> bool:
+        """Issue #530: 保存中の生JSONがexpected_raw_dataと完全一致する場合のみ
+        削除する(楽観ロック)。"""
+        return self._store.delete_if_raw_matches(lot_id, expected_raw_data)
+
+    def delete(self, lot_id: str) -> bool:
+        return self._store.delete(lot_id)
+
+    def apply_batch(self, delete_lot_ids: list[str], puts: list[PurchaseLot]) -> None:
+        """ロットの削除と追加/更新を1回の書き込みで適用する(Issue #61 Phase B2)。
+
+        保有の原子的な置換・削除で使う。1件ずつ削除して途中で失敗する状態を
+        構造的に無くすため、delete_by_holding()のループではなくこちらを使うこと。
+        """
+        self._store.apply_batch(delete_lot_ids, puts)
+
+    def delete_by_holding(self, holding_id: str) -> int:
+        lots = self.list_by_holding(holding_id)
+        for lot in lots:
+            self._store.delete(lot.lot_id)
+        return len(lots)
+
+
+class HoldingRepository:
+    def __init__(self, store_dir: Path | None = None) -> None:
+        self._store: CollectionStore[Holding] = build_collection_store(
+            Holding, "holdings_v2.json", "holding_id", store_dir
+        )
+
+    def list_all(self) -> list[Holding]:
+        return self._store.list_all()
+
+    def list_by_stock(self, stock_code: str) -> list[Holding]:
+        """owner横断検索用(M3.1: BUY候補側での同一銘柄の全owner Holding集約・
+        売却/利確競合チェック等)。"""
+        return self._store.find(lambda holding: holding.stock_code == stock_code)
+
+    def list_by_owner(self, owner: str) -> list[Holding]:
+        """LINE UI第二弾「保有銘柄」機能(2026-08)向け。指定ownerの保有銘柄一覧を
+        stock_code昇順で返す。"""
+        items = self._store.find(lambda holding: holding.owner == owner)
+        return sorted(items, key=lambda holding: holding.stock_code)
+
+    def list_distinct_owners(self) -> list[str]:
+        """LINE UI第二弾「保有銘柄」機能(2026-08)向け。現在保有銘柄に登録されて
+        いる所有者一覧を、重複除去のうえ安定順(文字列昇順)で返す。owner名は
+        一切ハードコードせず、既存Holdingから動的に導出する(将来の所有者
+        増減にコード変更なしで追従するため)。"""
+        return sorted({holding.owner for holding in self._store.list_all()})
+
+    def get(self, holding_id: str) -> Holding | None:
+        return self._store.get(holding_id)
+
+    def get_raw_data(self, holding_id: str) -> str | None:
+        return self._store.get_raw_data(holding_id)
+
+    def upsert(self, holding: Holding) -> None:
+        self._store.upsert(holding)
+
+    def insert_if_absent(self, holding: Holding) -> bool:
+        """Issue #530: 既存があれば触らずFalse、無ければ追加してTrue(CAS)。"""
+        return self._store.insert_if_absent(holding)
+
+    def replace_if_raw_matches(
+        self, holding_id: str, expected_raw_data: str, holding: Holding
+    ) -> bool:
+        """Issue #530: 保存中の生JSONがexpected_raw_dataと完全一致する場合のみ
+        置き換える(楽観ロック)。"""
+        return self._store.replace_if_raw_matches(holding_id, expected_raw_data, holding)
+
+    def delete_if_raw_matches(self, holding_id: str, expected_raw_data: str) -> bool:
+        """Issue #530: 保存中の生JSONがexpected_raw_dataと完全一致する場合のみ
+        削除する(楽観ロック)。"""
+        return self._store.delete_if_raw_matches(holding_id, expected_raw_data)
+
+    def apply_batch(self, delete_holding_ids: list[str], puts: list[Holding]) -> None:
+        """保有の削除と追加/更新を1回の書き込みで適用する(Issue #61 Phase B2)。"""
+        self._store.apply_batch(delete_holding_ids, puts)
+
+    def delete(self, holding_id: str) -> bool:
+        return self._store.delete(holding_id)

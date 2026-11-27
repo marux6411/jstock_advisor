@@ -1,0 +1,593 @@
+import datetime as dt
+from decimal import Decimal
+
+import pytest
+
+from jstock_advisor.config.loader import load_config
+from jstock_advisor.domain.entities.common import DataSourceReference
+from jstock_advisor.domain.entities.enums import (
+    CorporateActionType,
+    DividendComparisonOutcome,
+    DividendPeriodEndBasis,
+    DividendValidationStatus,
+    RecordDateUnknownReason,
+)
+from jstock_advisor.interfaces.types import AnnualDividendActual, CorporateActionEvent, DividendInfo
+from jstock_advisor.providers.dividend_data.cross_validating_impl import (
+    CrossValidatingDividendDataProvider,
+)
+from jstock_advisor.providers.dividend_data.yfinance_impl import YFinanceDividendDataProvider
+from jstock_advisor.services.corporate_action_service import CorporateActionService
+
+_NOW = dt.datetime(2026, 7, 24, tzinfo=dt.UTC)
+
+
+class _FakeTicker:
+    def __init__(self, symbol: str) -> None:
+        self.symbol = symbol
+        self.info = {"regularMarketPrice": 1000, "dividendRate": 50}
+        self.dividends: dict[object, float] = {}
+
+
+class _NoOpCorporateActionProvider:
+    """株式分割等が一切発生しないことを明示するためのフェイク
+    (コードレビュー修正2: corporate_action_serviceを必須依存にしたことに伴い、
+    分割調整が不要なテストでも暗黙のNoneではなく明示的な「分割無し」を表現する)。"""
+
+    def get_corporate_actions(self, stock_code: str, since: dt.date) -> list[CorporateActionEvent]:
+        return []
+
+
+def _no_op_corporate_action_service() -> CorporateActionService:
+    return CorporateActionService(_NoOpCorporateActionProvider(), now=_NOW)
+
+
+def test_corporate_action_service_is_a_required_dependency() -> None:
+    """【コードレビュー修正2】corporate_action_serviceを渡さずに
+    YFinanceDividendDataProviderを生成しようとするとTypeErrorになること。
+
+    分割調整を一切行っていない生値を「基準日へ正規化済み」とAPI上誤って
+    表現してしまう余地を、実行時のNoneチェックではなく型(必須引数)で
+    構造的に無くすための確認(推奨案A)。"""
+    with pytest.raises(TypeError):
+        YFinanceDividendDataProvider(now=_NOW)  # type: ignore[call-arg]
+
+
+def test_get_dividend_info_marks_record_date_as_permanently_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import jstock_advisor.providers.dividend_data.yfinance_impl as module
+
+    monkeypatch.setattr(module.yf, "Ticker", _FakeTicker)
+    provider = YFinanceDividendDataProvider(
+        now=_NOW, corporate_action_service=_no_op_corporate_action_service()
+    )
+
+    info = provider.get_dividend_info("7203")
+
+    assert info is not None
+    assert info.dividend_record_date is None
+    assert info.dividend_ex_date is None
+    assert info.dividend_record_date_unknown_reason == RecordDateUnknownReason.DATA_PROVIDER_MISSING
+
+
+def test_inferred_decrease_never_sets_official_dividend_cut_announced(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # yfinance単独の年間配当合計比較から推測される減少は、あくまでinferredであり、
+    # official_dividend_cut_announced(一次情報での公式発表)には絶対にしない(要求仕様§11・§12)。
+    import jstock_advisor.providers.dividend_data.yfinance_impl as module
+
+    class _TickerWithDividends(_FakeTicker):
+        def __init__(self, symbol: str) -> None:
+            super().__init__(symbol)
+            self.info = {"regularMarketPrice": 1000, "dividendRate": 50}
+            self.dividends = {
+                dt.datetime(2024, 6, 27): 50.0,
+                dt.datetime(2024, 12, 27): 50.0,
+                dt.datetime(2025, 6, 27): 30.0,
+                dt.datetime(2025, 12, 29): 30.0,
+            }
+
+    monkeypatch.setattr(module.yf, "Ticker", _TickerWithDividends)
+    provider = YFinanceDividendDataProvider(
+        now=_NOW, corporate_action_service=_no_op_corporate_action_service()
+    )
+
+    info = provider.get_dividend_info("4631")
+
+    assert info is not None
+    assert info.inferred_dividend_decrease is True
+    assert info.official_dividend_cut_announced is False
+    assert info.dividend_breakdown_confirmed is False
+
+
+class _FixedCorporateActionProvider:
+    def __init__(self, events: list[CorporateActionEvent]) -> None:
+        self._events = events
+
+    def get_corporate_actions(self, stock_code: str, since: dt.date) -> list[CorporateActionEvent]:
+        return [e for e in self._events if e.stock_code == stock_code]
+
+
+def test_real_dividend_cut_is_not_hidden_by_double_split_adjustment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #706(二重調整バグ)の回帰テスト。`ticker.dividends`は問い合わせ
+    時点までの分割を反映して既に遡及調整済みの値を返す(実測で確認済み)。
+    FY2025の配当実績(yfinanceが返す、既に分割後基準の値)は25円×2回=50円。
+    2026年4月1日に1:5分割が発生しているが、この50円はすでにその分割を反映した
+    基準で表示されているため、追加の分割調整をしてはならない。
+
+    予想配当(同じく分割後基準の現在値)が12円なら、50円→12円は76%の実質減配
+    であり、FORECAST_DIVIDEND_CUTと判定されなければならない。**修正前の
+    バグ(50円を分割後基準の生値だと誤認し、さらに5で割っていた)では
+    50/5=10円となり、forecast(12円) > buggy_actual(10円)でDIVIDEND_INCREASE
+    (増配)に誤判定されていた**(実際には76%の減配であるにもかかわらず)。
+    """
+    import jstock_advisor.providers.dividend_data.yfinance_impl as module
+
+    class _TickerWithSplitStraddlingDividends(_FakeTicker):
+        def __init__(self, symbol: str) -> None:
+            super().__init__(symbol)
+            self.info = {"regularMarketPrice": 1000, "dividendRate": 12}
+            self.dividends = {
+                dt.datetime(2025, 6, 27): 25.0,
+                dt.datetime(2025, 12, 29): 25.0,
+            }
+
+    monkeypatch.setattr(module.yf, "Ticker", _TickerWithSplitStraddlingDividends)
+
+    split_event = CorporateActionEvent(
+        stock_code="5401",
+        event_type=CorporateActionType.SPLIT,
+        announced_date=dt.date(2026, 4, 1),
+        effective_date=dt.date(2026, 4, 1),
+        ratio=Decimal("5"),
+        source=DataSourceReference(provider="test", fetched_at=_NOW),
+    )
+    corporate_action = CorporateActionService(
+        _FixedCorporateActionProvider([split_event]), now=_NOW
+    )
+    provider = YFinanceDividendDataProvider(now=_NOW, corporate_action_service=corporate_action)
+
+    info = provider.get_dividend_info("5401")
+
+    assert info is not None
+    assert info.actual_annual_dividend_per_share == Decimal("50")
+    # 修正前は二重調整により実質10円(50/5)となり、forecast(12円) > 10円で
+    # DIVIDEND_INCREASEに誤判定されていた(実際は50→12円の76%減配)。
+    assert info.dividend_comparison_outcome == DividendComparisonOutcome.FORECAST_DIVIDEND_CUT
+    assert info.inferred_dividend_decrease is True
+
+
+def test_fiscal_year_aggregation_separates_periods_correctly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """3月決算企業(fiscal_year_end_month=3)で、暦年ではなく決算期
+    (FY2025: 2024/04-2025/03、FY2026: 2025/04-2026/03)に正しく分離されること
+    (配当データクロスバリデーション根本修正の中心テスト)。"""
+    import jstock_advisor.providers.dividend_data.yfinance_impl as module
+
+    class _TickerWithFiscalYearStraddlingDividends(_FakeTicker):
+        def __init__(self, symbol: str) -> None:
+            super().__init__(symbol)
+            self.info = {"regularMarketPrice": 1000, "dividendRate": 20}
+            self.dividends = {
+                dt.datetime(2025, 3, 27): 30.0,  # FY2025(2024/04-2025/03)の期末配当
+                dt.datetime(2025, 9, 26): 15.0,  # FY2026(2025/04-2026/03)の中間配当
+                dt.datetime(2026, 3, 26): 18.0,  # FY2026の期末配当
+            }
+
+    monkeypatch.setattr(module.yf, "Ticker", _TickerWithFiscalYearStraddlingDividends)
+    provider = YFinanceDividendDataProvider(
+        now=_NOW, corporate_action_service=_no_op_corporate_action_service()
+    )
+
+    info = provider.get_dividend_info("4193", fiscal_year_end_month=3)
+
+    assert info is not None
+    by_end = {a.period_end: a for a in info.annual_dividend_actuals}
+    assert by_end[dt.date(2025, 3, 31)].raw_dividend_per_share == Decimal("30")
+    # 暦年集計なら2025年=30+15=45になってしまうが、決算期単位ではFY2026は33のみ
+    assert by_end[dt.date(2026, 3, 31)].raw_dividend_per_share == Decimal("33")
+    assert info.actual_annual_dividend_per_share == Decimal("33")
+    assert info.calendar_year_fallback_used is False
+
+
+def test_december_fiscal_year_end_matches_calendar_year_aggregation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """12月決算企業(fiscal_year_end_month=12)で従来通りの挙動(暦年集計と
+    同じ結果)になること。"""
+    import jstock_advisor.providers.dividend_data.yfinance_impl as module
+
+    class _TickerWithCalendarYearDividends(_FakeTicker):
+        def __init__(self, symbol: str) -> None:
+            super().__init__(symbol)
+            self.info = {"regularMarketPrice": 1000, "dividendRate": 20}
+            self.dividends = {
+                dt.datetime(2024, 6, 27): 10.0,
+                dt.datetime(2024, 12, 27): 10.0,
+                dt.datetime(2025, 6, 27): 12.0,
+                dt.datetime(2025, 12, 29): 12.0,
+            }
+
+    monkeypatch.setattr(module.yf, "Ticker", _TickerWithCalendarYearDividends)
+    provider = YFinanceDividendDataProvider(
+        now=_NOW, corporate_action_service=_no_op_corporate_action_service()
+    )
+
+    info = provider.get_dividend_info("2914", fiscal_year_end_month=12)
+
+    assert info is not None
+    by_end = {a.period_end: a for a in info.annual_dividend_actuals}
+    assert by_end[dt.date(2024, 12, 31)].raw_dividend_per_share == Decimal("20")
+    assert by_end[dt.date(2025, 12, 31)].raw_dividend_per_share == Decimal("24")
+    assert info.actual_annual_dividend_per_share == Decimal("24")
+
+
+def test_interim_and_final_dividend_not_merged_by_calendar_year(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """5195パターン回帰: 前期末配当と当期中間配当が「同じ暦年」というだけの
+    理由で誤って合算されないこと。"""
+    import jstock_advisor.providers.dividend_data.yfinance_impl as module
+
+    class _TickerWithSameCalendarYearButDifferentFiscalYears(_FakeTicker):
+        def __init__(self, symbol: str) -> None:
+            super().__init__(symbol)
+            self.info = {"regularMarketPrice": 1000, "dividendRate": 20}
+            self.dividends = {
+                dt.datetime(2025, 2, 1): 50.0,  # FY2025(3月決算)の期末配当
+                dt.datetime(2025, 8, 1): 30.0,  # FY2026(3月決算)の中間配当。同じ暦年だが別決算期
+            }
+
+    monkeypatch.setattr(module.yf, "Ticker", _TickerWithSameCalendarYearButDifferentFiscalYears)
+    provider = YFinanceDividendDataProvider(
+        now=_NOW, corporate_action_service=_no_op_corporate_action_service()
+    )
+
+    info = provider.get_dividend_info("5195", fiscal_year_end_month=3)
+
+    assert info is not None
+    by_end = {a.period_end: a for a in info.annual_dividend_actuals}
+    # 暦年集計なら2025年=50+30=80になってしまうが、決算期単位では両者は別期
+    assert by_end[dt.date(2025, 3, 31)].raw_dividend_per_share == Decimal("50")
+    assert by_end[dt.date(2026, 3, 31)].raw_dividend_per_share == Decimal("30")
+
+
+def test_none_fiscal_year_end_month_falls_back_to_calendar_year(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """fiscal_year_end_month=None(未指定)の場合、従来の暦年集計と完全に
+    同じ結果を返し、calendar_year_fallback_used=Trueが設定されること。"""
+    import jstock_advisor.providers.dividend_data.yfinance_impl as module
+
+    class _TickerWithDividends(_FakeTicker):
+        def __init__(self, symbol: str) -> None:
+            super().__init__(symbol)
+            self.info = {"regularMarketPrice": 1000, "dividendRate": 20}
+            self.dividends = {
+                dt.datetime(2024, 6, 27): 10.0,
+                dt.datetime(2024, 12, 27): 10.0,
+                dt.datetime(2025, 6, 27): 12.0,
+                dt.datetime(2025, 12, 29): 12.0,
+            }
+
+    monkeypatch.setattr(module.yf, "Ticker", _TickerWithDividends)
+    provider_without = YFinanceDividendDataProvider(
+        now=_NOW, corporate_action_service=_no_op_corporate_action_service()
+    )
+    provider_with_12 = YFinanceDividendDataProvider(
+        now=_NOW, corporate_action_service=_no_op_corporate_action_service()
+    )
+
+    info_without = provider_without.get_dividend_info("2914")
+    info_with_12 = provider_with_12.get_dividend_info("2914", fiscal_year_end_month=12)
+
+    assert info_without is not None
+    assert info_with_12 is not None
+    assert info_without.calendar_year_fallback_used is True
+    assert info_with_12.calendar_year_fallback_used is False
+    assert (
+        info_without.actual_annual_dividend_per_share
+        == info_with_12.actual_annual_dividend_per_share
+    )
+    without_by_end = {
+        a.period_end: a.raw_dividend_per_share for a in info_without.annual_dividend_actuals
+    }
+    with_12_by_end = {
+        a.period_end: a.raw_dividend_per_share for a in info_with_12.annual_dividend_actuals
+    }
+    assert without_by_end == with_12_by_end
+
+
+def test_annual_dividend_actual_period_boundaries_are_correct(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """annual_dividend_actualsの各period_start/period_end/period_end_basisが
+    正しいこと。"""
+    import jstock_advisor.providers.dividend_data.yfinance_impl as module
+
+    class _TickerWithDividends(_FakeTicker):
+        def __init__(self, symbol: str) -> None:
+            super().__init__(symbol)
+            self.info = {"regularMarketPrice": 1000, "dividendRate": 20}
+            self.dividends = {dt.datetime(2025, 9, 26): 15.0, dt.datetime(2026, 3, 26): 18.0}
+
+    monkeypatch.setattr(module.yf, "Ticker", _TickerWithDividends)
+    provider = YFinanceDividendDataProvider(
+        now=_NOW, corporate_action_service=_no_op_corporate_action_service()
+    )
+
+    info = provider.get_dividend_info("4193", fiscal_year_end_month=3)
+
+    assert info is not None
+    assert len(info.annual_dividend_actuals) == 1
+    actual = info.annual_dividend_actuals[0]
+    assert actual.period_start == dt.date(2025, 4, 1)
+    assert actual.period_end == dt.date(2026, 3, 31)
+    assert actual.period_end_basis == DividendPeriodEndBasis.DERIVED_FROM_FISCAL_YEAR_END
+    assert actual.period_start_is_estimated is False
+
+
+def test_raw_and_normalized_values_are_identical_even_when_a_split_occurred(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #706(二重調整バグの修正): raw_dividend_per_shareと
+    normalized_dividend_per_shareは常に同一になる(分割が発生した年度でも)。
+
+    `ticker.dividends`はyfinance(Yahoo Finance)が問い合わせ時点までの分割を
+    反映して既に遡及調整済みの値を返すため(実測で確認済み)、
+    `_sum_by_fiscal_year()`はこれを追加で分割調整しない。本テストは旧版
+    (`test_raw_and_normalized_values_differ_without_double_adjustment`、
+    raw=50・normalized=10〔=50/5〕を期待していた)の前提が実際のyfinance
+    応答と矛盾していたことの是正であり、CorporateActionService経由の
+    追加調整が無いことを明示的に固定する。
+    """
+    import jstock_advisor.providers.dividend_data.yfinance_impl as module
+
+    class _TickerWithSplitStraddlingDividends(_FakeTicker):
+        def __init__(self, symbol: str) -> None:
+            super().__init__(symbol)
+            self.info = {"regularMarketPrice": 1000, "dividendRate": 9}
+            self.dividends = {
+                dt.datetime(2025, 6, 27): 25.0,
+                dt.datetime(2025, 12, 29): 25.0,
+            }
+
+    monkeypatch.setattr(module.yf, "Ticker", _TickerWithSplitStraddlingDividends)
+
+    split_event = CorporateActionEvent(
+        stock_code="5401",
+        event_type=CorporateActionType.SPLIT,
+        announced_date=dt.date(2026, 4, 1),
+        effective_date=dt.date(2026, 4, 1),
+        ratio=Decimal("5"),
+        source=DataSourceReference(provider="test", fetched_at=_NOW),
+    )
+    corporate_action = CorporateActionService(
+        _FixedCorporateActionProvider([split_event]), now=_NOW
+    )
+    provider = YFinanceDividendDataProvider(now=_NOW, corporate_action_service=corporate_action)
+
+    info = provider.get_dividend_info("5401", fiscal_year_end_month=12)
+
+    assert info is not None
+    actual = info.annual_dividend_actuals[-1]
+    assert actual.raw_dividend_per_share == Decimal("50")  # yfinanceの値をそのまま合算(25+25)
+    assert actual.normalized_dividend_per_share == Decimal("50")  # 追加調整はしない(二重調整の解消)
+    assert actual.normalization_basis_date is not None
+
+
+def test_policy_flag_is_unknown_not_false(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Issue #30 Phase 1: yfinanceは方針の有無を判定不可のためNone(UNKNOWN)を返す。
+    以前のFalse固定(「方針なし」と区別不能)へ退行しないことを固定する。"""
+    import jstock_advisor.providers.dividend_data.yfinance_impl as module
+
+    monkeypatch.setattr(module.yf, "Ticker", _FakeTicker)
+    provider = YFinanceDividendDataProvider(
+        now=_NOW, corporate_action_service=_no_op_corporate_action_service()
+    )
+
+    info = provider.get_dividend_info("7203")
+
+    assert info is not None
+    assert info.is_progressive_or_doe_policy is None
+    assert info.shareholder_return_policy_type is None
+
+
+# --- Issue #59 Phase B2: 取得失敗 / 真の0 / 不明 の3状態を混同しない ------------
+
+
+class _RaisingInfoTicker:
+    def __init__(self, symbol: str) -> None:
+        self.symbol = symbol
+
+    @property
+    def info(self) -> dict[str, object]:
+        raise RuntimeError("429 Too Many Requests")
+
+
+class _RaisingDividendsTicker:
+    def __init__(self, symbol: str) -> None:
+        self.symbol = symbol
+        self.info = {"regularMarketPrice": 1000, "dividendRate": 50}
+
+    @property
+    def dividends(self) -> dict[object, float]:
+        raise TimeoutError("read timed out")
+
+
+class _ZeroDividendTicker:
+    """配当を明示的に0で返すfake(真のzero。無配企業)。"""
+
+    def __init__(self, symbol: str) -> None:
+        self.symbol = symbol
+        self.info = {"regularMarketPrice": 1000, "dividendRate": 0}
+        self.dividends: dict[object, float] = {}
+
+
+class _NoPriceTicker:
+    """応答は成立するが対象銘柄のデータが無いfake(SUCCESS + missing)。"""
+
+    def __init__(self, symbol: str) -> None:
+        self.symbol = symbol
+        self.info: dict[str, object] = {}
+        self.dividends: dict[object, float] = {}
+
+
+def _provider_for(
+    monkeypatch: pytest.MonkeyPatch, ticker_cls: type
+) -> YFinanceDividendDataProvider:
+    import jstock_advisor.providers.dividend_data.yfinance_impl as module
+
+    monkeypatch.setattr(module.yf, "Ticker", ticker_cls)
+    return YFinanceDividendDataProvider(
+        now=_NOW, corporate_action_service=_no_op_corporate_action_service()
+    )
+
+
+def test_dividend_info_failure_raises_provider_data_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """取得失敗を配当0や欠測へ潰さない。"""
+    from jstock_advisor.interfaces.provider_errors import ProviderDataError
+
+    provider = _provider_for(monkeypatch, _RaisingInfoTicker)
+
+    with pytest.raises(ProviderDataError) as excinfo:
+        provider.get_dividend_info("7203")
+
+    assert excinfo.value.operation == "info"
+    assert excinfo.value.retryable is True
+    assert isinstance(excinfo.value.__cause__, RuntimeError)
+
+
+def test_dividends_series_failure_raises_provider_data_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from jstock_advisor.interfaces.provider_errors import ProviderDataError
+
+    provider = _provider_for(monkeypatch, _RaisingDividendsTicker)
+
+    with pytest.raises(ProviderDataError) as excinfo:
+        provider.get_dividend_info("7203")
+
+    assert excinfo.value.operation == "dividends"
+    assert excinfo.value.retryable is True
+
+
+def test_explicit_zero_dividend_is_kept_as_true_zero(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """明示的な配当0(無配)は真のzeroとして保持する(#55 semanticsの回帰)。"""
+    provider = _provider_for(monkeypatch, _ZeroDividendTicker)
+
+    info = provider.get_dividend_info("7203")
+
+    assert info is not None
+    assert info.forecast_annual_dividend_per_share == Decimal("0")
+
+
+def test_missing_market_data_is_still_unknown_not_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """応答は成立したがデータが無い場合は従来どおりNone(unknown)。"""
+    provider = _provider_for(monkeypatch, _NoPriceTicker)
+
+    assert provider.get_dividend_info("7203") is None
+
+
+def test_issue_706_end_to_end_cross_validation_no_longer_falsely_excludes_split_stock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #706の実例(stock_code=1925)を模した統合テスト。
+
+    yfinance実測: FY2026-03の配当イベントは2025-09-29(37.5)+2026-03-30(50.0)
+    で合計87.5(既に2026-09-29の2倍分割を反映した、問い合わせ時点基準の値)。
+    EDINET側はこの決算期の生値(未調整)として175.00を報告している
+    (175.00 = 87.5 * 2。分割前基準の原本値)。
+
+    修正前は`_sum_by_fiscal_year()`がyfinance側の87.5をさらに2で割り43.75とし、
+    EDINET側を正しく87.5へ調整した結果と比較して50%の「真の乖離」と誤判定し、
+    配当データ取得不可(DATA_INSUFFICIENT)として除外していた。修正後は
+    yfinance側がそのまま87.5となり、EDINET側の調整結果(87.5)と一致し、
+    VALIDATEDとなる(除外されない)。
+    """
+    import jstock_advisor.providers.dividend_data.yfinance_impl as module
+
+    class _SplitAffectedTicker(_FakeTicker):
+        def __init__(self, symbol: str) -> None:
+            super().__init__(symbol)
+            self.info = {"regularMarketPrice": 1000, "dividendRate": 90}
+            self.dividends = {
+                dt.datetime(2025, 9, 29): 37.5,
+                dt.datetime(2026, 3, 30): 50.0,
+            }
+
+    monkeypatch.setattr(module.yf, "Ticker", _SplitAffectedTicker)
+
+    # 実際のbatch実行時刻(2026-09-30 08:01 JST)を模す。分割効力発生
+    # (2026-09-29)より後でなければ、この統合シナリオ自体が成立しない。
+    now = dt.datetime(2026, 9, 29, 23, 1, tzinfo=dt.UTC)
+    split_event = CorporateActionEvent(
+        stock_code="1925",
+        event_type=CorporateActionType.SPLIT,
+        announced_date=dt.date(2026, 9, 29),
+        effective_date=dt.date(2026, 9, 29),
+        ratio=Decimal("2"),
+        source=DataSourceReference(provider="test", fetched_at=now),
+    )
+
+    class _FixedCorporateActionProvider:
+        def __init__(self, events: list[CorporateActionEvent]) -> None:
+            self._events = events
+
+        def get_corporate_actions(
+            self, stock_code: str, since: dt.date
+        ) -> list[CorporateActionEvent]:
+            return [
+                e for e in self._events if e.effective_date is None or e.effective_date >= since
+            ]
+
+    corporate_action = CorporateActionService(_FixedCorporateActionProvider([split_event]), now=now)
+    primary = YFinanceDividendDataProvider(now=now, corporate_action_service=corporate_action)
+
+    period_end = dt.date(2026, 3, 31)
+    edinet_actual = AnnualDividendActual(
+        period_end=period_end,
+        period_end_basis=DividendPeriodEndBasis.REPORTED,
+        period_start=dt.date(2025, 4, 1),
+        period_start_is_estimated=False,
+        raw_dividend_per_share=Decimal("175.00"),
+        normalized_dividend_per_share=None,
+        normalization_basis_date=None,
+    )
+
+    class _FixedSecondaryProvider:
+        def get_dividend_info(
+            self, stock_code: str, fiscal_year_end_month: int | None = None
+        ) -> DividendInfo:
+            return DividendInfo(
+                stock_code="1925",
+                fiscal_year="2026",
+                actual_annual_dividend_per_share=Decimal("175.00"),
+                source=DataSourceReference(provider="edinet", fetched_at=now),
+                annual_dividend_actuals=[edinet_actual],
+            )
+
+    cross_validated = CrossValidatingDividendDataProvider(
+        primary=primary,
+        secondary=_FixedSecondaryProvider(),
+        corporate_action_service=corporate_action,
+        config=load_config().data_validation,
+        now=now,
+    )
+
+    result = cross_validated.get_dividend_info("1925", fiscal_year_end_month=3)
+
+    assert result is not None
+    assert result.actual_annual_dividend_per_share == Decimal("87.5")
+    assert result.validation_status == DividendValidationStatus.VALIDATED

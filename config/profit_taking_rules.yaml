@@ -1,0 +1,132 @@
+# 利確判定設定（要求仕様 12節）
+
+version: 1
+
+thresholds:
+  # 含み益率(%)によるシグナル。コードレビュー対応(2026-08、上値余地の導入)により、
+  # unrealized_gain_partial_pct/unrealized_gain_full_pctはもはや判定レベル
+  # (raw_level)の決定には使わない(price_positionブロックに置き換えられた)。
+  # _compute_sell_prices()の価格フィールド候補選択(level_gain、どの価格を
+  # 表示するかの補助値)専用として引き続き使うため、値・キー名は変更しない。
+  unrealized_gain_watch_pct: 20.0        # 利確候補として監視
+  unrealized_gain_partial_pct: 30.0      # 価格フィールド候補選択専用(判定レベルには不使用)
+  unrealized_gain_full_pct: 50.0         # 価格フィールド候補選択専用(判定レベルには不使用)
+
+  # 強気適正価格に対する超過率(%)。同様にコードレビュー対応(2026-08)により、
+  # 判定レベルの決定には使わず、_compute_sell_prices()の価格フィールド候補選択
+  # (level_fv)専用として残す(値・キー名は変更しない)。
+  fair_value_excess_partial_pct: 25.0    # 価格フィールド候補選択専用(判定レベルには不使用)
+  fair_value_excess_full_pct: 40.0       # 価格フィールド候補選択専用(判定レベルには不使用)
+
+  # 総合利回りの低下によるシグナル(%)
+  total_yield_caution_pct: 2.5           # 利確を検討
+  total_yield_strong_caution_pct: 2.0    # 強く利確を検討
+
+# 含み益率×上値余地(ceilingまでの距離)の基本アクションレベル判定(コードレビュー
+# 対応2026-08)。ceiling_price(usable_for_trading_judgment=Trueかつ信頼性ゲート
+# 通過済みのfair_value_range.bull)に対する上値余地を、利確判定の中心指標として
+# 導入する。含み益率単独・適正価格超過率単独では判定レベルへ到達しない設計へ
+# 変更したため、上記thresholdsのgain/fair_value_excess系キーは判定レベルの
+# 決定には使わなくなった(このブロックが置き換える)。
+price_position:
+  watch_gain_pct: 20.0            # 内部WATCHトリガー(含み益のみでWATCHへ)
+  partial_gain_pct: 20.0          # PARTIAL候補の含み益閾値
+  full_gain_pct: 25.0             # FULL候補の含み益閾値
+  partial_upside_max_pct: 15.0    # これ以上の上値余地は「まだ余地あり」(WATCH据え置き)
+  full_upside_max_pct: 5.0        # FULL候補の上値余地上限
+  ceiling_exceeded_pct: 0.0       # 上値余地がこれ未満(=ceiling超過)でFULL強候補
+
+# 利確判定を弱める要因。該当する場合、判定レベルを1段階引き下げる(FULL->PARTIAL, PARTIAL->WATCH等)
+mitigating_factors:
+  fair_value_rising_with_earnings_growth:
+    enabled: true
+    downgrade_levels: 1
+  continuous_dividend_increase:
+    enabled: true
+    # 増配が継続しているとみなす年数
+    min_consecutive_years: 2
+    downgrade_levels: 1
+  progressive_dividend_or_doe_policy:
+    enabled: true
+    downgrade_levels: 1
+  long_term_holding_benefit_imminent:
+    enabled: true
+    # 優待の長期保有優遇まで、この営業日数以内であれば適用
+    within_business_days: 60
+    downgrade_levels: 1
+  few_reinvestment_alternatives:
+    enabled: true
+    downgrade_levels: 1
+  nisa_long_term_benefit:
+    # 2026-10-03 USER決定(案A。Issue #778、原本 = #122 issuecomment-5968181968): 口座区分(NISA / 特定 / 一般)を
+    # 判定に実質的に使わない。NISA口座の保有に対する利確判定の軽減(downgrade)を行わない。
+    # 出荷値をfalseに固定するguardが tests/unit/test_issue_778_nisa_mitigation_disabled.py にある
+    # (trueへ戻すにはUSERの決定の変更とguardの更新が要る)。downgrade_levelsは据え置き(enabled: falseの間は使われない)。
+    enabled: false
+    downgrade_levels: 1
+
+# 権利確定日・決算発表予定日が近い場合、判定に付記する(自動での判定変更は行わない)
+event_proximity_notice:
+  dividend_record_date_within_business_days: 10
+  benefit_record_date_within_business_days: 10
+  earnings_announcement_within_business_days: 10
+
+# 複数条件による判定(要求仕様9節)。含み益率単独ではFULLへ到達できない設計とする。
+condition_based_judgment:
+  min_conditions_for_partial: 2
+  min_moderate_conditions_for_full: 2
+  forward_return_inferior_threshold_pct: -20.0
+  timing_downgrade_block_margin_pct: 0.0
+  # 中立適正価格基準の期待リターン単独ではFULLの強条件にしない(レビュー対応)。
+  # 以下も併せて満たす場合のみ、適正価格ベースの強いFULL条件として成立する。
+  min_fair_value_methods_for_full: 3
+  max_fair_value_spread_ratio_for_full: 1.30
+  # 強気適正価格をこの%以上超過している場合のみFULLの強条件候補とする(40%)
+  bull_excess_margin_pct_for_full: 40.0
+  # --- 利確判定エンジン再レビュー対応(2026-07): MEDIUM信頼度でも適正価格ベースで
+  # PARTIAL相当を許可するための追加ゲート(要求仕様§5) ---
+  min_business_days_to_earnings_for_fair_value_action: 4
+  min_fair_value_methods_for_partial: 3
+  max_fair_value_spread_ratio_for_partial: 1.30
+
+# 保有株数・売買単位を考慮した実行可能性(要求仕様レビュー対応)。
+# TSE上場銘柄の単元株数は2018年10月に全銘柄100株へ統一済み(制度上の既知の事実)。
+# 単元未満株取引が利用可能かどうかは銘柄・口座ごとに異なり自動判定できないため、
+# 既定はFalse(捏造しない)。
+trading_unit:
+  default_trading_unit: 100
+  default_odd_lot_trading_available: false
+
+# 利益保全(Profit Protection)判定(2026-08、サンリオ8136の含み益吐き出し事例対応)。
+# Fair Valueベースの割高判定(condition_based_judgment等)とは独立した軸であり、
+# 「すでに十分な含み益を得ており、その利益を高値から相当量失い始めている」ことを
+# 検出する。Fair Value confidenceがLOW/UNKNOWNであっても、strongの条件を満たせば
+# PARTIAL_PROFIT_TAKEを成立可能とする(候補閾値はサンリオ1銘柄への過学習を避けるため
+# 初期値として設定し、実績蓄積後にGitHub Issueで再評価する)。
+profit_protection:
+  enabled: true
+  # 通常のPARTIAL候補(§3A)。単独では無条件にPARTIALとせず、既存の
+  # condition_based_judgment.min_conditions_for_partialの一条件として数える
+  # (trend悪化等の他条件と組み合わさった場合のみPARTIALへ到達する)。
+  candidate:
+    min_current_gain_pct: 20.0
+    min_drawdown_from_peak_pct: 8.0
+    min_gain_giveback_ratio_pct: 20.0
+  # Strong Profit Protection(§3B)。Fair Value confidenceに依存せず、単独で
+  # PARTIAL_PROFIT_TAKEを成立可能とする(既存のPRICE_POSITION/FAIR_VALUE_STRONGと
+  # 同様、mitigating・timing両層の合計softeningでもPARTIAL未満へは降格しない)。
+  strong:
+    min_current_gain_pct: 25.0
+    min_drawdown_from_peak_pct: 10.0
+    min_gain_giveback_ratio_pct: 30.0
+
+# PARTIAL_PROFIT_TAKE成立後、何株売るかの目安比率(2026-08、コードレビュー
+# 対応Part B)。判定強度(SellIntensity、profit_taking.pyのorigin+momentumから
+# 決まる)に応じて、保有株数に対するこの比率を売買単位に切り下げて実際の
+# 売却株数を算出する(trading_unit_feasibility.py)。0 < light <= standard <=
+# strong <= very_strong < 1 を満たす必要がある(起動時validation)。
+partial_sell_ratios:
+  light: 0.25       # 弱いPARTIAL(非価格系条件のみで成立)
+  standard: 0.50    # 通常のPARTIAL(価格マトリクス・適正価格ベース)
+  strong: 0.60      # Strong Profit Protection
+  very_strong: 0.80 # Strong Profit Protection + トレンド悪化

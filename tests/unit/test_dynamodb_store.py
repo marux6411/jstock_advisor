@@ -1,0 +1,747 @@
+from __future__ import annotations
+
+import time
+
+import boto3
+import pytest
+from moto import mock_aws
+from pydantic import BaseModel
+
+from jstock_advisor.infrastructure.aws.dynamodb_store import DynamoDbCollectionStore, to_dynamo_item
+
+_TABLE_NAME = "test-items"
+_REGION = "ap-northeast-1"
+
+
+class _Item(BaseModel):
+    item_id: str
+    name: str
+    value: int
+
+
+@pytest.fixture
+def store(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("AWS_DEFAULT_REGION", _REGION)
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "testing")
+    with mock_aws():
+        client = boto3.client("dynamodb", region_name=_REGION)
+        client.create_table(
+            TableName=_TABLE_NAME,
+            KeySchema=[{"AttributeName": "item_id", "KeyType": "HASH"}],
+            AttributeDefinitions=[{"AttributeName": "item_id", "AttributeType": "S"}],
+            BillingMode="PAY_PER_REQUEST",
+        )
+        yield DynamoDbCollectionStore(_Item, _TABLE_NAME, "item_id")
+
+
+@pytest.fixture
+def store_with_ttl(monkeypatch: pytest.MonkeyPatch):
+    """通知検証モード機能(2026-08追加)。ttl_seconds指定時のみttl属性が付与される
+    ことを確認するための、既存storeフィクスチャと同一テーブルを使うTTL付き版。"""
+    monkeypatch.setenv("AWS_DEFAULT_REGION", _REGION)
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "testing")
+    with mock_aws():
+        client = boto3.client("dynamodb", region_name=_REGION)
+        client.create_table(
+            TableName=_TABLE_NAME,
+            KeySchema=[{"AttributeName": "item_id", "KeyType": "HASH"}],
+            AttributeDefinitions=[{"AttributeName": "item_id", "AttributeType": "S"}],
+            BillingMode="PAY_PER_REQUEST",
+        )
+        yield DynamoDbCollectionStore(_Item, _TABLE_NAME, "item_id", ttl_seconds=7200)
+
+
+def test_upsert_and_get_round_trips(store: DynamoDbCollectionStore[_Item]) -> None:
+    item = _Item(item_id="1", name="foo", value=10)
+    store.upsert(item)
+    fetched = store.get("1")
+    assert fetched == item
+
+
+def test_get_returns_none_for_missing_item(store: DynamoDbCollectionStore[_Item]) -> None:
+    assert store.get("does-not-exist") is None
+
+
+def test_upsert_overwrites_existing_item(store: DynamoDbCollectionStore[_Item]) -> None:
+    store.upsert(_Item(item_id="1", name="foo", value=10))
+    store.upsert(_Item(item_id="1", name="bar", value=20))
+    fetched = store.get("1")
+    assert fetched is not None
+    assert fetched.name == "bar"
+    assert fetched.value == 20
+
+
+def test_list_all_returns_every_item(store: DynamoDbCollectionStore[_Item]) -> None:
+    store.upsert(_Item(item_id="1", name="a", value=1))
+    store.upsert(_Item(item_id="2", name="b", value=2))
+    items = store.list_all()
+    assert {item.item_id for item in items} == {"1", "2"}
+
+
+def test_delete_removes_item_and_reports_existence(store: DynamoDbCollectionStore[_Item]) -> None:
+    store.upsert(_Item(item_id="1", name="a", value=1))
+    assert store.delete("1") is True
+    assert store.get("1") is None
+    assert store.delete("1") is False
+
+
+def test_find_filters_with_predicate(store: DynamoDbCollectionStore[_Item]) -> None:
+    store.upsert(_Item(item_id="1", name="a", value=1))
+    store.upsert(_Item(item_id="2", name="b", value=2))
+    store.upsert(_Item(item_id="3", name="c", value=3))
+    found = store.find(lambda i: i.value >= 2)
+    assert {item.item_id for item in found} == {"2", "3"}
+
+
+def test_upsert_many_writes_all_items(store: DynamoDbCollectionStore[_Item]) -> None:
+    store.upsert_many(
+        [
+            _Item(item_id="1", name="a", value=1),
+            _Item(item_id="2", name="b", value=2),
+        ]
+    )
+    assert len(store.list_all()) == 2
+
+
+def test_insert_if_absent_adds_new_item_and_returns_true(
+    store: DynamoDbCollectionStore[_Item],
+) -> None:
+    added = store.insert_if_absent(_Item(item_id="1", name="foo", value=10))
+    assert added is True
+    assert store.get("1") == _Item(item_id="1", name="foo", value=10)
+
+
+def test_insert_if_absent_does_not_overwrite_existing_item(
+    store: DynamoDbCollectionStore[_Item],
+) -> None:
+    store.upsert(_Item(item_id="1", name="original", value=10))
+
+    added = store.insert_if_absent(_Item(item_id="1", name="attempted-overwrite", value=99))
+
+    assert added is False
+    fetched = store.get("1")
+    assert fetched is not None
+    assert fetched.name == "original"
+    assert fetched.value == 10
+
+
+def test_get_consistent_round_trips(store: DynamoDbCollectionStore[_Item]) -> None:
+    store.upsert(_Item(item_id="1", name="foo", value=10))
+    assert store.get_consistent("1") == _Item(item_id="1", name="foo", value=10)
+
+
+def test_get_consistent_returns_none_for_missing_item(
+    store: DynamoDbCollectionStore[_Item],
+) -> None:
+    assert store.get_consistent("does-not-exist") is None
+
+
+def test_get_consistent_uses_consistent_read(
+    store: DynamoDbCollectionStore[_Item], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """コードレビュー対応: get_consistent()はConsistentRead=TrueでGetItemを呼ぶこと
+    (通常のget()は結果整合性読み取りのまま変更せず、こちらだけ強い整合性で読む)。"""
+    calls: list[dict] = []
+    original_get_item = store._table.get_item
+
+    def _spy_get_item(**kwargs):
+        calls.append(kwargs)
+        return original_get_item(**kwargs)
+
+    monkeypatch.setattr(store._table, "get_item", _spy_get_item)
+
+    store.get_consistent("does-not-exist")
+
+    assert len(calls) == 1
+    assert calls[0].get("ConsistentRead") is True
+
+
+def test_upsert_without_ttl_seconds_omits_ttl_attribute(
+    store: DynamoDbCollectionStore[_Item],
+) -> None:
+    """既存の全リポジトリ呼び出し(ttl_seconds未指定)はttl属性が付与されないまま
+    (通知検証モード機能2026-08追加、NORMAL挙動の無変更確認)。"""
+    store.upsert(_Item(item_id="1", name="foo", value=10))
+    raw_item = store._table.get_item(Key={"item_id": "1"})["Item"]
+    assert "ttl" not in raw_item
+
+
+def test_upsert_with_ttl_seconds_sets_ttl_attribute(
+    store_with_ttl: DynamoDbCollectionStore[_Item],
+) -> None:
+    """通知検証モード機能(2026-08追加): ttl_seconds指定時のみttl属性(UNIX秒)を
+    付与する(ValidationRecommendationsTable等の使い捨てテーブル向け)。"""
+    before = int(time.time())
+    store_with_ttl.upsert(_Item(item_id="1", name="foo", value=10))
+    raw_item = store_with_ttl._table.get_item(Key={"item_id": "1"})["Item"]
+    assert "ttl" in raw_item
+    assert int(raw_item["ttl"]) >= before + 7200 - 5
+    assert int(raw_item["ttl"]) <= before + 7200 + 30
+
+
+@pytest.fixture
+def store_with_gsi(monkeypatch: pytest.MonkeyPatch):
+    """LINE UI第二弾「対象確認」機能(2026-08)向け、GSI経由のQuery検証用。
+    汎用のcategory属性でGSIを作る(batch_id等、特定機能の属性名にテストを
+    結び付けないため)。"""
+    monkeypatch.setenv("AWS_DEFAULT_REGION", _REGION)
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "testing")
+    with mock_aws():
+        client = boto3.client("dynamodb", region_name=_REGION)
+        client.create_table(
+            TableName=_TABLE_NAME,
+            KeySchema=[{"AttributeName": "item_id", "KeyType": "HASH"}],
+            AttributeDefinitions=[
+                {"AttributeName": "item_id", "AttributeType": "S"},
+                {"AttributeName": "category", "AttributeType": "S"},
+            ],
+            GlobalSecondaryIndexes=[
+                {
+                    "IndexName": "category-index",
+                    "KeySchema": [{"AttributeName": "category", "KeyType": "HASH"}],
+                    "Projection": {"ProjectionType": "ALL"},
+                }
+            ],
+            BillingMode="PAY_PER_REQUEST",
+        )
+        yield DynamoDbCollectionStore(_Item, _TABLE_NAME, "item_id")
+
+
+def test_upsert_with_index_attributes_adds_top_level_attribute(
+    store_with_gsi: DynamoDbCollectionStore[_Item],
+) -> None:
+    store_with_gsi.upsert_with_index_attributes(
+        _Item(item_id="1", name="a", value=1), {"category": "buy_candidate"}
+    )
+    raw_item = store_with_gsi._table.get_item(Key={"item_id": "1"})["Item"]
+    assert raw_item["category"] == "buy_candidate"
+    # dataとしても引き続き正しく読み戻せる(索引属性がモデルの通常シリアライズを
+    # 壊さないこと)。
+    assert store_with_gsi.get("1") == _Item(item_id="1", name="a", value=1)
+
+
+def test_query_by_index_returns_only_matching_items(
+    store_with_gsi: DynamoDbCollectionStore[_Item],
+) -> None:
+    store_with_gsi.upsert_with_index_attributes(
+        _Item(item_id="1", name="a", value=1), {"category": "buy_candidate"}
+    )
+    store_with_gsi.upsert_with_index_attributes(
+        _Item(item_id="2", name="b", value=2), {"category": "buy_candidate"}
+    )
+    store_with_gsi.upsert_with_index_attributes(
+        _Item(item_id="3", name="c", value=3), {"category": "near_buy"}
+    )
+
+    results = store_with_gsi.query_by_index("category-index", "category", "buy_candidate")
+
+    assert {item.item_id for item in results} == {"1", "2"}
+
+
+def test_query_by_index_returns_empty_list_when_no_match(
+    store_with_gsi: DynamoDbCollectionStore[_Item],
+) -> None:
+    store_with_gsi.upsert_with_index_attributes(
+        _Item(item_id="1", name="a", value=1), {"category": "buy_candidate"}
+    )
+    assert store_with_gsi.query_by_index("category-index", "category", "no_such_value") == []
+
+
+def test_upsert_without_index_attributes_is_unaffected(
+    store: DynamoDbCollectionStore[_Item],
+) -> None:
+    """既存のupsert()呼び出しは今回の変更で一切挙動が変わらない(索引属性を
+    要求しない通常テーブルでも引き続き使えること)。"""
+    store.upsert(_Item(item_id="1", name="foo", value=10))
+    assert store.get("1") == _Item(item_id="1", name="foo", value=10)
+
+
+def test_get_does_not_use_consistent_read(
+    store: DynamoDbCollectionStore[_Item], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """通常のget()は今回の修正で変更しない(ConsistentReadを指定しないまま)。"""
+    calls: list[dict] = []
+    original_get_item = store._table.get_item
+
+    def _spy_get_item(**kwargs):
+        calls.append(kwargs)
+        return original_get_item(**kwargs)
+
+    monkeypatch.setattr(store._table, "get_item", _spy_get_item)
+
+    store.get("does-not-exist")
+
+    assert len(calls) == 1
+    assert "ConsistentRead" not in calls[0]
+
+
+# --- get_many() (対象確認機能2026-08、N+1回避) -----------------------------
+
+
+def test_get_many_returns_empty_dict_for_empty_input(
+    store: DynamoDbCollectionStore[_Item],
+) -> None:
+    """必須テスト1: 0件。"""
+    assert store.get_many([]) == {}
+
+
+def test_get_many_single_id_round_trips(store: DynamoDbCollectionStore[_Item]) -> None:
+    """必須テスト2: 1件。"""
+    store.upsert(_Item(item_id="1", name="a", value=1))
+    assert store.get_many(["1"]) == {"1": _Item(item_id="1", name="a", value=1)}
+
+
+def test_get_many_with_exactly_100_ids_uses_single_batch_request(
+    store: DynamoDbCollectionStore[_Item], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """必須テスト3: 100件(BatchGetItemの1リクエスト上限ちょうど)は1リクエストで
+    完結すること。"""
+    for i in range(100):
+        store.upsert(_Item(item_id=str(i), name=f"n{i}", value=i))
+    calls: list[dict] = []
+    original = store._resource.batch_get_item
+
+    def _spy(**kwargs):
+        calls.append(kwargs)
+        return original(**kwargs)
+
+    monkeypatch.setattr(store._resource, "batch_get_item", _spy)
+
+    result = store.get_many([str(i) for i in range(100)])
+
+    assert len(calls) == 1
+    assert len(result) == 100
+
+
+def test_get_many_splits_into_multiple_batch_requests_over_100_ids(
+    store: DynamoDbCollectionStore[_Item], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """必須テスト4: 101件以上は複数のBatchGetItemリクエストへ分割されること
+    (100件ずつのチャンク、1件ずつのGetItemへはフォールバックしないこと)。"""
+    for i in range(101):
+        store.upsert(_Item(item_id=str(i), name=f"n{i}", value=i))
+    batch_calls: list[dict] = []
+    original_batch = store._resource.batch_get_item
+
+    def _spy_batch(**kwargs):
+        batch_calls.append(kwargs)
+        return original_batch(**kwargs)
+
+    get_item_calls: list[dict] = []
+    original_get_item = store._table.get_item
+
+    def _spy_get_item(**kwargs):
+        get_item_calls.append(kwargs)
+        return original_get_item(**kwargs)
+
+    monkeypatch.setattr(store._resource, "batch_get_item", _spy_batch)
+    monkeypatch.setattr(store._table, "get_item", _spy_get_item)
+
+    result = store.get_many([str(i) for i in range(101)])
+
+    assert len(batch_calls) == 2  # 100件 + 1件の2リクエストへ分割される
+    assert len(result) == 101
+    assert get_item_calls == []  # 1件ずつGetItemする実装へフォールバックしない
+
+
+def test_get_many_omits_missing_ids(store: DynamoDbCollectionStore[_Item]) -> None:
+    """必須テスト5: 一部IDが存在しない場合、存在するIDのみ戻り値に含まれる
+    (Noneでは表現しない、get()と同じ意味)。"""
+    store.upsert(_Item(item_id="1", name="a", value=1))
+    result = store.get_many(["1", "does-not-exist"])
+    assert result == {"1": _Item(item_id="1", name="a", value=1)}
+
+
+def test_get_many_retries_on_unprocessed_keys_and_succeeds(
+    store: DynamoDbCollectionStore[_Item], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """必須テスト6: UnprocessedKeysが発生しても、リトライにより最終的に
+    全件取得できること。"""
+    item1 = _Item(item_id="1", name="a", value=1)
+    item2 = _Item(item_id="2", name="b", value=2)
+    raw1 = to_dynamo_item(item1, "item_id")
+    raw2 = to_dynamo_item(item2, "item_id")
+    calls: list[dict] = []
+
+    def _flaky_batch_get_item(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            # 1回目はitem_id=2だけをUnprocessedKeysとして残す。
+            return {
+                "Responses": {_TABLE_NAME: [raw1]},
+                "UnprocessedKeys": {_TABLE_NAME: {"Keys": [{"item_id": "2"}]}},
+            }
+        return {"Responses": {_TABLE_NAME: [raw2]}, "UnprocessedKeys": {}}
+
+    monkeypatch.setattr(store._resource, "batch_get_item", _flaky_batch_get_item)
+    monkeypatch.setattr(
+        "jstock_advisor.infrastructure.aws.dynamodb_store.time.sleep", lambda *_: None
+    )
+
+    result = store.get_many(["1", "2"])
+
+    assert len(calls) == 2
+    assert result == {"1": item1, "2": item2}
+
+
+def test_get_many_raises_when_unprocessed_keys_remain_after_max_retries(
+    store: DynamoDbCollectionStore[_Item], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """必須テスト7: UnprocessedKeysが規定回数のリトライ後も残る場合、
+    RuntimeErrorを送出すること(存在しないIDとして静かに省略しない、
+    取得失敗と「存在しない」を混同しない)。"""
+
+    def _always_unprocessed(**kwargs):
+        return {
+            "Responses": {_TABLE_NAME: []},
+            "UnprocessedKeys": {_TABLE_NAME: {"Keys": [{"item_id": "1"}]}},
+        }
+
+    monkeypatch.setattr(store._resource, "batch_get_item", _always_unprocessed)
+    monkeypatch.setattr(
+        "jstock_advisor.infrastructure.aws.dynamodb_store.time.sleep", lambda *_: None
+    )
+
+    with pytest.raises(RuntimeError, match="UnprocessedKeys"):
+        store.get_many(["1"])
+
+
+def test_get_many_deduplicates_repeated_ids(
+    store: DynamoDbCollectionStore[_Item], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """必須テスト8: 入力IDに重複があっても1件として扱う(BatchGetItemの
+    重複キーエラーを起こさない、戻り値も1エントリ)。"""
+    store.upsert(_Item(item_id="1", name="a", value=1))
+    calls: list[dict] = []
+    original = store._resource.batch_get_item
+
+    def _spy(**kwargs):
+        calls.append(kwargs)
+        return original(**kwargs)
+
+    monkeypatch.setattr(store._resource, "batch_get_item", _spy)
+
+    result = store.get_many(["1", "1", "1"])
+
+    assert result == {"1": _Item(item_id="1", name="a", value=1)}
+    assert len(calls) == 1
+    assert len(calls[0]["RequestItems"][_TABLE_NAME]["Keys"]) == 1
+
+
+def test_get_many_never_falls_back_to_single_get_item(
+    store: DynamoDbCollectionStore[_Item], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """入力件数が多くても1件ずつGetItemする実装へフォールバックしないこと
+    (通常規模での確認、大規模分割時の確認はtest_get_many_splits_into_
+    multiple_batch_requests_over_100_idsで別途行う)。"""
+    store.upsert(_Item(item_id="1", name="a", value=1))
+    store.upsert(_Item(item_id="2", name="b", value=2))
+    calls: list[dict] = []
+    original = store._table.get_item
+
+    def _spy(**kwargs):
+        calls.append(kwargs)
+        return original(**kwargs)
+
+    monkeypatch.setattr(store._table, "get_item", _spy)
+
+    store.get_many(["1", "2"])
+
+    assert calls == []
+
+
+# --- Issue #113: Scanのストリーミング(iter_all) -----------------------------
+
+
+class _FakePagedTable:
+    """LastEvaluatedKeyで複数ページを返すtableダブル(Scan呼び出し回数を数える)。"""
+
+    def __init__(self, pages: list[list[dict]]) -> None:
+        self._pages = pages
+        self.scan_calls = 0
+
+    def scan(self, **kwargs):
+        self.scan_calls += 1
+        index = kwargs.get("ExclusiveStartKey", {}).get("page", 0)
+        response: dict = {"Items": self._pages[index]}
+        if index + 1 < len(self._pages):
+            response["LastEvaluatedKey"] = {"page": index + 1}
+        return response
+
+
+def _fake_pages(store: DynamoDbCollectionStore[_Item], page_sizes: list[int]) -> _FakePagedTable:
+    pages: list[list[dict]] = []
+    counter = 0
+    for size in page_sizes:
+        page = []
+        for _ in range(size):
+            counter += 1
+            item = _Item(item_id=str(counter), name="x", value=counter)
+            page.append(to_dynamo_item(item, "item_id"))
+        pages.append(page)
+    return _FakePagedTable(pages)
+
+
+def test_iter_all_returns_same_items_as_list_all(
+    store: DynamoDbCollectionStore[_Item],
+) -> None:
+    store.upsert(_Item(item_id="1", name="a", value=1))
+    store.upsert(_Item(item_id="2", name="b", value=2))
+
+    assert list(store.iter_all()) == store.list_all()
+
+
+def test_iter_all_fetches_pages_lazily(
+    store: DynamoDbCollectionStore[_Item], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #113: 全ページを先読みせず、消費した分だけScanすること。
+
+    `list_all()`が全ページを一度にlistへ保持していたため、本番の
+    RecommendationsTable(約118MB)でLambdaのメモリ上限を超えていた。
+    """
+    fake = _fake_pages(store, [3, 3, 3])
+    monkeypatch.setattr(store, "_table", fake)
+
+    iterator = store.iter_all()
+    first = next(iterator)
+
+    assert first.item_id == "1"
+    assert fake.scan_calls == 1  # 1ページ目しか取得していない
+
+    rest = list(iterator)
+
+    assert fake.scan_calls == 3
+    assert [item.item_id for item in rest] == ["2", "3", "4", "5", "6", "7", "8", "9"]
+
+
+def test_list_all_still_returns_every_page(
+    store: DynamoDbCollectionStore[_Item], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`list_all()`はiter_all()のlist()化であり、ページング結果が変わらないこと。"""
+    fake = _fake_pages(store, [2, 2, 1])
+    monkeypatch.setattr(store, "_table", fake)
+
+    items = store.list_all()
+
+    assert [item.item_id for item in items] == ["1", "2", "3", "4", "5"]
+    assert fake.scan_calls == 3
+
+
+# --- Issue #63 PR-2(A-U1b): 全件経路を失敗ポリシー機構へ接続する ---------------
+#
+# 不正レコードは fixture としてのみ作る。Production への注入は行わない。
+# 主キーは所有者を含みうる形（架空値）を再現する。
+
+
+def _put_broken(table_name: str, item_id: str) -> None:
+    """`data` がモデルとして不正な項目を直接書き込む（fixture 専用）。"""
+    boto3.resource("dynamodb", region_name=_REGION).Table(table_name).put_item(
+        Item={"item_id": item_id, "data": '{"item_id": "x", "name": "n", "value": "not-int"}'}
+    )
+
+
+def _lenient_store() -> DynamoDbCollectionStore[_Item]:
+    from jstock_advisor.infrastructure.record_failure_policy import RecordFailurePolicy
+
+    return DynamoDbCollectionStore(
+        _Item, _TABLE_NAME, "item_id", failure_policy=RecordFailurePolicy.LENIENT
+    )
+
+
+def test_iter_all_is_strict_by_default(store: DynamoDbCollectionStore[_Item]) -> None:
+    """既定(STRICT)では 1 件の不正で例外。**現行の挙動と同じ。**"""
+    store.upsert(_Item(item_id="owner-a#0001", name="a", value=1))
+    _put_broken(_TABLE_NAME, "owner-a#0000")
+
+    with pytest.raises(Exception):  # noqa: B017 - pydantic の ValidationError をそのまま通す
+        store.list_all()
+
+
+def test_iter_all_skips_under_lenient(store: DynamoDbCollectionStore[_Item]) -> None:
+    """LENIENT なら Scan 経路で 1 件の不正を skip して残りを返す。"""
+    store.upsert(_Item(item_id="owner-a#0001", name="a", value=1))
+    _put_broken(_TABLE_NAME, "owner-a#0000")
+
+    items = _lenient_store().list_all()
+
+    assert [i.item_id for i in items] == ["owner-a#0001"]
+
+
+def test_get_is_unaffected_by_a_broken_record(store: DynamoDbCollectionStore[_Item]) -> None:
+    """★ get() は要求した 1 件しか検証しない。
+
+    1 件の不正が他の id の取得を妨げない、という既存の性質を固定する。
+    PR-3a で get() をポリシーへ接続した後もこの性質は変わらない
+    （接続したのは「要求した id 自身が壊れていた場合」の扱いだけである）。
+    """
+    store.upsert(_Item(item_id="owner-a#0001", name="a", value=1))
+    _put_broken(_TABLE_NAME, "owner-a#0000")
+
+    got = store.get("owner-a#0001")
+
+    assert got is not None
+    assert got.item_id == "owner-a#0001"
+
+
+def test_get_many_skips_under_lenient(store: DynamoDbCollectionStore[_Item]) -> None:
+    """BatchGetItem 経路でも、同じ束に不正が混じって全滅しない。"""
+    store.upsert(_Item(item_id="owner-a#0001", name="a", value=1))
+    _put_broken(_TABLE_NAME, "owner-a#0000")
+
+    result = _lenient_store().get_many(["owner-a#0000", "owner-a#0001"])
+
+    assert list(result) == ["owner-a#0001"]
+
+
+def test_broken_item_id_is_hashed_in_logs(
+    store: DynamoDbCollectionStore[_Item], caplog: pytest.LogCaptureFixture
+) -> None:
+    """★ 既定では主キーの平文をログへ出さない（Issue #135 E-4 を開かない）。"""
+    import logging
+
+    _put_broken(_TABLE_NAME, "owner-a#0000")
+
+    with caplog.at_level(logging.WARNING):
+        _lenient_store().list_all()
+
+    assert "owner-a#0000" not in caplog.text
+    assert "sha256:" in caplog.text
+# --- Issue #63 PR-3a: 主キー指定の get() / get_consistent() を接続する ---------
+#
+# cache の Production 読み取りは 5 経路とも主キー指定の get() である。
+# PR-2 の _decode_page() は全件経路にしか入っていないため、LENIENT を宣言しても
+# Lambda では効かず、壊れた 1 件が従来どおり例外を送出していた。
+# ローカル JSON 実装は _read_all() を経由するため効いており、backend によって
+# 挙動が食い違っていた。この差を塞ぐ。
+
+
+def test_get_returns_none_under_lenient_when_the_requested_record_is_broken(
+    store: DynamoDbCollectionStore[_Item],
+) -> None:
+    """★ LENIENT では、要求した id 自身が壊れていても None を返す（= miss）。
+
+    これが無いと `get_or_fetch()` は例外で止まり、取り直しに進めない。
+    """
+    _put_broken(_TABLE_NAME, "owner-a#0000")
+
+    assert _lenient_store().get("owner-a#0000") is None
+
+
+def test_get_consistent_returns_none_under_lenient_when_broken(
+    store: DynamoDbCollectionStore[_Item],
+) -> None:
+    """get_consistent() も同じ扱いにする（読み方の違いだけで分岐させない）。"""
+    _put_broken(_TABLE_NAME, "owner-a#0000")
+
+    assert _lenient_store().get_consistent("owner-a#0000") is None
+
+
+def test_get_is_strict_by_default_when_the_requested_record_is_broken(
+    store: DynamoDbCollectionStore[_Item],
+) -> None:
+    """★ 既定（STRICT）では元の例外をそのまま送出する。**現行の挙動と同じ。**
+
+    宣言していない collection の挙動を変えていないことを固定する。
+    """
+    _put_broken(_TABLE_NAME, "owner-a#0000")
+
+    with pytest.raises(Exception):  # noqa: B017 - pydantic の ValidationError をそのまま通す
+        store.get("owner-a#0000")
+
+
+def test_get_consistent_is_strict_by_default_when_broken(
+    store: DynamoDbCollectionStore[_Item],
+) -> None:
+    with pytest.raises(Exception):  # noqa: B017 - pydantic の ValidationError をそのまま通す
+        _put_broken(_TABLE_NAME, "owner-a#0000")
+        store.get_consistent("owner-a#0000")
+
+
+def test_get_raises_under_fail_safe_suppress(store: DynamoDbCollectionStore[_Item]) -> None:
+    """★ FAIL_SAFE_SUPPRESS では fail-closed とし、元の例外を送出する。
+
+    このポリシーは「判定不能」を呼び出し側へ伝えて**送信を見送らせる**もので
+    あるが、`get()` の戻り値 `T | None` にはそれを伝える表現が無い。None を
+    返すと呼び出し側は「レコードが無い」と読み、`notification_log` なら
+    重複送信という、まさにこのポリシーが防ごうとしている誤りを起こす。
+    伝えられない以上は黙って進めない。
+
+    現時点でこのポリシーを宣言している collection は無い（PR-4 で
+    notification_log へ入れる予定であり、その再送判定は find() /
+    query_by_index() の全件経路を使う）。
+    """
+    from jstock_advisor.infrastructure.record_failure_policy import RecordFailurePolicy
+
+    suppress_store: DynamoDbCollectionStore[_Item] = DynamoDbCollectionStore(
+        _Item, _TABLE_NAME, "item_id", failure_policy=RecordFailurePolicy.FAIL_SAFE_SUPPRESS
+    )
+    _put_broken(_TABLE_NAME, "owner-a#0000")
+
+    with pytest.raises(Exception):  # noqa: B017 - pydantic の ValidationError をそのまま通す
+        suppress_store.get("owner-a#0000")
+
+
+def test_get_hashes_the_item_id_in_logs_by_default(
+    store: DynamoDbCollectionStore[_Item], caplog: pytest.LogCaptureFixture
+) -> None:
+    """★ 既定では主キーの平文をログへ出さない（Issue #135 E-4 を開かない）。"""
+    import logging
+
+    _put_broken(_TABLE_NAME, "owner-a#0000")
+
+    with caplog.at_level(logging.WARNING):
+        _lenient_store().get("owner-a#0000")
+
+    assert "owner-a#0000" not in caplog.text
+    assert "sha256:" in caplog.text
+
+
+def test_get_shows_the_item_id_when_plain_is_declared(
+    store: DynamoDbCollectionStore[_Item], caplog: pytest.LogCaptureFixture
+) -> None:
+    """PLAIN を宣言した collection（cache 5 件）では平文で出る。
+
+    主キーが銘柄コード・日付・用途名で構成されることを確認したうえで宣言する
+    ものであり、ここでは cache と同じ形の架空値を使う。
+    """
+    import logging
+
+    from jstock_advisor.infrastructure.record_failure_policy import (
+        ItemIdDisclosure,
+        RecordFailurePolicy,
+    )
+
+    cache_key = "latest_price:0000:2026-09-07"
+    plain_store: DynamoDbCollectionStore[_Item] = DynamoDbCollectionStore(
+        _Item,
+        _TABLE_NAME,
+        "item_id",
+        failure_policy=RecordFailurePolicy.LENIENT,
+        item_id_disclosure=ItemIdDisclosure.PLAIN,
+    )
+    _put_broken(_TABLE_NAME, cache_key)
+
+    with caplog.at_level(logging.WARNING):
+        plain_store.get(cache_key)
+
+    assert cache_key in caplog.text
+
+
+def test_get_raw_data_is_unaffected_by_the_policy(
+    store: DynamoDbCollectionStore[_Item],
+) -> None:
+    """★ get_raw_data() は接続対象外（CAS 用の生 JSON）。
+
+    モデル検証を通らないため「検証失敗の扱い」が存在しない。壊れたレコードで
+    あっても保存されているバイト列をそのまま返す（楽観ロックの
+    ConditionExpression が成立しなくなるのを避けるため）。
+    """
+    _put_broken(_TABLE_NAME, "owner-a#0000")
+
+    raw = _lenient_store().get_raw_data("owner-a#0000")
+
+    assert raw is not None
+    assert "not-int" in raw

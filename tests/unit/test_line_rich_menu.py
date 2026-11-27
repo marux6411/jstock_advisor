@@ -1,0 +1,157 @@
+"""infra/line_rich_menu/rich_menu.json のスキーマ検証(LINEボタン起点会話型UI・
+実装プランv2 4節、Issue #593で8ボタン版〔2行×4列の均等grid〕へ更新)。
+
+register_rich_menu.py自体は人間が手元で実行する運用スクリプトのため自動テスト
+対象外とするが(Lambda/CIからは呼ばれない)、定義JSONの面積合計・重複領域の
+有無・action.data値が確定postback data定義と一致することは回帰的に検証する。
+
+買付余力(Issue #592、A5a)の「💰 余力管理」を含む8ボタン版
+(上段: 買った/売った/お気に入り登録/余力管理、下段: 保有銘柄/ウォッチリスト/
+対象確認/銘柄分析。USER確定レイアウト、Issue #593 issuecomment-5842895208)
+を対象とする。
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Any
+
+from jstock_advisor.infrastructure.line.webhook import parse_postback_events
+
+_RICH_MENU_PATH = (
+    Path(__file__).resolve().parents[2] / "infra" / "line_rich_menu" / "rich_menu.json"
+)
+
+_EXPECTED_POSTBACK_DATA = {
+    "action=start_buy",
+    "action=start_sell",
+    "action=start_watch",
+    "action=start_available_cash_reconcile",
+    "action=show_holdings",
+    "action=show_watchlist",
+    "action=show_targets",
+    "action=start_analyze",
+}
+
+
+def _load() -> dict[str, Any]:
+    result: dict[str, Any] = json.loads(_RICH_MENU_PATH.read_text(encoding="utf-8"))
+    return result
+
+
+def test_rich_menu_json_is_valid_json_with_required_top_level_fields() -> None:
+    data = _load()
+    assert data["size"]["width"] > 0
+    assert data["size"]["height"] > 0
+    assert data["selected"] is True
+    assert data["name"]
+    assert data["chatBarText"]
+    assert isinstance(data["areas"], list)
+    assert len(data["areas"]) == 8
+
+
+def test_rich_menu_areas_cover_full_grid_without_gaps_or_overlap() -> None:
+    """上段(y=0)・下段(y=843)の2行、各行が幅方向に隙間・重複なくタイルする。"""
+    data = _load()
+    width = data["size"]["width"]
+    height = data["size"]["height"]
+    areas = data["areas"]
+
+    rows: dict[int, list[dict[str, Any]]] = {}
+    for area in areas:
+        y = area["bounds"]["y"]
+        rows.setdefault(y, []).append(area)
+
+    assert set(rows.keys()) == {0, height // 2}
+    for row_areas in rows.values():
+        sorted_areas = sorted(row_areas, key=lambda a: a["bounds"]["x"])
+        cursor = 0
+        row_height = None
+        for area in sorted_areas:
+            bounds = area["bounds"]
+            if row_height is None:
+                row_height = bounds["height"]
+            assert bounds["height"] == row_height
+            assert bounds["x"] == cursor  # 隙間・重複が無い(直前の右端と一致)
+            cursor += bounds["width"]
+        assert cursor == width  # 行内の合計幅がリッチメニュー全体の幅と一致
+
+    # 上段+下段の高さ合計がリッチメニュー全体の高さと一致(縦方向も隙間・重複なし)
+    top_height = rows[0][0]["bounds"]["height"]
+    bottom_height = rows[height // 2][0]["bounds"]["height"]
+    assert top_height + bottom_height == height
+
+
+def test_rich_menu_action_data_matches_confirmed_postback_definitions() -> None:
+    data = _load()
+    action_data_values = {area["action"]["data"] for area in data["areas"]}
+    assert action_data_values == _EXPECTED_POSTBACK_DATA
+
+
+def test_rich_menu_actions_are_all_postback_type_with_display_text() -> None:
+    data = _load()
+    for area in data["areas"]:
+        action = area["action"]
+        assert action["type"] == "postback"
+        assert action["displayText"]
+
+
+def test_rich_menu_areas_form_uniform_4x2_grid() -> None:
+    """Issue #593(USER確定レイアウト): 全8領域が均等なgrid(各625x843)を成す。
+
+    旧版は上段3(833/834/833)+下段4(625ずつ)の非対称配置だったが、新版は
+    2行×4列すべて均等サイズへ変更された(issuecomment-5842895208)。
+    """
+    data = _load()
+    for area in data["areas"]:
+        bounds = area["bounds"]
+        assert bounds["width"] == 625
+        assert bounds["height"] == 843
+
+
+def test_rich_menu_available_cash_button_is_positioned_as_confirmed() -> None:
+    """買付余力(#592)の「余力管理」は上段4列目(x=1875, y=0)に配置する
+    (USER確定レイアウト: お気に入り登録の右隣)。
+    """
+    data = _load()
+    matches = [
+        area
+        for area in data["areas"]
+        if area["action"]["data"] == "action=start_available_cash_reconcile"
+    ]
+    assert len(matches) == 1
+    bounds = matches[0]["bounds"]
+    assert (bounds["x"], bounds["y"]) == (1875, 0)
+
+
+def test_rich_menu_actions_are_all_accepted_by_webhook_parser() -> None:
+    """Issue #628回帰防止契約テスト: Rich Menu(rich_menu.json)に定義された
+    postback actionは、`_VALID_POSTBACK_ACTIONS`を単純比較するのではなく、
+    実際に`parse_postback_events()`へ通してWebhook側で受理されることを確認する
+    (private constantの単純比較は、allowlist側の追加漏れを検出できないため)。
+
+    Rich Menuへ新規ボタンを追加した際、Webhook allowlistへの追加が漏れると
+    このテストが落ちる(start_available_cash_reconcileがこの漏れで
+    Production上サイレントに無反応になっていた事例の再発防止)。
+    """
+    data = _load()
+    for area in data["areas"]:
+        raw_data = area["action"]["data"]
+        payload = {
+            "events": [
+                {
+                    "type": "postback",
+                    "replyToken": "reply-contract-1",
+                    "source": {"type": "user", "userId": "Ucontracttest0001"},
+                    "postback": {"data": raw_data},
+                }
+            ]
+        }
+        body = json.dumps(payload).encode("utf-8")
+        events = parse_postback_events(body)
+        assert len(events) == 1, (
+            f"Rich Menuのaction data '{raw_data}' がWebhook parserで"
+            "受理されなかった(allowlistへの追加漏れの可能性)"
+        )
+        assert raw_data == f"action={events[0].action}"

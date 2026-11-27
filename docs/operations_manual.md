@@ -1,0 +1,6468 @@
+# jstock_advisor 運用手順書
+
+本書は、AWSへのデプロイ前にローカル環境で本システムを日常運用する場合の操作手順を
+まとめたものです。実際に構築済みのCLIコマンドのみを記載しており、
+`config/schedule.yaml` に定義はあるが未実装の処理は「未実装」と明記しています。
+
+最終的な投資判断は、本システムの出力にかかわらず必ず利用者自身が行ってください。
+
+---
+
+## 1. システム概要
+
+- 対象: 日本株の長期・高配当・株主優待重視の売買支援(REIT・ETFは対象外)
+- 現状: ローカルCLIとAWS(Lambda/DynamoDB/EventBridge Scheduler/API Gateway)の両方に対応
+  (`infrastructure/collection_store.py`が実行環境を自動判定してストレージを切り替える)。
+  AWSへのデプロイ手順は[infra/README.md](../infra/README.md)を参照
+- データ保存先: ローカル実行時は`data/local_store/*.json`、AWS実行時はDynamoDB(リポジトリ層のインターフェースは同一)
+- 判断の原則:
+  - Pythonが数値計算・判定を行い、あいまいな推測はしない(データが無ければ「取得不可」として扱う)
+  - ルール変更(config/*.yaml)は`rules`コマンド経由の提案→人間承認を経ないと本適用されない
+  - 実際の売買可否は必ず利用者が最終判断する
+
+---
+
+## 2. 事前準備
+
+### 2.1 Python環境
+
+```bash
+python -m venv .venv
+.venv\Scripts\pip install -e .[dev]
+```
+
+以降、本書のコマンドは `jstock <サブコマンド>` の形式で記載します
+(`.venv\Scripts\jstock.exe` が有効化されている前提。有効化していない場合は
+`.venv\Scripts\python.exe -m jstock_advisor.cli.main <サブコマンド>` で代替可能)。
+
+### 2.2 環境変数(.env)
+
+```powershell
+Copy-Item .env.example .env
+```
+
+`.env` に以下を設定します(未設定の項目は該当機能がドライラン/取得不可扱いになります)。
+
+| 変数 | 用途 | 未設定時の挙動 |
+|---|---|---|
+| `LINE_CHANNEL_ACCESS_TOKEN` / `LINE_USER_ID` | LINE通知の送信 | 標準出力へのドライラン表示のみ(送信されない)。ただし `jstock watchlist-screening` の `run` / `retry-finalize` / `retry-stock` / `retry-notification` は、標準出力へ切り替えず、送信が必要な場面で失敗する(4.1節。Issue #434) |
+| `EDINET_API_KEY` | 配当クロスバリデーション・適時開示(臨時報告書)の取得 | EDINET由来のデータが常に取得不可扱いになる |
+
+### 2.3 設定ファイル(config/\*.yaml)
+
+すべてユーザーが直接編集可能な閾値・ルール設定です。主なファイル:
+
+| ファイル | 内容 |
+|---|---|
+| `screening_rules.yaml` | 一次スクリーニング条件(総合利回り下限・財務健全性等) |
+| `valuation_rules.yaml` | 適正価格算出方法・推奨買値の算出比率 |
+| `profit_taking_rules.yaml` | 利確判定の閾値・緩和要因 |
+| `sell_rules.yaml` | 投資前提悪化売却ルール |
+| `scoring_weights.yaml` | 買い候補スコアの重み付け |
+| `schedule.yaml` | 実行スケジュール定義(AWS移行時にEventBridge化を想定) |
+| `notification_rules.yaml` | LINE再通知条件 |
+| `data_validation_rules.yaml` | データ出典間の乖離許容閾値 |
+| `evaluation_rules.yaml` | 定点評価のラベル判定閾値 |
+| `review_improvement.yaml` | 週次改善レビューの対象期間・改善候補の基準・GitHub Issue自動起票の有効/無効(5.1節) |
+| `decision_evaluation.yaml` | 判定精度向上機能・自己評価基盤(Phase A)がDecisionSnapshotの成績集計対象とみなす営業日ホライズン(5.2節) |
+
+これらの値を変更する場合は、原則として第7節の「ルール改善承認フロー」を経てください
+(直接編集での即時反映も技術的には可能ですが、変更履歴・根拠が記録されなくなります)。
+
+---
+
+## 3. 初回セットアップ(データ登録)
+
+自動取得できないデータは、運用開始前に手動で登録する必要があります。
+
+### 3.1 保有銘柄の登録
+
+```bash
+jstock holdings add 8136 --shares 100 --price 3775 --account-type NISA
+# または
+jstock holdings import-csv holdings.csv
+```
+
+### 3.2 ウォッチリストの登録
+
+```bash
+jstock watchlist add 7203 --priority HIGH
+```
+
+### 3.3 株主優待の登録(★必須・自動取得非対応)
+
+株主優待は自動取得できる公式データ源が存在しないため、**保有銘柄・ウォッチリスト
+銘柄のうち株主優待がある銘柄は、必ず利用者が会社発表等の一次情報を確認のうえ
+登録してください**。未登録の場合、その銘柄の総合利回り計算・優待廃止検知は
+機能しません。
+
+```bash
+jstock shareholder-benefit add 2914 \
+  --min-shares-required 100 --frequency-per-year 1 \
+  --category CASH_EQUIVALENT --description "クオカード1000円分" \
+  --min-shares-for-tier 100 --estimated-value 1000
+# または
+jstock shareholder-benefit import-csv benefits.csv
+```
+
+CSVを用意しただけでは反映されません。必ず`import-csv`を実行し(ローカル運用は
+そのまま、AWS本番環境へ反映する場合は`AWS_LAMBDA_FUNCTION_NAME`環境変数を
+設定した状態で同じコマンドを実行)、`jstock shareholder-benefit list`で
+登録件数を確認してください。取込漏れは4節の起動時ログ(`WARNING`)でも検知できます。
+
+### 3.4 ウォッチリスト自動追加の候補銘柄一覧(2026-08-01・候補ユニバース本格対応で全面変更)
+
+候補ユニバース本格対応(2026-08-01)により、固定CSV(`data/universe/candidate_universe.csv`)
+から、東証(JPX)・日本経済新聞社が公開する銘柄一覧を毎週自動取得する方式へ変更しました。
+`config/watchlist_screening_rules.yaml`の`candidate_universe.provider`を`"jpx"`(既定)に
+設定していれば、事前の候補登録作業は不要です。CSV方式(`"csv"`)は小規模な動作検証用に
+残しています。
+
+**キャッシュの取得元とローカル管理コマンド**: 取得したデータはS3(本番)またはローカル
+ファイル(`data/cache/candidate_universe/`)へキャッシュされます。`WatchlistDispatcherFunction`
+が起動のたびに自動で取得・検証・更新するため、**通常運用では以下のコマンドを使う必要は
+ありません**。ローカルでの事前確認・リハーサル用の任意ツールとして提供しています(常に
+ローカルキャッシュのみを読み書きし、本番S3には一切アクセスしません)。
+
+```bash
+jstock candidate-universe refresh   # ローカルキャッシュを取得・検証・更新
+jstock candidate-universe status    # ローカルキャッシュの現在の状態(source_date・件数等)を表示
+```
+
+**本番S3キャッシュを定例スケジュール外で手動更新したい場合**: ローカルCLIからは行えません。
+`WatchlistDispatcherFunction`を直接手動起動してください(4.1節参照)。
+
+### 3.5 買付余力(available cash)の参照・棚卸し更新(2026-09-26追加、Issue #594)
+
+所有者(owner)単位の買付余力を、証券会社等の実額と照合して登録・確認します。
+自動取得できないデータのため、実際の残高と乖離しないよう定期的に棚卸し
+(reconcile)してください。**未登録owner(過去に一度も棚卸ししていない)と
+0円(棚卸しした結果0円だった)は明示的に区別されます**(#584/#589の契約)。
+
+```bash
+jstock available-cash show --owner 本人
+jstock available-cash reconcile --owner 本人 --amount 500000
+```
+
+`reconcile`は絶対値での上書きです(前回値との差額計算は行いません)。
+負の金額は拒否されます。LINE経由の棚卸し操作はIssue #592で実装済みです
+(6.2節)。**本コマンドは、PCのローカルストアだけを読み書きする試算・手元の確認用**で、
+Lambda/IAMを必要とせず、★ Productionの買付余力には反映されません ★。Productionの
+買付余力の登録・更新・確認は、LINEの「余力管理」メニュー(6.2節)で行ってください。
+`AWS_LAMBDA_FUNCTION_NAME`環境変数が設定されている環境では、ローカルのつもりで
+ProductionのDynamoDBを読み書きしてしまうことを防ぐため、`show` / `reconcile` とも
+実行前に拒否されます(Issue #923。読取・書込は0件)。
+
+**通常のLINE「買った」「売った」との連動(2026-09-26追加、Issue #590)**:
+LINEメニューボタンからの「買った」「売った」の登録確定は、買付余力が
+未登録の所有者に対しては拒否されます(自動0円初期化はしません。上記の
+「未登録≠0円」契約と整合させるため)。#590がProductionへ反映された後は、
+まだ一度も棚卸し(reconcile)していない所有者は、LINEの「余力管理」メニュー
+(#592/#593/#595のrollout状況による)で先に買付余力を登録しないと、LINEからの
+売買登録ができなくなります(★ 本コマンドはローカル専用のため、Productionの
+登録には使えません ★)。既存の所有者へ影響が出る場合は、事前にLINEの
+「余力管理」メニューで棚卸ししておくことを検討してください(自動backfillは
+行わない設計のため、対応するかどうかは運用判断です)。CLI(`buy-executed`/`sell-executed`/`holdings add`)からの
+登録は本改訂の対象外で、買付余力と連動しません(別Issue #619で対応予定)。
+
+---
+
+## 4. 日次運用
+
+`config/schedule.yaml` の日次ジョブと、対応するCLIコマンド・AWS Lambda関数の対応表です。
+AWSデプロイ後はEventBridge Schedulerが下表のLambda関数を自動実行します(時刻はJST、
+`infra/template.yaml`の`ScheduleExpressionTimezone: Asia/Tokyo`により変換不要)。
+ローカル運用のみの場合は、利用者自身がタスクスケジューラ等にCLIコマンドを登録するか
+手動で実行してください。
+
+| 時刻 | schedule.yamlのジョブ | 対応コマンド | 対応Lambda関数 | 備考 |
+|---|---|---|---|---|
+| 08:00 | `daily_buy_candidates_analysis` | `jstock analyze buy-candidates <銘柄コード...> --source real --notify` | `BuyCandidatesFunction` | ウォッチリスト+保有銘柄を統合して買い判定(新規購入・買い増し)を行う(2026-07-31改訂)。全上場銘柄の自動スクリーニングではない |
+| 08:00 | `daily_holdings_watchlist_analysis` | `jstock analyze holdings --source real --notify` | `HoldingsWatchlistFunction` | 保有銘柄の利確・売却判定、ポートフォリオ集中チェック(2026-07-31改訂: 16:30から08:00へ変更。買い候補分析と処理条件・通知タイミングを揃えるため)。保有銘柄は全件自動対象 |
+| 10:00/12:30/15:30 | `disclosure_check` | `jstock analyze disclosure-check --source real --notify` | `DisclosureCheckFunction` | 保有銘柄の新規開示にリスクキーワードが検出された場合のみ速報通知する |
+| 18:00 | `point_in_time_evaluation` | `jstock evaluation run --source real` | `EvaluationFunction` | 評価期限(営業日数)を迎えた推奨のみ処理。通知機能は無く、結果はコンソール/CloudWatch Logs表示のみ。Timeout 900秒(Issue #113。残時間に余裕を残して自主的に切り上げる) |
+
+### 実行結果の確認ポイント
+
+- `[DATA_ERROR]` と表示された銘柄は、データ取得に失敗し判定を出せなかったことを示します(推測での補完はしていません)
+- 買い候補が無い日は「本日買いを検討すべき銘柄はありませんでした。」と表示されます(異常ではありません)
+- `--notify` 時、前回と同一内容の推奨は再送されません(「前回と同内容のため通知をスキップしました」)
+- `BuyCandidatesFunction`・`HoldingsWatchlistFunction`は同じ08:00起動でも別々のLambda関数として完全に独立しており、それぞれ別の「まとめ通知」を送ります。保有銘柄側のまとめ通知に買い候補の結果が含まれないのは意図した設計です(2026-07-31確認)。買い候補が0件の日も、保有銘柄側と同様に「今回の購入候補: 該当なし」を明示するまとめ通知を送信します(Issue #568で修正。`notification_rules.yaml`の`send_empty_summary`は既定true。falseへ変更すると0件の日にまとめ通知自体を送信しなくなるが、通常運用でこの既定値を変更する想定はない)
+- 両関数とも起動時に株主優待レジストリの読み込み件数をCloudWatch Logsへ`INFO`で常時記録し、`notification_rules.yaml`の`operations.shareholder_benefit_registry_min_expected_entries`(既定1)未満の場合は`WARNING`を追加で出します(2026-07-31追加。CSV取込漏れ等の運用ミスを検知するため。バッチ処理自体は止めません)
+- **株主優待データのcoverage(2026-10-03追加。Issue #754)**: 上の件数とは別に、レジストリが気になる銘柄・保有銘柄の何割をカバーしているかを、候補側・保有側の2軸でCloudWatch Logsへ`INFO`で常時記録します(`event=shareholder_benefit_registry_coverage`。件数と割合のみで、銘柄コードは出しません)。買い候補のバッチが両軸を、保有株のバッチが保有側だけを記録します。**WARNINGは出さず、判定・通知には使いません**(株主優待データは現在、判定に使わない方針のため)。coverageが0%でも異常ではありません。記録が失敗した場合は`event=shareholder_benefit_registry_coverage_failed`が`ERROR`で残ります(判定・通知は止まりません)。
+- **Profit Protection ATTENTION(利益保全注意、2026-08-21追加)**: 保有継続(監視)のうち、利益保全判定のcandidate/strongシグナル(6.2節)を検出した銘柄のみ、例外的に「⚠️利益保全注意」としてLINE通知します(決算待ち等それ以外の理由による保有継続(監視)は引き続き通知しません)。同じ利益保全の局面(判定基準日・最高値・最高値を記録した日の組がすべて同じ)については、局面が変わるまで個別のLINE通知を再送しません
+- 【保有株チェック完了】(内部の処理名は「保有銘柄分析」のまま、表示名のみ2026-08-21改称)の各件数(一部売却・全部売却・売却・緊急確認・利益保全注意)は、実際に個別LINE送信できた件数ではなく、その日の判定で有効なアクションとして検出された件数です。売買クールダウン・優先順位比較・再通知抑止・kill switchで個別のLINE通知だけが見送られても検出件数には残ります(データ品質チェックで判定自体が保留された場合のみ検出件数から除きます)。実際の送信件数(利益保全注意を含む)はCloudWatch Logsの`holdings_summary_action_counts`ログで確認できます(`batch_id`ごとに`{action}_detected`/`{action}_sent`を出力)
+- kill switch(緊急停止)が有効な間は、個別のLINE通知・1日のまとめ通知のいずれも送信されません(判定・Recommendation保存自体は継続します)。緊急停止中も、まとめ通知の検出件数(一部売却・全部売却・売却・緊急確認・利益保全注意)に使うデータ品質チェックだけは通常時と同じ判定を読み取り専用で行います(2026-08-21再々改訂。以前は緊急停止中はこのチェック自体が行われず、緊急停止の開始/解除タイミング次第でデータ品質上「要確認」とすべき判定が検出件数へ混入しうる不備がありました)。LINE通知(個別・「要確認」通知を含む)が緊急停止中に送信されることはありません
+- まとめ通知・個別通知(利益保全注意を含む)の重複送信防止は、2026-08-28改訂(Issue #17)で原子的なclaim方式へ強化しました。送信直前に「この送信決定」を表す記録をDynamoDBの条件付き書き込み(notification_claimsテーブル、保持期間30日は掃除専用)で確保し、確保できた1つの実行だけがLINE送信します。送信失敗時はclaimを取り消して再試行可能に戻し、送信成功後に履歴保存だけが失敗した場合は再試行がLINEを再送せず履歴のみ復元します。claimを確保したまま実行が異常終了した場合は20分経過後に後続実行が引き継ぎます。ただし厳密に1回だけ(exactly-once)の保証ではなく、LINE側受理済みの通信エラーや送信中の異常終了からの引き継ぎでは、ごく稀に二重送信があり得ます(通知の取りこぼし防止を優先する設計)。この重複抑止の「当日」判定は日本時間の暦日基準です(2026-08-21改訂。以前はシステム基盤の時刻(UTC)の暦日をそのまま使っており、日本時間の朝8時台〜9時台でUTC暦日とずれ、同じ日本時間の1日が別日として扱われる不備がありました)
+- 売買イベント検知(新規購入・買い増し・一部売却・全部売却の推定)・クールダウン期限の算出・1日1回だけ検知処理を行うための排他制御も、同じ日本時間の暦日を基準に統一しています(2026-08-21再々改訂。以前はこの検知処理側がシステム基盤の時刻(UTC)のままで、上記の重複抑止・クールダウン判定側だけが先に日本時間基準へ変わっていたため、期限の算出と比較の基準日が1日分ずれる不備がありました)。クールダウンの日数設定・東証休業日/祝日を営業日として数えないルールは変更していません。日付・営業日判定の横断的な棚卸しはGitHub Issue #18で引き続き追跡しています
+
+---
+
+## 4.1 ウォッチリスト自動追加(2026-08-01追加・候補ユニバース本格対応で全面改訂・2026-08-16平日毎日起動化)
+
+| 時刻 | schedule.yamlのジョブ | 対応コマンド | 対応Lambda関数 |
+|---|---|---|---|
+| 平日(月曜〜金曜)06:00(2026-08-16改訂。旧: 毎週土曜07:00。cron自体は祝日判定なし。★ 2026-09-19以降、東証休場日は起動後にskip: 本節末の「市場休場日のskip」) | (未登録。`infra/template.yaml`の`WeekdayMorning` ScheduleV2にcron直書き) | `jstock watchlist-screening run` | `WatchlistDispatcherFunction`(`job_type=NEW_CANDIDATE_SCREENING`) |
+| 毎時 | (未登録。`infra/template.yaml`にcron直書き) | ― | `WatchlistBatchReconcilerFunction` |
+
+**WATCHLIST_MAINTENANCEに独立したScheduleは存在しない(2026-08-16改訂)**:
+旧・毎週日曜07:00の独立実行(`SundayMaintenanceReview`)は廃止した。現在は、
+同日のNEW_CANDIDATE_SCREENINGが業務finalizeを正常完了した直後の後続処理
+としてのみ起動する(詳細は4.1.1節「起動方式の平日毎日化」参照)。
+
+候補ユニバース本格対応(2026-08-01)で、単一Lambdaの自己再帰fan-outから、
+4つのLambda関数+SQSキューによる構成へ全面的に作り直しました。
+
+| Lambda関数 | 役割 |
+|---|---|
+| `WatchlistDispatcherFunction` | 平日毎日06:00のEventBridge起動、またはWATCHLIST_MAINTENANCEの自己invoke起動。候補ユニバースの取得(Downloader)・確定・銘柄ごとの進捗行作成・SQSへの投入のみを行う |
+| `WatchlistWorkerFunction` | メインキュー(`WatchlistScreeningQueue`)のトリガー。1メッセージ=1銘柄を評価する |
+| `WatchlistTerminalFailureHandlerFunction` | メインキューで3回失敗したメッセージの移動先(`WatchlistTerminalFailureQueue`)のトリガー。該当銘柄をFAILED確定する |
+| `WatchlistBatchReconcilerFunction` | 毎時起動。長時間RUNNINGのまま/DISPATCHINGのままのバッチのタイムアウト検知・終端確定を行う |
+
+CLIでの手動実行・dry-run確認方法は変更ありません。
+
+```bash
+jstock watchlist-screening run --dry-run   # 登録・通知・監査ログ記録を一切行わず結果のみ表示
+jstock watchlist-screening run             # 実際にウォッチリストへ登録・LINE通知
+```
+
+**LINE認証情報が無い環境で実行したとき(2026-10-10追加。Issue #434)**: `jstock watchlist-screening` の `run` / `retry-finalize` / `retry-stock` / `retry-notification` は、
+`.env` 等から `LINE_CHANNEL_ACCESS_TOKEN` / `LINE_USER_ID` を読めない環境でも、標準出力へのドライラン表示(送信されない)へ黙って切り替えません。
+**送信が必要な場面でだけ失敗し、「送信しました」とは表示も記録もされません**。2.2節の「未設定時は標準出力へのドライラン表示のみ」は、この4コマンドには当てはまりません
+(`jstock analyze ... --notify` など他のコマンドの挙動は変わりません)。
+
+| コマンド | 認証情報が無いとき | 終了コード | バッチの状態 |
+|---|---|---|---|
+| `run`(`--dry-run` を除く) | 追加された銘柄があり、通知が有効なときだけ送信を試み、「LINE通知を送信していません(LINE認証情報が無いため)。」と表示する。ウォッチリストへの追加は確定・保持される。最後に「LINE通知: 送信していません」と表示する | 1 | `run` はバッチの状態を更新しない |
+| `retry-finalize` | finalizeは実行する。通知が不要なら通常どおり成功する。通知を送る段で失敗した場合は、「finalizeは実行しましたが、LINE通知は送信していません(LINE認証情報が無いため)。」と表示し、認証情報のある環境で `retry-notification` を実行するよう案内する | 通知を送る段で失敗: 1 / それ以外: 0 | 通知を送る段で失敗した場合は `NOTIFICATION_FAILED` |
+| `retry-stock` | 1銘柄の再評価の後、それが最後の未完了行だった場合に実行されるfinalizeで、`retry-finalize` と同じ | 通知を送る段で失敗: 1 / それ以外: 0 | 同上 |
+| `retry-notification` | 送信が唯一の目的のため、状態を変える前に失敗する。「LINE認証情報が無いため、通知を再試行できません(バッチの状態は変更していません)。」と表示する | 1 | 変更しない |
+
+- 通知の再試行(`retry-notification`)は、**認証情報のある環境で**実行してください(Issue #434 / PR #863 の実装による実行条件。23節の「手動の retry-notification が必要になる」契約〔USER承認済み。#117 issuecomment-5740407445〕を実際に実行するときの前提です。認証情報が読めない環境では、状態を変えずに終了します)。
+- `run` で送れなかった通知は、`retry-notification` では再送できません(`retry-notification` の対象は `NOTIFICATION_FAILED` のバッチだけで、`run` はバッチの状態を更新しないため)。この CLI には、`run` で送れなかった通知の再送手段はありません(`run` を再実行しても、追加済みの銘柄は除外されます)。
+- これらは Production の状態を更新する手動コマンドです。実行の可否は27.5節(Human Gate)に従います。
+
+**バッチの状態遷移**: DynamoDBの`jstock-batch_runs`テーブルの`status`属性で
+確認できます。
+
+```
+DISPATCHING → RUNNING → FINALIZING → COMPLETED (execution_result=NORMAL)
+     ↓                                   ↘ ABORTED (execution_result=HIGH_THROTTLE_RATE)
+DISPATCH_FAILED                       FINALIZING → FINALIZE_FAILED
+
+RUNNING → TIMEOUT_FINALIZING → TIMED_OUT
+              ↘ TIMEOUT_FINALIZE_FAILED → (Reconcilerが毎時自動で再試行)
+```
+
+- **`COMPLETED`**: 通常の正常完了。`execution_result=NORMAL`。
+- **`ABORTED`**(`execution_result=HIGH_THROTTLE_RATE`): 全銘柄の処理完了後、
+  データ取得元(Yahoo Finance)へのアクセス集中が疑われた件数の割合が閾値
+  (既定20%、`high_throttle_rate_threshold_pct`)を超えた場合。ウォッチリスト
+  追加・LINE通知は行われません(合否判定自体の結果は監査用に保持されます)。
+- **`DISPATCH_FAILED`**: 候補ユニバースの取得・進捗行の作成に失敗した、または
+  `WatchlistDispatcherFunction`自体が`batch_processing_timeout_hours`(既定24時間)
+  以内に応答しなかった場合。候補リスト自体が確定していないため、この状態から
+  finalize処理は一切行われません。**自動的な再開はしません**。次回のスケジュール
+  起動(NEW_CANDIDATE_SCREENINGは翌平日06:00)が新しい`batch_id`で最初からやり直します。
+- **`FINALIZE_FAILED`**: 全銘柄の評価は完了したが、集計処理(ウォッチリストへの
+  実登録・LINE通知・実行結果の記録)自体が例外で失敗した場合。`finalize_error_message`
+  にエラー概要、`finalize_failed_at`に失敗時刻が記録されます。自動復旧の仕組みは
+  なく、次回のスケジュール起動を待つか、`jstock watchlist-screening run`で
+  手動実行してください(新しい`batch_id`で最初からやり直す形になります)。
+- **`TIMED_OUT`**: 処理開始から`batch_processing_timeout_hours`(既定24時間)
+  以内に全銘柄の評価が終わらなかった場合。`WatchlistBatchReconcilerFunction`が
+  毎時のチェックで検知し、未完了銘柄をまとめてFAILED確定します。**この場合、
+  途中まで合格していた銘柄も含めてウォッチリストへの追加・LINE通知は一切
+  行いません**(全銘柄評価が終わっていない状態のランキングは実際の実力順とは
+  限らないため)。途中結果・完了率(`completion_rate`)はAuditLogに記録されます。
+- **`TIMEOUT_FINALIZE_FAILED`**: タイムアウト確定処理自体が想定外の理由で
+  失敗した一時的な状態。`WatchlistBatchReconcilerFunction`が次回(1時間後)の
+  実行で自動的に再試行するため、通常は運用者の対応は不要です。長時間
+  (数時間以上)この状態のままの場合はCloudWatch Logsのエラー内容を確認してください。
+
+**finalize-only recovery で通常通知が抑止されることについて(Issue #211、2026-09-08追加)**:
+`WatchlistBatchReconcilerFunction`は、全銘柄の評価が終わっているのに集計処理
+(finalize)まで進んでいない停滞バッチを検知すると、子Lambdaへ
+`recovery_action=FINALIZE_ONLY`のペイロードを送って集計だけをやり直させます
+(銘柄評価・Recommendation再生成・fanout等は行いません)。
+
+```
+★ この経路では、重大リスク以外の通常のLINE通知は **送られません**。
+  ブロック理由は `TRADE_DETECTION_IN_PROGRESS` として記録されます。
+```
+
+理由は、recoveryが**売買検知(`TradeCooldownService.detect_and_apply()`)を
+この実行では走らせていない**ためです。売買を検知した銘柄には通常通知の
+クールダウンが適用されますが、検知を走らせていない実行ではそのクールダウンが
+未適用のままになります。この状態で通常通知を送ると、**本来は抑止されるべき
+銘柄へ通知が出る**可能性があります。「検知完了を確認できていないなら送らない」
+(fail-close)が本システムの方針です。
+
+したがって運用上は次のように扱ってください。
+
+- recovery が走った日は、その batch 由来の通常通知が出ないことは **正常**です。
+  通知が来ないことを障害として扱わないでください。
+- 集計・監査記録(AuditLog / DecisionSnapshot 等)は通常どおり残ります。
+  判定結果を確認したい場合は `jstock audit show <銘柄コード>` を使ってください。
+- 通知が必要な場合は、次回のスケジュール起動(新しい`batch_id`で最初から)を
+  待ってください。recovery を再実行しても通知は出ません。
+- 重大リスク(`is_critical_risk`)の通知はこのゲートを貫通するため、
+  recovery 経路でも送られます。
+
+```
+★ 2026-09-08 より前は、この経路でも通常通知が送られていました
+  (ペイロードに検知状態が載っておらず、受け取り側が既定値 True =
+   「検知済み」として扱っていたため)。Issue #211 で fail-close へ是正しています。
+```
+
+**候補銘柄数の上限について**: 旧仕様にあった評価対象件数の上限(300件)は、
+候補ユニバース本格対応でSQSベースの銘柄単位処理へ全面的に作り直したことに伴い
+撤廃しました。約3,122銘柄の全件処理には数時間規模の時間がかかります(1銘柄
+あたり30〜45秒 ÷ 同時実行数4)。
+
+**段階導入(全件処理へ移行する前の実測)**: `config/watchlist_screening_rules.yaml`の
+`staged_rollout`で、評価対象を一時的に絞り込めます。
+
+```yaml
+staged_rollout:
+  candidate_limit: 100          # 先頭100件のみ評価(nullで無制限)
+  market_segment_filter: null   # 例: ["プライム（内国株式）"]で市場区分を絞り込み
+```
+
+100→500→プライム市場のみ→全件、の順に実測し、以下をすべて満たすことを
+確認してから全件(両方`null`)へ戻すことを推奨します(実測値は`record_batch_audit`の
+出力値、またはCloudWatch Logsで確認できます)。
+
+- 429疑い率(`rate_limit_suspected_rate_pct`)が5%未満
+- データ取得失敗率(`data_error_rate_pct`)が5%未満
+- p95処理時間(`p95_processing_duration_ms`)がWorkerのLambda Timeout(180秒)以内
+- `batch_processing_timeout_hours`(既定24時間)以内に95%以上完了
+- Terminal Failure率(`terminal_failure_rate_pct`)が5%未満
+
+**`TransactionConflictException`について(2026-08-07追加)**: `WatchlistWorkerFunction`の
+CloudWatch Logsで`TransactionConflictException`(`batch_tracker.py`の
+`try_finalize_if_ready`等)が稀に記録されることがありますが、これは複数の
+Worker(同時実行数`WatchlistReservedConcurrentExecutions`、既定4、2026-08-20に
+Issue #4の実施基準充足確認を経て3から引き上げ)がほぼ同時に
+`jstock-batch_runs`テーブルの同一項目(`batch_id`)を更新しようとした際の
+DynamoDB側の一時的な競合であり、`ConditionalCheckFailedException`と同様に
+想定内の競合として捕捉・無視する扱いに修正済みです(2026-08-07修正)。
+該当銘柄の評価結果自体は例外発生前に確定保存されているため失われず、SQSの
+再送により数分以内に自動回復します。この文字列でCloudWatch Logsを検索して
+頻発している場合のみ、`WatchlistReservedConcurrentExecutions`を下げるなどの
+対応を検討してください。
+
+**銘柄ごとのウォッチリスト登録結果の確認**: `decision_type=
+watchlist_auto_addition_repository_result`のAuditLogに、`batch_id`ごとに
+各銘柄が実際に追加された(`added`)・既に登録済みで見送られた(`skipped_existing`)・
+追加件数上限外で見送られた(`skipped_over_limit`)・削除後の再追加クールダウン中
+のため見送られた(`skipped_cooldown`、2026-08-15追加)・書き込みに失敗した
+(`repository_failed`)のいずれかが記録されます。同じ`batch_id`の
+`decision_type=watchlist_auto_addition_candidate_evaluation`(スクリーニング
+評価結果)と突き合わせることで、ある銘柄がなぜ追加されなかったのかを追跡できます。
+
+### 4.1.1 永続ローテーション・自動メンテナンス(2026-08-15追加)
+
+**永続ローテーション**: 毎回固定300銘柄(先頭側のみ)しか評価していなかった
+問題を解消するため、前回どこまで評価したかを`WatchlistScreeningRotationState`
+テーブル(単一行、`rotation_id=default`)へ永続化し、次回はその続きから
+評価する巡回方式に変更した。現在の巡回状況(何周目か・概算進捗・現在の
+カーソル位置・次回選択プレビュー)は以下で確認できる。
+
+```bash
+jstock watchlist-screening rotation-status
+```
+
+`config/watchlist_screening_rules.yaml`の`rotation.enabled`を`false`にすると、
+巡回を行わず旧来の固定300件スライス方式へフォールバックできる(移行時の
+安全弁)。ローテーションの前進(コミット)は、その回の候補銘柄に対する
+ランキング・ウォッチリスト追加・通知までの業務処理が確定した時点
+(`_finish_batch()`到達時)にのみ行われる。個別銘柄の評価エラー(poison
+stock)はローテーションの前進を妨げないが、finalize処理自体(ランキング
+計算・ウォッチリスト書き込み)が技術的に失敗した場合(`FINALIZE_FAILED`)は
+その回のローテーションは前進しない(次回同じwindowから再開する)。
+
+**本番検証(2026-08-15)で発覚・修正した不具合**: 上記のローテーション前進
+(`try_commit_rotation_advance`/`_commit_dynamodb`)は、`WatchlistScreeningRotationState`
+テーブルの実際の保存形式(1項目全体を単一の`data`属性(JSON文字列)へ保存する、
+`infrastructure/aws/dynamodb_store.py`の`DynamoDbCollectionStore`方式)と、
+更新処理側が前提としていたスキーマ(`pointer_version`等を項目の
+トップレベル属性として直接更新)が一致しておらず、DynamoDB上では
+`ConditionExpression`が常に`ConditionalCheckFailedException`となり
+**commitが恒久的に失敗していた**(=巡回が一度も前進していなかった)。
+`data`属性全体の一致を条件とする条件付き更新へ修正し、既存の本番state
+(移行不要)のままそのまま前進できるようにした。
+
+あわせて、Dispatcherがほぼ同時に2回起動された場合、両方が同じ未前進の
+cursorを読み同一rotation windowを二重にdispatchできる問題も本番検証で
+確認された(rotation cursorのCASは「cursorの二重前進」は防ぐが「同じ
+windowの二重選択・二重dispatch」自体は防げないため)。これを防ぐため、
+`job_type="NEW_CANDIDATE_SCREENING"`かつ`rotation.enabled=true`の場合のみ、
+候補選択前に専用の軽量lease(`WatchlistRotationDispatchLeaseTable`、
+`infrastructure/aws/watchlist_rotation_dispatch_lease.py`、
+`trade_detection_run_locks`テーブルと同じ単一行・条件付き更新パターン)を
+取得するようにした。取得できなかった場合、Dispatcherは候補選択・SQS投入を
+一切行わず`{"skipped": "rotation_dispatch_in_progress"}`を返し、監査ログへ
+`block_reason=ROTATION_DISPATCH_ALREADY_IN_PROGRESS`として記録する。この
+leaseはバッチが正常/異常いずれの終端状態(COMPLETED/COMPLETED_WITH_
+NOTIFICATION_FAILURE/ABORTED/DISPATCH_FAILED/TIMED_OUT)に至った場合も
+解放されるが、万一解放されなかった場合(Lambda異常終了等)も
+`batch_processing_timeout_hours`(既定24時間)経過で自動的に失効し、次回の
+取得を妨げない。rotation cursorのCAS(前進の排他制御)とこのdispatch lease
+(同一windowの二重評価防止)は別責務であり、どちらか一方を欠かすと不具合が
+再発するため両方を維持している。`WATCHLIST_MAINTENANCE`はこのleaseの対象外
+(候補選択がrotation windowに依存しないため)。
+
+**自動メンテナンス(自動削除)**: `registration_source=AUTO_SCREENING`の
+銘柄のみを対象に再評価し、以下の条件に該当する銘柄を自動でウォッチリスト
+から削除する(手動登録銘柄は対象外)。起動タイミングは2026-08-16改訂で
+「毎週日曜07:00の独立実行」から「同日のNEW_CANDIDATE_SCREENINGの後続処理」
+へ変更した(詳細は次項「起動方式の平日毎日化」参照)。
+
+- **即時削除**: REIT/ETFへの分類変更・債務超過・継続企業の前提への重大な
+  疑義のいずれか1つでも該当すれば1回の再評価で削除する。
+- **3回連続非該当+最低継続期間**: 上記以外の理由による非該当が3回連続し、
+  かつ最初に非該当となってから`minimum_not_qualified_span_days`(既定28日)
+  以上経過した場合にのみ削除する(件数条件・期間条件は独立したAND条件)。
+  2026-08-16の起動方式変更により実行頻度が週1回から平日毎日へ変わった
+  ため、「3回連続」が実質的に意味する期間は従来の約3週間から最短で約3
+  営業日相当へ短縮されている(閾値自体は変更していない。GitHub Issue
+  「自動maintenance削除基準の閾値再評価」で実データ蓄積後の再評価を管理)。
+- **長期確認不能**: データ取得エラー等で`maximum_unconfirmed_days`(既定
+  180日)を超えて再評価できない場合、削除はせず`decision_type=
+  watchlist_auto_removal`のAuditLogとCloudWatch Logsの警告記録に留める。
+
+削除は`decision_type=watchlist_auto_removal`のAuditLogに理由とともに
+記録される(LINE通知は行わない)。削除から`readd_cooldown_days`(既定30日)は
+`WatchlistRemovalHistoryTable`(DynamoDB Native TTLで自動失効)により同一
+銘柄の自動再追加をスキップする。この自動メンテナンスジョブは新規候補
+スクリーニングと同じDispatcher/Worker/SQSキュー/毎時Reconcilerを共用しており
+(SQSメッセージ本文の`job_type`で分岐)、専用のランキング・ウォッチリスト
+書き込み・通知フェーズは持たず、`WatchlistScreeningRotationState`も一切
+変更しない(ローテーションの前進は`job_type=NEW_CANDIDATE_SCREENING`
+専用)。
+
+**起動方式の平日毎日化(2026-08-16改訂・同日再修正)**: NEW_CANDIDATE_SCREENINGの
+スケジュールを毎週土曜07:00から平日(月曜〜金曜)06:00へ変更した
+(`infra/template.yaml`の`WeekdayMorning` ScheduleV2、`cron(0 6 ? * MON-FRI *)`、
+cron自体は日本の祝日を考慮しない。休場日のskipは起動後のhandler側で行う: Issue #440)。これに伴いWATCHLIST_MAINTENANCEの独立した
+定期実行(旧`SundayMaintenanceReview`)は廃止し、同日のNEW_CANDIDATE_SCREENING
+バッチが**信頼できる状態で正常finalizeした場合のみ**、後続処理として
+自動的に起動する方式へ変更した。
+
+トリガーは`maybe_trigger_maintenance(batch_id, batch_item, now, config,
+final_status)`が担い、`_finish_batch()`が`_maybe_commit_rotation()`の直後に
+呼び出す。**再修正(High、2026-08-16)**: 当初は`_finish_batch()`へ到達した
+かどうか(=`mark_watchlist_batch_completed()`が呼ばれたかどうか)のみで
+起動可否を判定しており、`ABORTED`(429率・スコア項目欠損率等の閾値超過による
+安全側の見送り判断)を含む全終端状態でトリガーされ得る不整合があった。
+これはデータ品質が疑わしい状態のまま自動削除判定へ流れてしまう恐れがあった
+ため、`final_status`を明示的な引数として受け取り、`WatchlistBatchStatus.
+COMPLETED`/`COMPLETED_WITH_NOTIFICATION_FAILURE`の2状態のみを起動対象とする
+よう修正した。`final_status`は、`_finish_batch()`側では
+`batch_tracker.resolve_watchlist_batch_completion_status(execution_result,
+notification_permanently_failed)`(`mark_watchlist_batch_completed()`自身が
+使う判定ロジックと同一実装を共有)で、その回の`execution_result`から都度
+計算した値を渡す(finalize処理の途中で取得した古い`batch_item`のstatus
+フィールドは一切参照しない)。`ABORTED`・`DISPATCH_FAILED`・`TIMED_OUT`・
+`FINALIZE_FAILED`のいずれも起動対象外(`DISPATCH_FAILED`/`TIMED_OUT`/
+`FINALIZE_FAILED`は`_finish_batch()`へ構造的に到達しないためそもそも
+呼ばれないが、`maybe_trigger_maintenance()`自体もこれらの`final_status`を
+渡された場合は起動しない防御的なガードを持つ)。個別銘柄の評価エラー
+(`FAILED_REQUIRED`/`FAILED_NO_TARGET_TYPE`/`NOT_FOUND`)は、その回の
+業務finalizeが`COMPLETED`として正常完了する限りトリガーを妨げない。
+
+`maybe_trigger_maintenance()`は`MaintenanceTriggerOutcome`(`TRIGGERED`/
+`NOT_APPLICABLE`/`SKIPPED_LEASE_UNAVAILABLE`/`SKIPPED_LOCAL_EXECUTION`/
+`CONFIGURATION_ERROR`/`INVOKE_FAILED`)を返す。運用監視・GitHub Issue #8の
+観測でこの戻り値を使う。
+
+**重複起動防止(exactly-once相当)**: `BatchRunsTable`の該当バッチ項目へ
+`maintenance_trigger_status`(`NOT_TRIGGERED`→`TRIGGERING`→`TRIGGERED`)・
+`maintenance_batch_id`(`f"watchlist-maint-{親batch_id}"`、決定論的に算出)・
+`maintenance_trigger_lease_expires_at`を持たせ、`batch_tracker.
+try_acquire_maintenance_trigger()`が既存の`try_acquire_dispatch_lease`/
+`try_acquire_rotation_dispatch_lease`と同じ「lease期限切れなら再取得可」
+条件付き更新パターンで起動権利を排他的に取得する(この段階に到達するのは
+`final_status`が起動対象の場合のみで、`ABORTED`等では`maintenance_trigger_
+status`自体が一切書き込まれない)。取得成功後、`boto3` Lambda `invoke()`
+(`InvocationType="Event"`、非同期)で`WatchlistDispatcherFunction`自身を
+`{"job_type": "WATCHLIST_MAINTENANCE", "batch_id": <maintenance_batch_id>,
+"triggered_by_batch_id": <親batch_id>, "trigger_type":
+"POST_NEW_CANDIDATE_SCREENING"}`ペイロードで自己invokeする。invoke成功後は
+`mark_maintenance_triggered()`で`TRIGGERED`へ恒久確定し、以後同じ親バッチ
+から二度と起動されない(戻り値`TRIGGERED`)。invoke自体が失敗した場合は
+`TRIGGERING`のまま(lease期限120秒)残し(戻り値`INVOKE_FAILED`)、毎時
+`WatchlistBatchReconcilerFunction`が`list_stale_maintenance_triggers()`経由で
+lease失効を検知し`maybe_trigger_maintenance()`を再試行する(処理の消失を
+防止)。子バッチ側の`batch_id`が親から決定論的に算出されるため、万一起動
+権利の排他制御をすり抜けて`invoke()`が二重に発生しても、2回目は子バッチ
+自身の`try_acquire_dispatch_lease`で棄却される二重の安全策になっている。
+親バッチ側にも`maintenance_batch_id`・`maintenance_triggered_at`が記録
+されるため、`get_watchlist_batch(親batch_id)`で子バッチへの追跡ができる
+(子バッチ側は`triggered_by_batch_id`/`trigger_type`で親を追跡)。
+
+ローカルCLI実行時は`running_on_lambda()`(`AWS_LAMBDA_FUNCTION_NAME`環境
+変数の有無で判定)が偽になるため、起動権利の取得までは行うが実際の
+Lambda `invoke()`は行わない(戻り値`SKIPPED_LOCAL_EXECUTION`。誤って本番
+Lambdaを起動しない安全策。この場合`TRIGGERED`へは確定せず、`TRIGGERING`の
+まま次回Reconcilerパスの対象になるため、ローカル検証後に本番実行すれば
+正しく起動できる)。
+
+**Reconciler再試行件数の計測(Medium修正、2026-08-16再修正・同日再々修正)**:
+毎時Reconcilerの戻り値`maintenance_trigger_retried`は、`list_stale_
+maintenance_triggers()`で取得した各バッチについて`maybe_trigger_
+maintenance()`を呼んだ回数の単純カウントではなく、その戻り値
+(`MaintenanceTriggerOutcome`)を見て**「実際にLambda invoke()を試行した
+(=`TRIGGERED`/`INVOKE_FAILED`)」ケースのみ**を数える。4つのカウンタの
+意味は以下のとおり(いずれも新規の永続DynamoDBカウンタは追加せず、
+Reconciler実行1回分のin-memory集計のみをログ・戻り値(GitHub Issue #8の
+ロールアウト観測で使用)に残す設計)。
+
+- `maintenance_trigger_retried`: 実際にLambda invoke()を試行した回数
+  (`TRIGGERED`+`INVOKE_FAILED`)
+- `maintenance_trigger_retry_failed`: そのうちinvoke()自体が失敗した回数
+  (`INVOKE_FAILED`のみ)
+- `maintenance_trigger_retry_skipped`: lease競合(`SKIPPED_LEASE_
+  UNAVAILABLE`、他の主体が先にleaseを再取得済み)・`NOT_APPLICABLE`等で
+  invoke()を試行しなかった回数
+- `maintenance_trigger_retry_configuration_error`: leaseの再取得には
+  成功したが、起動先関数名の環境変数(`WATCHLIST_DISPATCHER_FUNCTION_
+  NAME`)未設定等の設定不備によりLambda invoke()呼び出し自体に到達しな
+  かった回数(`CONFIGURATION_ERROR`)
+
+**再々修正(2026-08-16)**: 当初`CONFIGURATION_ERROR`も`maintenance_trigger_
+retried`(および`retry_failed`)へ含めていたが、`CONFIGURATION_ERROR`は
+invoke()呼び出し前に終了するケースであり、「実際にinvoke()を試行した
+件数」という`retried`の定義と矛盾していたため、専用カウンタ
+(`maintenance_trigger_retry_configuration_error`)へ分離した。
+
+**スクリーニング高速化(計測のみ、2026-08-15追加)**: `WatchlistCandidateProgressTable`の
+各行へ`data_fetch_duration_ms`/`scoring_duration_ms`(データ取得・判定計算の
+所要時間)を記録するようになり、`record_batch_audit`のfinalize集計へ
+p50/p95・平均値が追加された。判定に必要な最小限の項目のみ取得する軽量版
+Provider(`LightweightScreeningDataProvider`)も実装済みだが、
+`config/watchlist_screening_rules.yaml`の`screening_data_provider`の本番既定値は
+引き続き`stock_snapshot`のまま(`lightweight`への切替は同値性検証後に別途判断)。
+
+### 4.1.2 市場休場日のskip(2026-09-19追加・Issue #440)
+
+EventBridgeのcronは月〜金で固定であり、祝日・国民の休日を考慮しない。東証(JPX)の休場日
+(判定は`BusinessCalendar.is_business_day`と同一。土日・祝日・国民の休日・
+`config/holiday_calendar.json`の臨時休業)には、**市場依存の3 entryのみ**が
+起動直後に何も行わず正常終了する(`lambda_handlers/_market_holiday.py`)。
+
+| entry | 休場日の返却値 |
+|---|---|
+| BuyCandidates親(平日08:00) | `{"dispatched": 0, "skipped": "MARKET_CLOSED"}` |
+| HoldingsWatchlist親(平日08:00) | `{"dispatched_holdings": 0, "skipped": "MARKET_CLOSED"}` |
+| WatchlistDispatcher `NEW_CANDIDATE_SCREENING`(平日06:00) | `{"skipped": "MARKET_CLOSED"}` |
+
+- **止めないもの**: 適時開示・評価・週次/月次/四半期・recovery(`FINALIZE_ONLY`等)・child・
+  worker・reconciler・`WATCHLIST_MAINTENANCE`(今回はscope外)。
+- **skipの位置**: eventとmodeのvalidationの後、最初の状態変更(売買検知・batch行・lease・SQS・
+  fan-out・保有集中通知)の前。不正なeventは休場日でも従来どおりエラーになる(休場日で隠さない)。
+- **ログ**: skip時にINFOを1件(`event=MARKET_CLOSED_SKIP handler=... business_date_jst=... execution_mode=...`)。
+  PIIを含まない。CloudWatchで`MARKET_CLOSED_SKIP`を検索すると、いつ・どのentryがskipしたか確認できる。
+  「起動したが何も起きていない」のは異常ではなく、この行があれば休場日のskipである。
+- **VALIDATIONのbypass**: `execution_mode=VALIDATION`かつ`allow_market_closed=true`のときだけ
+  休場日でも実行できる(使用時は`MARKET_CLOSED_BYPASS`を記録)。NORMALでtrue・真偽値以外はエラー。
+- **★ WatchlistDispatcherは検証モードを持たない**(`execution_mode`を拒否する)ため、`allow_market_closed=true`は
+  常にエラーとなり、**休場日に手動起動(例: S3キャッシュ更新目的)してもskipされる**。
+  休場日に実行が必要な場合は、営業日まで待つか、別途Issueで対応を判断する。
+- **連休明け**: 次の営業日は通常どおり起動する。連休中の売買は、前回保存した保有スナップショットとの
+  差分として、その営業日に検知される(日数の連続性に依存しない。テストで確認済み)。
+- **ロールバック**: 追加は返却値の`skipped`とログのみで、保存データ形式は変えていない。
+  旧版へ戻すと休場日にも従来どおり起動する(直前営業日の値で判定・通知が出る従来の挙動)。
+
+---
+
+## 5. 週次・月次・四半期レビュー
+
+**2026-08 振り返り機能改修**: 従来の週次・月次の全期間合算成績レポート自動送信、
+四半期の固定リマインド送信は廃止した。詳細はdocs/functional_spec.md 12.4節参照。
+
+| 頻度 | schedule.yamlのジョブ | 対応Lambda関数 | 挙動 |
+|---|---|---|---|
+| 週次(月19:00) | `weekly_review` | `WeeklyReviewFunction` | 前週(月〜日 JST)に確定した7暦日評価を分析し、改善候補を検出。GitHub Issue作成成功時のみLINE通知(5.1節) |
+| 月次(第1土10:00) | `monthly_review` | `MonthlyReviewFunction` | 内部記録(ログ)のみ。LINE送信なし |
+| 四半期(1,4,7,10月第1土11:00) | `quarterly_logic_review` | `QuarterlyReviewFunction` | 内部記録(ログ)のみ。LINE送信なし |
+
+全期間合算の成績を手動で確認したい場合は、引き続き
+`jstock review report --notify`(LINE送信)または`jstock review report`
+(標準出力のみ)を使う。必要に応じ`jstock performance summary --horizon <N>`で
+特定ホライズンのみ確認できる。
+
+ローカルCLIには「当月第1土曜日か」を判定する処理はありません。AWS Lambda版
+(`MonthlyReviewFunction`/`QuarterlyReviewFunction`)は毎週土曜に起動したうえで、
+`lambda_handlers/_scheduling.py`が当月第1土曜日かどうかを内部判定し、
+戻り値(`is_monthly_review_day`/`is_quarterly_review_day`)に含めるが、
+いずれの場合もLINE送信は行わない。`QuarterlyReviewFunction`はルール改善提案
+(リスク影響・過学習リスク評価等の自由記述を要する)を自動生成しない
+(要求仕様45節の人間承認必須の原則のため)。実際の`rules backtest`/
+`rules propose`は利用者が手動で実行すること(第7節参照)。
+
+### 5.0 定点評価の監視とbacklog回復(Issue #113、2026-08-31追加)
+
+#### run summaryの読み方
+
+`EvaluationFunction`は実行のたびにCloudWatch Logsへ次の1行を出力する
+(**予算切れで途中終了した場合も必ず出力される**)。
+
+```
+evaluation_handler done: evaluated=N (business=N calendar=N) skipped=N
+  due_horizons=N already_evaluated=N pending_horizons=N pending_recommendations=N
+  backlog_remaining=N budget_exhausted=<bool> recommendations_scanned=N
+  missing=N provider_calls=N duration_ms=N
+```
+
+| 項目 | 意味 |
+|---|---|
+| `due_horizons` | 評価日が到来している(recommendation, horizon)の組の総数 |
+| `already_evaluated` | そのうち既に評価済みの数 |
+| `pending_horizons` | 未処理の数(= `due_horizons - already_evaluated`) |
+| `backlog_remaining` | **この実行の後に残った未処理数**。0でなければ回復途中 |
+| `budget_exhausted` | 残時間が尽きて自主的に切り上げたか |
+| `provider_calls` | 外部株価APIへ実際に到達した回数(runスコープのキャッシュ後) |
+
+**監視の要点**: `backlog_remaining`が**実行を重ねても減らない/増える**場合は、
+1回あたりの処理能力が新規流入(推奨の増加ペース)を下回っている。
+この場合はTimeout・providerレイテンシ・pending件数を確認すること。
+
+途中経過は `evaluation scan done:` と `evaluation progress:`(500件ごと)で
+追跡できる。以前は`START`〜`REPORT`の間にアプリケーションログが1行も出ず、
+どこまで進んだか追跡できなかった。
+
+#### CloudWatch Alarm
+
+| Alarm | 条件 |
+|---|---|
+| `<stack>-evaluation-errors` | `Errors >= 1`(**Lambdaのタイムアウトもここに計上される**) |
+| `<stack>-evaluation-duration` | `Duration >= 720,000ms`(Timeout 900秒の80%) |
+
+★ **2026-09-24更新(Issue #504)**: 上記2本を含むLambda 12本すべてに`AlarmActions`(SNS Topic
+`IncidentNotificationTopic`経由でLINEへ通知)が接続された。「通知先は設定していない」は
+2026-09-23時点までの記述であり、現在は誤り。**最新の状態は29節・#132の最新の記録を読むこと**
+(この節へ焼き込まない)。
+
+#### run summaryの監査ログへの記録(Issue #114 Phase B1、2026-09-02追加)
+
+上記のrun summaryは、CloudWatch Logsに加えて**監査ログへも保存される**。
+
+```
+保存先        jstock-audit_log
+decision_type evaluation_run_summary
+audit_id      evaluation_run_summary:<run開始時刻のISO8601>
+```
+
+CloudWatch Logsは検索が手間で保持期間の制約もあるため、
+「いつの実行で、backlogがどこまで減ったか」を後から永続データとして
+追跡できるようにしたもの。記録内容は上表のrun summary全項目に加え、
+`run_started_at` / `run_completed_at` / `run_status`
+(`COMPLETED` または `BUDGET_EXHAUSTED`)。
+
+**保証範囲(重要)**
+
+| 実行の終わり方 | 監査ログへの記録 |
+|---|---|
+| 正常完了 | される |
+| 時間予算による自主終了 | される(`run_status=BUDGET_EXHAUSTED`) |
+| **メモリ不足(OOM)・タイムアウト** | **されない場合がある** |
+
+OOM・タイムアウトではLambdaのプロセスが強制終了され、記録処理まで到達できない。
+**この検知は上記のCloudWatch Alarm(`<stack>-evaluation-errors`)の役割**である
+(OOMもタイムアウトも`Errors`に計上される)。したがって
+「監査ログに記録が無い」ことをもって「backlogが無い」と解釈してはならない。
+
+**監査ログへの保存に失敗した場合**
+
+評価そのもの(EvaluationResultの保存)は既に成功しているため、
+**保存失敗でLambdaを失敗させない**(失敗させると自動リトライで
+評価処理全体が不要に再実行されるため)。失敗時は次のように表れる。
+
+```
+ERRORログ         event=evaluation_run_summary_persist_failed ...
+Lambdaの戻り値    "audit_persisted": false
+```
+
+`audit_persisted` が `false` の実行は、評価結果自体は正常だが
+監査記録だけが欠けている状態である。
+
+Lambdaが自動リトライした場合、各リトライは`run_started_at`が異なるため
+**それぞれ別の実行として記録される**(最後の試行の状態を見ること)。
+
+#### backlog回復期間中の注意
+
+未処理分は**古い推奨から順に消化される**。評価値は基準日の株価から計算されるため
+遅れて処理しても結果は変わらないが、**週次改善レビュー(5.1節)は
+「前週に結果が確定した分」を集計する**ため、回復期間中はその週の集計件数が
+一時的に大きく膨らむ。**回復期間中の週次レビュー結果を、通常の週と同じ意味で
+比較しないこと**(`docs/functional_spec.md` 12.4節参照)。
+
+### 5.1 GitHub Issue自動起票の設定(振り返り機能改修、2026-08追加)
+
+週次改善レビュー(`WeeklyReviewFunction`)は、改善候補が十分な証拠とともに
+検出された場合にGitHub Issueを自動作成する。この機能を有効化するには、
+以下の手順が必要(**GitHub App本体の作成・インストールは本システムが
+代行できないため、必ず利用者自身がGitHub UI上で行うこと**)。
+
+1. GitHub Developer Settingsで新しいGitHub Appを作成する。権限は最小限
+   (`Repository permissions > Issues: Read and write`、
+   `Repository permissions > Metadata: Read-only`)のみ付与する
+   (`Contents`等の書き込み権限は不要。本機能はコードを書き換えない)。
+2. 対象リポジトリへこのGitHub Appをインストールする(Installation IDが
+   発行される)。
+3. GitHub Appの秘密鍵(.pemファイル)を生成・ダウンロードする。
+4. AWS Secrets Managerへ、以下のJSON形式でシークレットを作成する
+   (キー名は固定):
+   ```bash
+   aws secretsmanager create-secret \
+     --name jstock/github-app \
+     --secret-string '{"app_id":"<App ID>","installation_id":"<Installation ID>","private_key":"<.pemファイルの中身をそのまま>"}'
+   ```
+5. 作成したシークレットのARNを`infra/samconfig.toml`の
+   `parameter_overrides`へ`GithubAppSecretArn="<ARN>"`として追加し、
+   対象リポジトリ("owner/repo"形式)を`GithubRepository="<owner>/<repo>"`
+   として追加する。
+6. `config/review_improvement.yaml`の`issue_creation_enabled`を`false`から
+   `true`へ変更する。
+7. `sam build && sam deploy`で再デプロイする(Productionへ反映するbuildなので、36.3の5に従い
+   `sam build --use-container`で行う。**重要**:
+   `config/review_improvement.yaml`はLambda Layer経由で配布される静的設定
+   ファイルであり、YAML編集だけでは反映されない。必ず再デプロイが必要)。
+
+上記1〜7が完了するまでの間は、`issue_creation_enabled=false`のままで安全に
+運用できる(GitHub API・Secrets Managerへは一切アクセスせず、改善候補の検出・
+内部記録のみ継続する。エラー扱いにも運用エラー通知にもならない)。
+
+**動作確認・トラブルシューティング**: 改善候補・Issue対応状況はDynamoDBへ
+直接記録される(CLIは今回未整備)。
+```bash
+# その週に検出された改善候補一覧
+aws dynamodb scan --table-name jstock-improvement_candidates
+
+# candidate_key単位のGitHub Issue対応状況(status: CANDIDATE/
+# SKIPPED_NOT_CONFIGURED/CONFIGURATION_ERROR/ISSUE_CREATING/ISSUE_CREATED/
+# ISSUE_CREATION_FAILED)
+aws dynamodb scan --table-name jstock-improvement_tasks
+
+# 週次の実績集計(Candidateの有無に関わらず毎週保存される)
+aws dynamodb scan --table-name jstock-weekly_review_metrics
+```
+`status=CONFIGURATION_ERROR`が継続する場合、Secrets Managerの値
+(app_id/installation_id/private_keyの3項目すべて)・GitHub App権限
+(Issues: Read and write)・`GithubRepository`パラメータの"owner/repo"形式を
+確認すること。`status=ISSUE_CREATION_FAILED`はGitHub API側の一時的な障害
+(5xx・タイムアウト・レート制限等)の可能性が高く、翌週の週次レビューで
+自動的に再試行される。
+
+### 5.2 判定精度向上機能・自己評価基盤(Phase A)の運用(2026-08追加)
+
+買い候補・売却・保有判断・利益確定の各判定が確定するたびに、その時点の
+最終判断値をDecisionSnapshotとして自動記録する(詳細はdocs/functional_spec.md
+12.5節参照)。運用者が個別に設定・起動する必要はなく、既存の
+`BuyCandidatesFunction`/`HoldingsWatchlistFunction`(またはローカル実行時は
+`jstock analyze buy-candidates`等)の実行に付随して自動的に動作する。
+
+**記録された判断の成績確認**:
+```bash
+# 記録済み全DecisionSnapshotの成績(件数・成功率・平均/中央値リターン・平均MFE/MAE)
+jstock decision-performance summary
+
+# 特定ホライズン(営業日数)のみに絞り込む場合
+jstock decision-performance summary --horizon 60
+```
+本コマンドが集計する対象は、既存の振り返り機能(12.1節)が既に算出済みの
+EvaluationResultのうち、`config/decision_evaluation.yaml`の
+`horizons_business_days`(既定5・20・60・120・250営業日)に含まれる行のみ。
+専用の振り返り処理を別途動かすものではないため、本コマンドを実行しても
+新たな株価取得・LINE通知は発生しない。
+
+**スコア別の詳細分析(2026-08追加、functional_spec.md 12.10節)**:
+```bash
+# 過去バリュエーション比較スコアをカテゴリ・信頼度・カバレッジ・
+# model_version別に分析(--horizonは必須)
+jstock decision-performance segments --score historical_valuation --horizon 60
+
+# 2つのスコア範囲グループの成績を比較(範囲が重複する場合はエラー終了)
+jstock decision-performance compare --score timing \
+  --label-a "TAILWIND寄り" --min-a 20 \
+  --label-b "HEADWIND寄り" --max-b -20 --horizon 60
+```
+`--score`には`historical_valuation`/`timing`/`earnings_surprise`/
+`earnings_trend`/`market`/`sector`/`environment`のいずれかを指定する。
+分析は各DecisionSnapshotに保存された「判定当時に実際に使用した設定値」
+のみを使い、現在の設定・現在のカテゴリ定義では再解釈しない。
+
+```bash
+# 市場全体の地合いスコアをカテゴリ・信頼度・カバレッジ・model_version別に分析
+jstock decision-performance segments --score market --horizon 60
+
+# 所属セクターの地合いスコア(functional_spec.md 12.12節)。sector_etf_mapに
+# 対応が無い業種(NOT_APPLICABLE)・データ不足で今回は算出できなかった業種
+# (NOT_EVALUATED)はいずれも自動的に対象dimensionから除外される
+jstock decision-performance segments --score sector --horizon 60
+
+# 市場+セクターを統合したEnvironment Composite Score
+jstock decision-performance segments --score environment --horizon 60
+```
+`environment`スコアも独自のcoverage閾値(`min_coverage_required`/
+`coverage_high_threshold`/`coverage_medium_threshold`)を持つため
+(コードレビュー対応、2026-08)、`segments --score environment`の
+coverage tier別分析が実際に機能する。本番運用では`sector_etf_map`が
+未整備のため所属セクターのスコアは全銘柄でNOT_APPLICABLEとなり、
+Environment Compositeは実質的にMarketのみのcoverageで判定され続ける
+点に留意すること(functional_spec.md 12.12節「既知の制約」参照)。
+
+**保存失敗時の確認方法**: DecisionSnapshotの保存に失敗した場合、
+CloudWatch Logsに固定イベントキー`decision_snapshot_save_failed`
+(`stock_code`/`recommendation_id`/`decision_type`付き)でWARNINGログが
+記録される(`BuyCandidatesFunction`/`HoldingsWatchlistFunction`のロググループを
+このキーで検索・メトリクスフィルタ可能)。
+
+**記録の不変性(2026-08再レビュー対応)**: DecisionSnapshotは一度保存されたら
+後から絶対に上書きされない(insert-only)。同じ判定の保存処理が偶然もう一度
+走った場合、記録内容が完全に同一であれば何もしない(正常な冪等再実行)。
+万一、同じ判定のはずなのに記録内容が食い違う異常なケース(想定される原因は
+ほぼ無いが、不正なデータ操作等)を検知した場合、既存の記録をそのまま保持し
+(新しい値では上書きしない)、CloudWatch Logsに固定イベントキー
+`decision_snapshot_conflict`(`stock_code`/`recommendation_id`/`decision_id`/
+`decision_type`付き)でWARNINGログを残す。`decision_snapshot_save_failed`
+(ストレージ障害等の予期しない失敗)とは原因が異なるため、イベントキーを
+分けて検索できるようにしてある。いずれの場合も既存の買い候補判定・売却判定・
+保有判断・利益確定判定やLINE通知には一切影響しない。
+
+**成績集計側の異常データ検知**: `jstock decision-performance summary`の集計対象は
+「1件の判定につきDecisionSnapshotは常に1件」を前提としている。万一この前提に
+反するデータが混入した場合、集計結果が不安定にならないよう該当の判定は集計から
+除外され、CloudWatch Logsに固定イベントキー`decision_performance_duplicate_snapshot`
+(`recommendation_id`付き)でWARNINGログが残る。
+
+**既存機能への影響について**: 本機能はShadow計測基盤であり、
+(1) LINE通知の内容・頻度には一切変更がなく通知件数も増えない、
+(2) DecisionSnapshotの保存に失敗しても、買い候補判定・売却判定・
+保有判断・利益確定判定やLINE通知の送信は一切ブロックされない
+(失敗は上記CloudWatchログにのみ記録される)。
+
+---
+
+## 6. 実売買記録(随時)
+
+推奨に基づいて実際に売買した場合、または見送った場合に記録します
+(この記録は保有銘柄の自動更新とは独立しています。保有銘柄自体は引き続き
+`jstock holdings add` 等で別途更新してください)。
+
+```bash
+jstock transactions buy-executed 2914 100 3400 --recommendation-id <推奨ID>
+jstock transactions sell-executed 2914 50 4600 --recommendation-id <推奨ID>
+jstock transactions skip-recommendation <推奨ID> --reason WAITED_FOR_EARNINGS
+jstock transactions list
+```
+
+**買付余力(available cash)と連動した登録(2026-09-26追加、Issue #619)**:
+上記`buy-executed`/`sell-executed`はTransactionのみを記録し、保有銘柄データ・
+買付余力(3.5節)は一切更新しません(`holdings add`等で別途更新が必要)。
+Holding/Transaction/AvailableCashを1回の登録操作として整合させたい場合は、
+代わりに次のコマンドを使用してください。
+
+```bash
+jstock transactions register-buy 2914 100 3400 --idempotency-key <一意な文字列>
+jstock transactions register-sell 2914 50 4600 --idempotency-key <一意な文字列>
+```
+
+`--idempotency-key`を省略すると毎回新規登録として扱われます(非冪等)。
+指定した場合、**所有者・銘柄・株数・単価・約定日・買付/売却の区分が完全に
+一致する再実行のみ**二重登録されません(スクリプト等からの再試行を安全に
+するため)。同じキーをこれらのいずれかが異なる別の取引へ使い回した場合は、
+その取引を黙って無視するのではなく、明示的なエラー(exit code 1)で
+拒否します(2026-09-26改訂、Issue #619サブちゃんレビュー対応。当初は
+この取り違えを検出できず、対象の取引が記録されないまま「既に登録済み
+です」と表示されてしまう欠陥があったため、fail-closedへ修正した。所有者
+違いの取り違え検出は同日追加のF6対応)。
+**したがって、複数の取引で同じ`--idempotency-key`を使い回さないこと**
+(取引ごとに一意な値を指定するか、省略して都度新規登録として扱うこと)。
+買付余力が未登録・不足している場合は明示的に拒否され、Holding/
+Transaction/AvailableCashのいずれも書き込まれません。これら2コマンドは
+既存の`buy-executed`/`sell-executed`/`holdings add`とは独立した経路で
+あり、互いに影響しません(既存コマンドの挙動は変更していません)。
+
+### 6.1 (廃止)LINEチャットのCSVコマンドからの登録
+
+**この登録方式(「買付,銘柄コード,株数,単価」「売却,銘柄コード,株数,単価」
+「ウォッチ,銘柄コード」のCSVテキスト送信)は2026-08-29に廃止しました
+(Issue #24)。** 現在、これらのテキストを送信しても登録は一切行われず、
+メニュー操作を案内する返信のみが返ります。LINEからの売買記録・ウォッチリスト
+登録は6.2節のメニューボタン(会話型UI)が正式かつ唯一の経路です。
+推奨IDとの紐付けや手数料・税額・メモ等の詳細な記録が必要な場合は、従来どおり
+CLI(`transactions buy-executed`/`sell-executed`等、6節冒頭)を使用してください。
+
+(廃止理由の要点: リッチメニュー導入後は利用実態が無く、確認画面なしの即時
+書き込み・売買記録と保有銘柄データの非原子的な2段階書き込み・保守停止
+(TradingPause)の対象外・所有者が既定owner固定・ウォッチ登録時に既存設定を
+既定値で上書きする等、会話型UIに対して安全性が劣る経路だったため。)
+
+### 6.2 LINEメニューボタンからの登録(会話型UI、2026-08追加)
+
+LINEトーク画面下部のリッチメニューから「📈 買った」「📉 売った」
+「⭐ お気に入り登録」を選び、画面の案内(入力→確認→登録する/やり直す/
+キャンセル)に従って記録する。**LINEからの登録経路は本方式のみ**(6.1の
+CSVコマンドは廃止済み)。利用者向けの操作方法は機能仕様書10.4節を参照。
+運用担当者が把握しておくべき点は以下のとおり。
+
+- **内部設計**: 対話の一時状態(入力待ち・確認待ち)は`conversation_states`
+  DynamoDBテーブルで管理し、TTL(20分)経過後はDynamoDB Native TTLによる
+  物理削除を待たず、アプリケーション側の判定(`infrastructure/aws/
+  conversation_state_store.py`)で即座に「対話なし」として扱う。
+- **「登録する」実行時の書き込み**は、売買記録・保有銘柄データ更新(または
+  ウォッチリスト登録)・対話状態の消費を、DynamoDB `TransactWriteItems`に
+  よる単一の原子的操作として実行する(`infrastructure/aws/
+  conversation_commit.py`)。既存Holdings/PurchaseLotsの更新・削除には
+  楽観ロック(計画構築時点のデータと一致することを条件とする)を必須で
+  付与しており、確認画面表示後に保有状況が(CLI等の別経路で)変化していた
+  場合は登録自体が失敗し、利用者へ「もう一度操作してください」と案内する。
+- **クラッシュ発生時の確認手順**: 「登録が完了しました」というLINE返信が
+  届かず、実際に登録されたか不明な場合は、`jstock transactions list` または
+  DynamoDBの`transactions`テーブルを、対話開始時に発行された`operation_id`
+  (= `transaction_id`として使われる)で検索することで、実際に登録済みか
+  どうかを確認できる。登録済みであれば同じ内容の再送信・再操作は不要。
+- **既知の制約**: 本方式自体の二重登録防止は上記の原子的操作で保証される
+  が、本方式とCLIが「ほぼ同時に同一銘柄」を操作した場合の完全な相互排他は
+  対象外(9節参照)。
+- **買付余力(available cash)の棚卸し(2026-09-26追加、Issue #592)**:
+  同じ会話状態機械・原子コミット基盤を再利用し、`action=
+  start_available_cash_reconcile`のpostbackから、所有者選択(既存所有者は
+  ボタン、未登録の新規所有者は自由テキスト入力も可)→現在値表示→新しい
+  金額入力→確認→登録、という流れで操作する(利用者向けの操作方法は機能
+  仕様書10.6節を参照。CLI版は3.5節)。**リッチメニューへのボタン追加自体
+  (A5b/#593)・AvailableCashTable/IAM配線(A6a/#595)はいずれも本Issueの
+  scope外**であり、本Issueの時点ではpostback自体は実装済みでも、
+  (1)リッチメニュー上に到達手段が無い(postbackを直接送信しない限り、
+  利用者は本機能へ到達できない)、(2)AvailableCashTable自体がまだ
+  Productionに存在しない(#595のChangeSet CREATE/EXECUTEが別途必要)、
+  の2点により実際には動作しない。#593(ボタン)・#595(table/IAM)の両方が
+  Productionへ反映されるまで、実質的にShadow実装の状態にある。
+
+#### リッチメニューの登録手順(初回セットアップ・変更時のみ、人間が実行)
+
+リッチメニューの作成・画像アップロードは`infra/line_rich_menu/
+register_rich_menu.py`で行う(このスクリプトはLambda/CIからは呼ばれない、
+人間が手元で実行する運用スクリプト)。定義は`infra/line_rich_menu/
+rich_menu.json`にリポジトリ管理されている。**Issue #593(2026-09-26)で
+2500×1686px・2行×4列の均等grid(各セル625×843)へ更新済み**(USER確定
+レイアウト、issuecomment-5842895208)のため、画像ファイルもこの構成
+(上段: 買った/売った/お気に入り登録/余力管理、下段: 保有銘柄/
+ウォッチリスト/対象確認/銘柄分析)に合わせて別途用意すること。
+「余力管理」に対応するLINE会話ロジック自体はIssue #592で別途実装する
+(本Issueのscope外)。
+
+```bash
+# 1. 環境変数にチャネルアクセストークンを設定する(Secrets Managerの値をコピー)
+export LINE_CHANNEL_ACCESS_TOKEN=<チャネルアクセストークン>
+
+# 2. リッチメニューを作成し、画像をアップロードする(デフォルト設定はまだ行わない)
+python infra/line_rich_menu/register_rich_menu.py --image /path/to/menu.png
+
+# 3. 出力された「現在のデフォルトリッチメニュー」を確認し、
+#    既存の別用途リッチメニューを上書きしても問題ないことを確認してから、
+#    出力されたrichMenuIdを指定してデフォルトに設定する
+python infra/line_rich_menu/register_rich_menu.py --rich-menu-id <richMenuId> --set-default
+```
+
+デフォルト設定(手順3)は既存のリッチメニュー設定を上書きする可能性があるため、
+必ず手順2の出力を確認してから実行すること。**アプリケーションコード
+(Lambda)のデプロイと、このリッチメニュー登録手順は完全に独立している**。
+コードをデプロイしただけではLINEトーク画面のメニュー表示は変わらず、
+本手順を別途手動で実行して初めて利用者の画面に反映される。
+
+**「💰 余力管理」ボタンを含む本レイアウトをset-default(手順3)する前提**:
+`action=start_available_cash_reconcile`(#592)を実際に処理できる
+LineWebhookFunctionと、AvailableCashTable/IAM配線(#595)の両方が
+Productionへ反映済みであること。いずれかが未反映のままset-defaultすると、
+このボタンをタップした利用者に対して「認識できない操作です」という
+案内が返るか、以下いずれかの例外でLambdaが停止する(既存7ボタンの
+動作には影響しない)。
+
+```
+#592未反映(LineWebhookFunctionが新actionを処理できない)
+  → 「認識できない操作です」の案内(_UNKNOWN_POSTBACK、正常応答)
+#595未反映かつtable自体が存在しない
+  → ResourceNotFoundException
+#595未反映(tableは存在するがIAM権限が無い)
+  → AccessDeniedException
+```
+
+いずれの場合も原因の切り分けに使えるが、「両方がProductionへ反映済みで
+なければset-defaultしない」という運用上の結論は変わらない。
+
+### 6.3 保有銘柄・ウォッチリスト・対象確認(参照専用、Phase 2-A・2026-08追加)
+
+利用者向けの操作方法は機能仕様書10.5節を参照。運用担当者が把握しておくべき
+点は以下のとおり。
+
+- **読み取り専用**: `HoldingsViewService`/`WatchlistViewService`/
+  `BuyCandidateTargetViewService`(いずれも`src/jstock_advisor/services/`
+  配下)は、Holding・PurchaseLot・WatchlistItem・BuyCandidateEvaluationRecord
+  等の正データへの書き込みメソッドを一切持たない設計。
+- **最新完了batchポインタ**: 「対象確認」「ウォッチリスト」の直近購入判定
+  参照は、`BuyCandidateBatchCompletionTable`(単一行)が指す直近の
+  「通常運用(NORMAL)で完了し、かつ全対象銘柄の内部記録(12.14節相当、
+  `BuyCandidateEvaluationRecordsTable`)保存が確認できたbatch」のみを見る。
+  検証モード(VALIDATION/DRY_RUN)実行時や、一部銘柄の内部記録保存に失敗した
+  場合はこのポインタを更新しない(直前の正常完了分がそのまま参照され
+  続ける)。更新されなかった場合は`buy-candidates` LambdaのCloudWatch Logs
+  へERRORログ(`evaluation record save incomplete, latest batch pointer NOT
+  updated`)が出力されるため、これが頻発する場合は`buy_candidate_evaluation_
+  records`テーブルへの書き込み失敗の原因を調査すること。
+- **GSI(`batch_id-index`)反映待ちの表示**: `BuyCandidateEvaluationRecordsTable`
+  のGSIは結果整合性のみのため、直近batch完了直後の数秒間、対象確認・
+  ウォッチリストの参照が「直近の分析結果を反映中です。少し時間をおいて
+  再度お試しください。」と表示することがある(1回の短い自動再試行後も
+  件数が一致しない場合のみ)。異常ではなく、少し待って再操作すれば解消する。
+- **IAM**: `LineWebhookFunction`に`BuyCandidateEvaluationRecordsTable`・
+  `BuyCandidateBatchCompletionTable`への読み取り専用アクセスを追加した
+  (11節のGSI追加時の注意もあわせて参照)。
+
+---
+
+## 7. ルール改善承認フロー(四半期レビュー等で発生)
+
+改善提案から実際の設定反映までは、必ず以下の順序で人間の承認を経ます。
+**どの段階でも自動適用は行われません。**
+
+```bash
+# 1. 感応度分析(対応: screening.total_yield.min_total_yield_pct のみ。現行値→提案値の方向は「厳しくする」向きのみ対応)
+jstock rules backtest screening.total_yield.min_total_yield_pct 3.5 4.0
+
+# 2. 改善提案の作成(評価件数が閾値未満だとエラーになります: 閾値変更60件/それ以外30件)
+jstock rules propose screening.total_yield.min_total_yield_pct 3.5 4.0 \
+  --reason "..." --risk-impact "..." --overfitting-risk "..." --rollback-condition "..."
+
+# 3. 提案の承認申請・承認(人間の判断)
+jstock rules submit-proposal <proposal_id>
+jstock rules approve-proposal <proposal_id>
+
+# 4. 新ルールバージョンの作成・承認・有効化(人間の判断)
+jstock rules create-version v2-mvp --description "..." --reason "..." --previous-version v1-mvp
+jstock rules submit-version v2-mvp
+jstock rules approve-version v2-mvp --approved-by <承認者名>
+jstock rules activate-version v2-mvp
+
+# 5. ★config/*.yamlへの実際の値の反映は自動化されていません。手動で編集してください
+#    (例: screening_rules.yaml の min_total_yield_pct を 4.0 に変更)
+```
+
+---
+
+## 8. 監査ログ・振り返り
+
+```bash
+jstock audit show <銘柄コード>                 # 判定の入力値・計算式・出力値・出典を確認
+jstock evaluation list --recommendation-id <推奨ID>  # 定点評価結果の確認(暦日7日評価も同コマンドで確認できる)
+jstock feedback add --recommendation-id <推奨ID> --satisfaction-score 4
+```
+
+週次改善レビュー(5.1節)は`decision_type=weekly_improvement_review`として
+AuditLogへ毎週1件記録される(対象件数・joinできた件数・
+`weekly_review_recommendation_missing_count`等の欠損件数・検出したCandidate数・
+GitHub連携の結果内訳を含む)。`jstock audit show`は銘柄コード単位の検索のため、
+週次レビューの監査ログはDynamoDB(`jstock-audit_log`テーブル)を
+`decision_type`でフィルタするか、直接スキャンして確認すること。
+
+---
+
+## 9. 既知の制約事項
+
+| 項目 | 制約 |
+|---|---|
+| 適時開示(決算短信) | TDnet専用のためEDINETからは取得不可。取得できるのはEDINET臨時報告書(代表者異動・特定子会社異動・財務コベナンツ等)のみ |
+| 適時開示チェックの対象範囲 | 保有銘柄のみが対象(ウォッチリストは対象外)。EDINET臨時報告書のみで、TDnet速報自体は取得不可 |
+| 株主優待 | 自動取得不可。必ず手動/CSV登録が必要 |
+| バックテスト | `screening.total_yield.min_total_yield_pct`のみ対応。それ以外のターゲットは「データ不足」扱い。かつ閾値を緩める方向は生存バイアスにより検証不可 |
+| 定点評価のtotal_return | 配当・優待込みの正確な総合リターンは未算出(株価ベースのリターンのみ) |
+| EvaluationLabelの自動付与 | LATE / PROFIT_TAKE_TOO_LATE は自動付与されない(推奨前の価格推移データを保持していないため) |
+| `--source real`時の全銘柄スキャン | `analyze buy-candidates --source real` は対象銘柄コードの指定が必須(mock時のみ全銘柄自動) |
+| 月次・四半期の「第1土曜日」判定 | CLI側では未実装(Lambda版は`_scheduling.py`で判定)。CLIで手動実行する場合は実行タイミングを利用者が判断 |
+| `BuyCandidatesFunction`のスキャン対象 | 全上場銘柄の自動スクリーニングではなく、ウォッチリスト登録銘柄のみを対象とする(市場全体をスキャンする実データ取得元が未接続のため) |
+| `QuarterlyReviewFunction` | ルール改善提案の自動生成は行わない(人間承認が必須な自由記述項目があるため)。レビュー時期のLINEリマインドのみ |
+| LINEチャットのCSVコマンド登録(6.1節) | **廃止済み(2026-08-29、Issue #24)**。送信しても登録されずメニュー操作の案内のみ返る |
+| LINEメニューボタン登録(会話型UI、6.2節) | 推奨ID・手数料・税額・メモ等は指定不可(最小限の項目のみ。詳細な記録はCLIを使用)。本方式自体の二重登録は防止しているが、本方式とCLIとの間の「ほぼ同時操作」に対する完全な相互排他は未対応(必要であれば別途PortfolioService全体の楽観ロック化を検討) |
+| 決算発表の実施確認(2026-08-06追加、2026-08-07改訂×3) | 無償データ(yfinance)のみを利用しており、TDnet等の有償APIは導入していないため、決算が実際に発表されたかどうかをシステムが自動で確定することはできない(常にUNCONFIRMED相当)。内部区分`EarningsDateStatus.CONFIRMED`は「取得できた決算予定日が過去日ではない」という意味であり、「発表が確認された」という意味ではない。財務データの更新有無から間接的に推定するのみで、その際`FinancialSummary.fiscal_period_end`は年次決算の期末日を表す(直近四半期の期末日ではない)ため、四半期反映確認には四半期実績データ(取得できる場合)を優先し、取得できない銘柄でのみ年次決算期末日を代替とする。ただし`recent_quarters`という名称だけでは四半期データ由来とは限らず、データ提供元から四半期単位のデータを取得できない場合は年次決算データへの振り替えである場合がある(`FinancialSummary.recent_periods_source`/監査ログの`financial_period_end_source`で区別可能。年次振り替えの場合、期中決算の反映は検知できない既知の制約が残る)。財務データの取得時刻(fetched_at)は取得元へのAPI呼び出し時刻に過ぎず、それだけでは「更新済み」と判定しない。財務期間を確認できない場合は安全側に「確認待ち」の状態のままとする。不明な由来を四半期データと推測することはしない。監査ログの`financial_period_end_source=UNKNOWN`、またはCloudWatch Logs上の`financial_period_source_inconsistent`という警告ログが確認された場合は、通常運用では起こらないデータ不整合(四半期実績データと年次代替のいずれとも判別できない状態)を示すため、データ整合性の確認対象とする |
+
+---
+
+## 10. 保有判断スコア方式の運用(2026-08-06追加)
+
+保有銘柄の「投資した前提が崩れていないか」の判定を、従来方式
+(`SellSignalService`)から新方式(保有判断スコア、`HoldingDecisionService`)へ
+段階的に切り替えるための運用手順です(判定方式自体の考え方は
+[機能仕様書6.9節](functional_spec.md)を参照)。利益確定(利確)判定は対象外で、
+常に従来どおりです。
+
+### 10.1 RuntimeConfigの初回作成
+
+新方式の稼働モード(`mode`)・kill switch(`notification_enabled`)は、
+再デプロイ不要で切り替えられるよう専用のRuntimeConfigレコード(DynamoDB、
+ローカル運用時はJSONファイル)で管理します。**運用開始前に必ず1回だけ**
+初期化してください(2回目以降はエラーになります)。
+
+```bash
+jstock holding-decision init-runtime-config --changed-by <あなたの名前> --mode legacy
+# 本番(AWS)環境に対して初期化する場合は --target aws を追加
+jstock holding-decision init-runtime-config --changed-by <あなたの名前> --mode legacy --target aws
+```
+
+既定は`mode=legacy`(現行と完全同一動作)・`notification_enabled=False`
+(kill switch ON相当)です。現在の設定は次のコマンドで確認できます。
+
+```bash
+jstock holding-decision show-runtime-config --target aws
+```
+
+**本番検証で発覚・修正した不具合(2026-08-21)**: 上記の`init-runtime-config`
+(初回作成)後に行う`set-mode`/`kill-switch`(10.2〜10.4節、更新)は、`--target
+aws`実行時、`RuntimeConfig`テーブルの実際の保存形式(1項目全体を単一の`data`
+属性(JSON文字列)へ保存する、`infrastructure/aws/dynamodb_store.py`の
+`DynamoDbCollectionStore`方式)と、更新処理側が前提としていたスキーマ
+(`config_version`等を項目のトップレベル属性として直接更新)が一致しておらず、
+DynamoDB上では`ConditionExpression`が常に`ConditionalCheckFailedException`
+となり、**`--target aws`での`set-mode`/`kill-switch`が一度も成功していな
+かった**(ローカル運用時はJSONファイルを使うため影響なし。`baseline_pointer.py`
+の`update_pointer`にも同一の不整合があり、あわせて修正した)。`data`属性全体
+の一致を条件とする条件付き更新へ修正し、既存の本番state(移行不要)のまま
+そのまま更新できるようにした(watchlist_rotation_state.pyのrotation commit
+で本番検証時に発覚・修正済みの不具合と同じ原因・同じ修正方針)。
+
+### 10.2 Shadow運用手順(新旧を並行計算し、通知は旧方式のみ)
+
+```bash
+jstock holding-decision set-mode shadow --changed-by <あなたの名前> \
+  --reason "新方式の並行検証を開始" --target aws
+```
+
+`mode=shadow`にすると、実際のLINE通知は引き続き旧方式のみが行いますが、
+新方式(`HoldingDecisionService`)も毎回計算・保存されるようになります
+(`HoldingDecisionResult`)。数日〜数週間このモードで運用し、10.6節の
+`compare`コマンドで新旧の判定差分を定期的に確認してください。
+
+### 10.3 Active切替手順(新方式が実際の通知を担当する)
+
+Shadow運用で新旧の乖離に問題が無いことを確認できたら、本稼働へ切り替えます。
+
+```bash
+jstock holding-decision set-mode active --changed-by <あなたの名前> \
+  --reason "Shadow検証完了、本稼働へ切替" --target aws
+```
+
+`mode=active`にすると、一般事業会社の銘柄は新方式が実際の通知を担当し、
+旧方式(`SellSignalService`)は通知を出さなくなります(判定自体は行われなく
+なります)。**銀行・保険・証券などの金融業銘柄は、`mode=active`に切り替えた
+後も自動的に旧方式のまま**です(10.5節)。
+
+**再通知の条件について(2026-10-10追記、Issue #890 PR-3)**: `mode=active`では、保有判断の通知を
+もう一度送るかどうかを、前回に送ったときの状態と比べる5つの条件(スコアの悪化・判定の変化・新たに
+確認済みのハードゲート・決算後・売却目安価格の変化)と、従来の日数の経過で決めます(前回の状態と
+比べられない場合は従来の判断)。この再通知の方針(周期の再送を残すか・判定の変化の範囲・決算後の方式・
+点数の比較値・キーワード一致のみの扱い・参照価格)は現在**暫定の値**
+(`services/hd_renotification_provisional_policy.py`)です。**`mode=active`にする承認の前に、各項目を
+確定してください**(併せて #888・#889 の是正、通知件数の見込みも前提です)。
+
+**運用制約(2026-10-11追記、10/12のProduction反映に伴う)**: 次回のProduction反映(前回fbd08cbe以降の変更を含む)の後も、
+**`mode=active`にしないでください**。反映後のコードは`mode=active`を受け入れる状態になっており、`mode=active`にすると上の再通知の
+条件(暫定の値)が実際の通知を決めます。次のすべてが満たされるまで`mode=shadow`(または`legacy`)のままにします:
+#888・#889の是正(新方式のハードゲートの確認の扱い)と、その独立評価・承認 / 再通知の方針の各項目の確定(上記) /
+確認に至らない重大リスクの通知設計(#901)の判断 / USERによる`mode=active`切替の明示的な承認。
+`mode=shadow`の間は、保有判断の通知を作る処理も再通知の判断も実行されません(従来方式の通知のみ)。
+
+ロールバックは`set-mode legacy`の1コマンドで即座に行えます(再デプロイ不要)。
+
+```bash
+jstock holding-decision set-mode legacy --changed-by <あなたの名前> \
+  --reason "問題を確認したため旧方式へ戻す" --target aws
+```
+
+### 10.4 kill switch運用(緊急停止)
+
+`mode`とは独立して、保有銘柄分析に関するLINE通知を即座に停止できる緊急
+スイッチです。`mode`を切り替えずに「今すぐ通知だけ止めたい」場合に使います。
+
+```bash
+jstock holding-decision kill-switch on --changed-by <あなたの名前> \
+  --reason "誤判定の疑いがあるため一時停止" --target aws
+# 解除
+jstock holding-decision kill-switch off --changed-by <あなたの名前> \
+  --reason "原因を確認し再開" --target aws
+```
+
+**`kill-switch on` ↔ `notification_enabled`の対応関係**(取り違えやすいため明記):
+
+| CLI指定 | 内部値 | 意味 |
+|---|---|---|
+| `kill-switch on` | `notification_enabled=False` | 通知停止 |
+| `kill-switch off` | `notification_enabled=True` | 通知許可(既定) |
+
+**停止対象(コードレビュー対応で全経路へ適用範囲を拡張、2026-08版)**:
+
+- 旧売却通知(SellSignalService)
+- 新保有判断通知(HoldingDecisionService)
+- 利確通知(ProfitTakingService)
+- ポートフォリオ集中リスク通知(PORTFOLIO_CONCENTRATION_REVIEW)
+- 保有銘柄分析バッチ完了サマリー通知
+
+**停止しないもの**: 判定処理そのもの・Recommendation/HoldingDecisionResultの
+保存・監査ログの記録。空振りにはならず、kill switch中でも通常どおり
+Recommendationは作成・保存されます(LINE送信だけが行われません)。
+
+`mode`等の他の設定値は、DynamoDBの読み取り頻度を抑えるため60秒
+(`runtime_config_cache_ttl_seconds`)キャッシュされますが、**kill switchの
+状態だけはこのキャッシュを経由せず、判定のたびに必ず最新値を取得します**
+(緊急停止操作が最大60秒遅れて反映される事態を避けるため)。切り替え後は
+次回の判定サイクルから確実に反映されます。
+
+**kill switch抑止状態の可観測性の制約**: kill switchにより送信を見送った
+事実そのものは、CloudWatch Logsの構造化ログ(`kill_switch_suppressed: ...`)
+以外には永続化されません。`NotificationLog`は実送信成功時にのみ書き込まれる
+既存仕様のため、`backtest`コマンドのhistory replayでは「送信ログが無い」
+ケースを`UNKNOWN`としてしか判定できず、「kill switchにより抑止された」と
+断定することはできません(抑止か記録漏れかを過去データから区別する手段が
+現状無いため)。将来この区別をhistory replayで確定表示したい場合は、
+専用の`NotificationAttempt`/監査テーブルの新設が別途必要です(現時点では
+未実装、残課題)。
+
+### 10.5 金融業移行手順
+
+銀行・保険・証券・その他金融業の銘柄は、`BankRegulatoryMetrics`(自己資本
+比率規制等)を評価する専用データソース・専用モデルが未実装のため、
+`mode=active`に切り替えた後も**当面は自動的に旧方式のまま**通知を継続します
+(`config/industry_scoring_policy.yaml`の`financial_industry_policy`が正の
+設定元)。新方式はこれらの銘柄についてもshadow相当で計算・保存は継続し、
+将来のモデル検証データとして蓄積されます。
+
+金融業を新方式へ移行するには、以下がすべて完了している必要があります
+(現時点ではいずれも未着手です)。
+
+1. 専用データソースの実装(`BankRegulatoryMetrics`の実データ取得)
+2. 専用スコアリングモデルの実装・`financial_model_version`の採番
+3. 最低1四半期程度のshadow運用相当での試験運用・人間レビュー
+4. `config/industry_scoring_policy.yaml`の該当カテゴリの`deferred: false`への
+   変更(コード変更を伴うためデプロイが必要)
+
+**緊急退避**: 何らかの理由で金融業の判定に問題が疑われる場合、
+`financial_policy_override`を`FORCE_DEFER_ALL`にすると、YAML側の設定に
+関わらず全金融業カテゴリを即座に旧方式へ退避させられます(再デプロイ不要)。
+
+```bash
+jstock holding-decision init-runtime-config --changed-by <あなたの名前> \
+  --mode active --financial-policy-override FORCE_DEFER_ALL --target aws
+```
+
+既に初期化済みの場合は`set-mode`と同様、`get-config`で現在値を取得してから
+`update_config`相当の操作が必要です(現状CLIに`financial-policy-override`
+単体を変更するコマンドは無く、`init-runtime-config`の初回作成時のみ指定
+可能です。運用中に変更したい場合はPythonから直接
+`HoldingDecisionRuntimeConfigService.update_config()`を呼び出してください)。
+
+### 10.6 compare実行方法(Shadow比較レポート)
+
+> **実行前の拒否と確認(Issue #886 の是正後。PR #908 で merge 済み〔2026-10-11〕。旧『暫定制約』を書き換えた)**:
+> `jstock holding-decision compare` と `jstock holding-decision backtest`(liveモード・replayモードとも)は、
+> 環境変数`AWS_LAMBDA_FUNCTION_NAME`が空でない値で設定されたシェルでは、**実行前に拒否されます**(終了コード2。
+> 各コマンドの最初に判定するため、銘柄の解決・設定の読込・providerの構築・DynamoDBの呼出より前に止まり、Productionへの
+> 読取・書込は0件です)。保存先は同変数の有無だけで決まり(`collection_store.py`の`running_on_lambda`)、拒否のguardが
+> 入る前は、設定されていてAWS資格情報が有効だと、ProductionのDynamoDBへ監査記録・投資ストーリー・baselineを
+> 書き込んでいました(非保有銘柄を`--stock-code`に指定しても書き込まれ、後日の購入時の初回評価の扱いが変わりえます)。
+> このCLIは手元のリポジトリから実行するため、guardが効くのは、PR #908を取り込んだ作業ツリーで実行するときです。
+> ローカルで実行するときは、`echo $AWS_LAMBDA_FUNCTION_NAME`(PowerShell: `$env:AWS_LAMBDA_FUNCTION_NAME`)が
+> 空であることを確認し、`shareholder-benefit import-csv`など「環境変数を設定して実行」と案内される手順の後のシェルは
+> 使い回さず、新しいシェルで実行する(またはその変数をunsetする)。Productionデータの確認が必要な場合は、読取専用の
+> 観測用profile(`AWS_PROFILE=jstock-observer`。18節)を使う別の手段で行い、本コマンドでは行わない。`--target aws`は
+> runtime-config系の4コマンド専用で、本節の対象外(意図したProduction操作)。
+>
+> **変数が空であることは、Productionへ安全であることの保証ではありません**。上の確認は、この2コマンドの保存先が
+> ローカルになるための条件の1つにすぎません。実行の前に、次も確認してください: `AWS_PROFILE`・`AWS_ACCESS_KEY_ID`などの
+> 資格情報の設定、接続先(リージョン・エンドポイント・`DYNAMODB_TABLE_PREFIX`。未設定なら既定値は`jstock`)が意図した
+> ものか。Productionの状態を調べるときは、許可された読取専用の経路(観測用profile)を使い、書込みが起こりうる
+> コマンドで調べないでください。
+
+Shadow運用中に新旧の判定差分を確認するためのコマンドです。指定銘柄
+(または全保有銘柄)を現在のデータで両エンジンにかけ、判定・score・
+通知差分に加えて、coverage・ハードゲート・主な加点/減点理由を表示します。
+
+```bash
+jstock holding-decision compare --stock-code 2914 --stock-code 8306
+# 保有銘柄すべてを対象にする場合は --stock-code を省略(省略時は所有者「本人」の保有銘柄のみ)
+jstock holding-decision compare
+# 本人以外の所有者を対象にする場合は --owner を指定(保有の確認・銘柄の一覧とも、その所有者の保有だけが対象)
+jstock holding-decision compare --owner <所有者名>
+# 実データで比較する場合(既定はmock)
+jstock holding-decision compare --source real
+# CSVへ出力
+jstock holding-decision compare --csv compare_result.csv
+```
+
+**列名の意味(コードレビュー対応で改名、2026-08版)**: `legacy_should_notify`/
+`new_should_notify`は「実際に通知したか」ではなく「通知条件に該当するか」を
+表します(compareはliveモードのみで何も送信しないため)。`should_notify_diff`は
+`MATCH`(一致)/`DIFFERENT`(不一致)/`NOT_COMPARABLE`(比較不能)の三値です。
+非保有銘柄では旧方式を評価しないため`legacy_should_notify`が`None`となり、
+その場合`should_notify_diff`は必ず`NOT_COMPARABLE`になります(bool比較による
+誤った差分表示を避けるための設計)。
+
+出力の「差分」欄が「一致」以外(旧のみ検討/新のみ検討)の銘柄は、判定根拠
+(「主な減点要因」「保有を支持する要因」)を確認し、必要であれば
+`config/holding_decision_rules.yaml`等の閾値調整を検討してください
+(調整自体は本書7節のルール改善承認フローに準じ、根拠を残しながら行うことを
+推奨します)。
+
+### 10.7 バックテスト手順
+
+> **実行前の拒否と確認(Issue #886 の是正後。旧『暫定制約』を書き換えた)**: 10.6節の拒否と確認(変数の確認、およびその注意書きにある
+> 資格情報・接続先の確認を含む)を、本節の`backtest`にも適用する(liveモード・replayモードとも、`AWS_LAMBDA_FUNCTION_NAME`が
+> 設定されたシェルでは実行前に拒否される)。`jstock rules backtest`はこの拒否の対象外で、読取りのみだが、上記の環境変数が
+> 設定されたシェルではProductionを読むため、同様に避ける。
+
+過去に実際に保存された判定結果を再生する`backtest`コマンドです。**このシステムは
+財務・配当・優待データを現在値としてのみ保持しており、過去の任意時点の
+財務スナップショットは保存していないため、真の意味での過去時点シミュレーション
+はできません**(Phase0前提)。
+
+```bash
+# liveモード(--start-date省略時): 指定銘柄を現在のデータで新旧比較
+jstock holding-decision backtest --stock-code 2914
+
+# replayモード(--start-date指定時): 過去に保存された評価結果を期間指定で再生
+jstock holding-decision backtest --start-date 2026-08-01 --end-date 2026-08-31
+
+# 保有銘柄すべてを対象にCSV出力(--stock-code省略時は所有者「本人」の保有銘柄のみ)
+jstock holding-decision backtest --csv backtest_result.csv
+
+# 本人以外の所有者を対象にする場合は --owner を指定(保有の確認・銘柄の一覧とも、その所有者の保有だけが対象。
+# replayモードでは --owner は対象銘柄の一覧と、再生する結果の絞り込み〔その所有者の判定結果・旧方式の推奨のみ〕に使う)
+jstock holding-decision backtest --owner <所有者名>
+```
+
+`jstock review before-after`(銘柄指定は`--stocks`)も同じ`--owner`(省略時は本人)を持ちます。
+Issue #579より前は、これらのコマンドが所有者を常に「本人」として保有を調べていたため、本人以外の
+所有者の保有銘柄が`NOT_EVALUATED_NON_HOLDING`(未登録)と表示されていました。
+
+**replayモードの所有者の絞り込み(Issue #736)**: 従来は`--owner`を指定しても、再生する結果は所有者で
+絞られず、他の所有者の行が混ざっていました。現在は、指定した所有者(省略時は本人)の保有判断の結果
+(`HoldingDecisionResult`。`holding_id`の所有者部分で判定)と、その所有者の旧方式の売却系の推奨だけを
+再生します(推奨との対応付け・対応する結果が無い旧方式の推奨の単独の行も同じ規則)。このため、従来より
+結果の行数が減ることがあります(意図した変更です)。
+owner対応前の旧形式の記録(`holding_id`が銘柄コードだけのもの・推奨の所有者が未設定のもの)は、所有者の
+移行と同じ規則で「本人」のものとして扱われます(`--owner`省略または本人を指定したときだけ出ます。他の
+所有者を指定したときは出ません)。`holding_id`の形式が不正で所有者を判別できない結果は、どの所有者の
+再生にも含まれず、件数のみ警告ログに記録されます。判定ロジックは変わりません。
+
+replayモードは`mode=shadow`で運用した蓄積データが無い期間を指定すると、
+推測で埋め合わせず素直に「該当するデータがありません」と表示します。
+運用開始直後で蓄積が無い場合は、まずliveモードで現状の判定を確認してください。
+
+**非保有銘柄の扱い**: liveモードの非保有銘柄は、旧方式(SellSignalService)を
+評価しません(架空の取得単価・保有期間による誤評価を防ぐため)。
+`legacy_recommendation_type=NOT_EVALUATED_NON_HOLDING`と表示されます。
+新方式は取得単価等を入力に使わないため非保有銘柄でも評価されます。
+単一銘柄指定時に限り、以下のオプションをすべて指定することで旧方式も
+評価できます(一部のみの指定・複数銘柄指定・replayモードとの併用はエラーに
+なります)。
+
+```bash
+jstock holding-decision backtest --stock-code 2914 \
+  --purchase-price 1500 --purchase-date 2024-01-15 --shares 100
+```
+
+この仮の保有データはどのRepositoryへも保存されません(検証専用)。
+
+**history replayの対応付け(コードレビュー対応で全面再設計、2026-08版)**:
+
+旧方式のRecommendationにはHoldingDecisionResultから参照できるFK(ID)が
+存在しないため、以下の優先順位で対応付けます。
+
+1. 近接時刻(評価時刻との差が5分以内)による対応付け(`NEAREST_TIMESTAMP`)
+2. 同一日(JST基準の暦日)による対応付け(`SAME_DAY_FALLBACK`。**既定では
+   無効**。`--allow-same-day-fallback`を指定した場合のみ有効になり、信頼度は
+   中程度として扱われます。有効化した場合、`SAME_DAY_FALLBACK`行はActive
+   移行判断の集計から除外してください)
+3. いずれも一意に定まらない場合は対応付けを行わず`AMBIGUOUS_MATCH`とする
+   (近接時刻内・同一日のいずれかに複数候補がある場合。最も近い1件を
+   自動採用することはしません)
+
+対応付け候補が全く見つからない場合(`NO_MATCH`)、`execution_plan_reason`から
+「旧方式がそもそも実行されなかった」(`mode=active`の一般事業会社)ことが
+分かる場合のみ`legacy_should_notify=False`と確定します。旧方式が実行予定
+だった(`legacy/shadow`モード等)にもかかわらず候補が見つからない場合は、
+`HoldingEvaluationAudit`(実行完了の証跡)が永続化されていないため過去データ
+から実行完了を証明できず、`legacy_recommendation_type=UNKNOWN_NO_MATCH`
+として「HOLDだった」と断定しません。
+
+新方式側は`HoldingDecisionResult.recommendation_id`という明示的なFKがある
+ため対応付けは決定論的ですが、IDが設定されていてもRecommendationの保存が
+失敗・欠落している可能性があるため実在確認まで行います。
+`RECOMMENDATION_ID_MISSING`(レコード欠落または銘柄コード不一致)、
+`RECOMMENDATION_ID_TYPE_MISMATCH`(recommendation_typeが新方式の想定型と
+不一致)という2種類のデータ不整合を区別して表示します。
+
+**Recommendation作成と通知実績の分離**: `*_recommendation_created`(作成有無)
+と`*_notification_sent`(実送信成功有無)は別の概念です。`NotificationLog`は
+実送信成功時にのみ書き込まれるため、Recommendationは作成されたが送信ログが
+無い場合は`*_notification_status=UNKNOWN`とし、`False`(未送信と確定)とは
+判定しません(kill switch抑止・記録漏れ等を過去データから区別できないため)。
+liveモードは何も永続化・送信しないため、`*_recommendation_created`は常に
+`False`、`*_notification_status=NOT_EXECUTED_LIVE_MODE`となります。
+
+---
+
+## 11. `infra/template.yaml`へDynamoDBテーブルを追加する際の注意(2026-08-14追加)
+
+`BuyCandidatesFunction`/`HoldingsWatchlistFunction`のように多数のテーブルへ
+アクセスするLambda関数へ`Policies:`で`DynamoDBCrudPolicy`/`DynamoDBReadPolicy`
+をテーブルごとに個別指定すると、SAMはエントリごとに個別のインラインIAM
+ポリシー(`AWS::IAM::Policy`)を生成します。テーブルが増えるたびにロールへ
+新規インラインポリシーが積み上がり、IAMロールのインラインポリシー合計
+サイズ上限(10240バイト、拡張不可のハード上限)を超過すると、
+`sam deploy`が`UPDATE_ROLLBACK_COMPLETE`で失敗します
+(`HandlerErrorCode: ServiceLimitExceeded`)。`BuyCandidatesFunction`/
+`HoldingsWatchlistFunction`/`WatchlistDispatcherFunction`/
+`WatchlistWorkerFunction`/`WatchlistBatchReconcilerFunction`(2026-08-15、
+rotation dispatch leaseテーブル追加を機に集約)は既に個別指定をやめ、
+同じアクション集合(CRUD/Read)のテーブル群を`Statement:`の`Resource`配列へ
+集約する形へ変更済みです。**今後これらの関数へ新しいテーブルへのアクセスを
+追加する場合は、新規に`DynamoDBCrudPolicy`等のエントリを追加するのではなく、
+既存の集約Statement(`DynamoDbCrudAccess`/`DynamoDbReadOnlyAccess`)の
+`Resource`配列へ`!GetAtt <Table>.Arn`と`!Sub "${<Table>.Arn}/index/*"`を
+追記してください**(付与するアクション自体は変更しない)。
+`WatchlistTerminalFailureHandlerFunction`はテーブル数がまだ少ないため
+個別指定のままですが、今後大きく増える場合は同様の集約が必要になります。
+`sam deploy --no-execute-changeset`でchangesetを事前作成し、実行前に
+`Replacement`列がすべて`False`であることを確認してから
+`aws cloudformation execute-change-set`で適用する運用を徹底してください
+(この事故は`sam deploy`の対話的confirm_changesetをバイパスせず、
+changesetの中身を人間が確認していれば防げた種類の問題ではなく、
+IAM側のサイズ上限はCloudFormation実行時まで判明しないため、事前の
+`sam validate`だけでは検知できません)。
+
+**既存テーブルへGSIを追加する場合の注意(2026-08、Phase 2-A・
+`BuyCandidateEvaluationRecordsTable`へ`batch_id-index`追加時に確認)**:
+DynamoDBのGSIはスパースインデックスであり、GSI追加(`UpdateTable`)は既存の
+全アイテムに対して自動バックフィルを行うものの、GSIのキー属性(この例では
+`batch_id`)をそもそも持たないアイテムはGSIに載らない。本システムの
+`DynamoDbCollectionStore`は各アイテムを`{id, "data": JSON文字列}`という
+形式で保存しており、通常の`upsert()`ではGSI用の属性はトップレベルに
+書き込まれない(`upsert_with_index_attributes()`を使うリポジトリのみが
+書き込む)。したがって、**GSI追加前にコード変更(該当リポジトリの
+`upsert_with_index_attributes()`切替)をデプロイしていない場合、GSI追加後も
+既存データはGSIから検索できないまま**になる。コードとインフラ(GSI追加)を
+同一デプロイで反映すれば、デプロイ後に新規書き込まれるデータから正しく
+GSIに載るため、通常はこれで実害はない(過去データをGSI経由で検索する必要が
+無い設計であることを事前に確認すること)。
+
+## 12. 保有銘柄オーナー機能移行の運用(TradingPauseConfig、2026-08追加)
+
+保有銘柄を所有者(本人/子供等)ごとに区別できるようにする機能追加(開発中、
+複数フェーズに分けて実施)の準備として、LINE会話型UIの「📈 買った」
+「📉 売った」操作をCLIから一時停止できる`TradingPauseConfig`を導入しました
+(10節のRuntimeConfigと同じ「再デプロイ不要でCLIから切り替える」設計)。
+「⭐ お気に入り登録」はHoldings/PurchaseLotsを一切更新しないため対象外で、
+一時停止中も通常どおり利用できます。
+
+**`--target`は`local`/`aws`のいずれかを必ず明示指定してください(既定値は
+ありません)**。`--target awss`のような入力ミスは値検証の時点でエラー終了し、
+どちらのバックエンドにも一切触れません(コードレビュー対応: 本番を一時停止
+したつもりでタイプミスによりローカルだけを操作してしまい、本番が停止して
+いないままデータ移行へ進んでしまう事故を防ぐため)。
+
+**pause確認と実際のBUY/SELL登録(TransactWriteItems)は原子的です**。
+LINE会話の確認画面表示時点でpause=falseだったとしても、「登録する」を
+押した瞬間の書き込みそのものにTradingPauseConfigの状態確認が含まれるため、
+その間に運用者が`--buy-sell`へ切り替えた場合は、書き込みの直前で
+確実に失敗し(「最新の保有状況が変更されたため登録できませんでした」と
+案内されます)、Holdings/PurchaseLots/Transactionsのいずれも変更されません。
+
+### 12.1 初回作成
+
+```bash
+jstock trading-pause init --changed-by <あなたの名前> --reason "M0導入" --target local
+# 本番(AWS)環境に対して初期化する場合
+jstock trading-pause init --changed-by <あなたの名前> --reason "M0導入" --target aws
+```
+
+既定は`--paused`省略時`pause_buy_sell=False`(通常運用、BUY/SELLとも利用可)
+です。現在の設定は次のコマンドで確認できます。
+
+```bash
+jstock trading-pause status --target aws
+```
+
+### 12.2 データ移行作業の前後での使い方
+
+データ移行(V2テーブルへの切替等)を開始する前に、必ずBUY/SELLを停止して
+ください。
+
+```bash
+jstock trading-pause set --buy-sell --changed-by <あなたの名前> \
+  --reason "所有者機能移行のためBUY/SELLを一時停止" --target aws
+```
+
+移行・コード切替・VALIDATIONモードでの整合性確認がすべて完了し、問題が
+無いことを確認できてから、初めて解除してください(コードのデプロイと
+本フラグの解除は必ず別々の操作です。デプロイに解除を同梱しないこと)。
+
+```bash
+jstock trading-pause set --no-buy-sell --changed-by <あなたの名前> \
+  --reason "移行完了・検証合格のため通常運用を再開" --target aws
+```
+
+解除を忘れたままにすると、移行作業が完了してもLINEから買付・売却が
+できない状態が続くため、`status`コマンドで意図した状態になっているか
+必ず確認してください。
+
+### 12.3 データ移行本体(preflight・run、2026-08追加)
+
+owner/holding_idへの実際のデータ移行は`jstock migrate holdings-owner`
+コマンド群で行います。**preflight(検証)とrun(移行本体)は必ず別々に
+実行してください**(1コマンドで連続実行する設計にはしていません)。
+
+```bash
+# 1. まず検証のみを行う(書き込みは一切発生しない)
+jstock migrate holdings-owner preflight --target aws
+```
+
+`PASS`と表示されれば移行を進められます。`FAIL`の場合は表示された各
+チェックの詳細(該当するrecommendation_id・notification_id等)を確認し、
+原因を解消してから再実行してください。
+
+```bash
+# 2. dry-run(既定、書き込みなし)で移行結果の見込みを確認する
+jstock migrate holdings-owner run --target aws
+
+# 3. 内容に問題が無ければ、--no-dry-runを明示して実際に書き込む
+jstock migrate holdings-owner run --target aws --no-dry-run
+```
+
+**移行本体(`run --no-dry-run`)は、`TradingPauseConfig.pause_buy_sell`が
+`true`(12.2節で設定済み)であることをコード自身が確認してから実行します。**
+`false`のまま・未初期化・取得エラーのいずれの場合も、移行は開始されず
+安全側で中止されます(CLIの操作手順だけに頼らない設計です)。
+
+移行は何度実行しても結果が変わらない(重複しない)設計のため、途中で
+失敗した場合は原因を確認のうえ、そのまま再実行して構いません(再実行時、
+既に正しく移行済みのholding_idを再度書き換えて二重prefix化する、といった
+不整合は発生しません。万一データが破損している場合はfail-closedで移行を
+中止します)。
+
+**`--target aws`指定時は、preflight・run本体の開始から終了まで一貫して
+AWS(DynamoDB)のみを参照し、途中でローカルJSONへフォールバックすることは
+ありません**(逆に`--target local`指定時はAWSへ一切アクセスしません)。
+1回の実行中にlocal/AWSのデータが混在することはない設計です。
+
+HoldingsSnapshot(通常)だけでなくValidationHoldingsSnapshot(検証モード用)
+についても、`active_holding=true`なのに対応するHoldingが存在しないといった
+不整合をpreflightが独立に検知します。
+
+## 13. 通知検証モード(VALIDATION)利用時の注意事項・用途別手順(2026-08追加)
+
+`BuyCandidatesFunction`・`HoldingsWatchlistFunction`をAWSコンソール/CLIから
+`{"execution_mode": "VALIDATION"}`で手動起動する「通知検証モード」
+(機能仕様書12.13節)は、**`notification_mode`を指定しない限り実際にLINEへ
+通知が送信されます**。これは既存仕様どおりの正常動作であり、バグでは
+ありません。
+
+owner再分類・データ移行検証(12節)・保有判断ロジックの整合性確認など、
+**LINE文面の確認自体が目的ではない**検証作業でVALIDATIONを使う場合は、
+実LINE送信を伴わない`notification_mode: "DRY_RUN"`を必ず使ってください
+(2026-08-23、owner再分類検証作業中に意図せずLINE通知が実送信された事例を
+受けて追加)。
+
+### 13.1 LINE文面そのものを確認したい場合(実送信あり)
+
+```json
+{
+  "execution_mode": "VALIDATION",
+  "notification_mode": "SEND"
+}
+```
+
+`notification_mode`を省略した場合も`SEND`と完全に同じ動作です(既存仕様との
+後方互換性のため、`{"execution_mode": "VALIDATION"}`単体の呼び出しは今後も
+挙動が変わりません)。**この形式では実際にLINEへ通知が届きます**(本文冒頭に
+「🧪検証｜」が付きます)。
+
+### 13.2 判定結果・処理の整合性だけを確認したい場合(実送信なし)
+
+```json
+{
+  "execution_mode": "VALIDATION",
+  "notification_mode": "DRY_RUN"
+}
+```
+
+判定・通知対象選定・通知文生成・検証banner付与までは13.1と全く同じ処理を
+行いますが、**外部LINE APIへの送信のみ行いません**。「実際に送るとしたら
+何が送られたか」(最終文面・銘柄コード・判定区分等)はCloudWatch Logsで
+確認できます。今回のM4.2のようなowner再分類・データ整合性・移行検証等、
+LINE文面確認自体が目的ではない作業では、原則こちらを使ってください。
+
+### 13.3 組み合わせの制約
+
+`notification_mode`は`execution_mode: "VALIDATION"`と組み合わせた場合のみ
+有効です。`execution_mode`が`NORMAL`(省略時含む)の状態で`notification_mode`
+を指定すると、黙って無視されたりSENDへフォールバックしたりせず、明確な
+エラーとしてLambda呼び出し自体が失敗します。通常の自動実行(毎日決まった
+時刻)は`notification_mode`を一切指定しないため、この制約による影響は
+ありません。
+
+### 13.4 各Lambdaの`execution_mode`対応可否(Issue #286、2026-09-08追加)
+
+**どのLambdaが検証モードを受け付けるのかは、Lambdaごとに異なります。**
+受け付けないLambdaへ指定した場合の挙動も、以前は一様ではありませんでした
+(黙って通常運用として実行されるものがありました)。実測した現況を以下に
+まとめます。
+
+| Lambda(handler module) | `execution_mode`指定時 | 備考 |
+|---|---|---|
+| `buy_candidates_handler` | **対応**(VALIDATION/NORMAL) | 13.1〜13.3の手順が使える。検証用テーブルへ隔離される |
+| `holdings_watchlist_handler` | **対応**(VALIDATION/NORMAL) | 同上 |
+| `disclosure_check_handler` | **対応**(VALIDATION/NORMAL) | Issue #109で対応済み |
+| `watchlist_dispatcher_handler` | ★ **拒否**(Lambda呼び出しが失敗する) | Issue #286。理由は下記 |
+| `watchlist_worker_handler` | ★ **拒否**(同上) | 同上 |
+| `watchlist_batch_reconciler_handler` | ★ **拒否**(同上) | 同上 |
+| `watchlist_terminal_failure_handler` | ★ **拒否**(同上) | 同上 |
+| `evaluation_handler` | ★ **拒否**(Lambda呼び出しが失敗する) | Issue #287。理由は下記 |
+| `weekly_review_handler` | ★ **拒否**(同上) | 同上。LINE送信とGitHub Issue起票を伴う処理 |
+| `monthly_review_handler` | ★ **拒否**(同上) | 同上 |
+| `quarterly_review_handler` | ★ **拒否**(同上) | 同上 |
+| `line_webhook_handler` | 対象外 | LINEからのwebhook受信であり、バッチ起動の概念を持たない |
+
+```
+★ watchlist系4本を「対応」ではなく「拒否」にした理由
+
+  検証モードが成立するには、書き込み先を検証用へ隔離できる必要がある。
+  watchlistにはその隔離が存在しない(実測)。
+
+    for_execution_context()を持つrepository  Recommendation / WatchState /
+                                             HoldingsSnapshot /
+                                             DailyNotificationPriority
+    WatchlistRepository と rotation state   **持たない**
+    infra/template.yamlのValidation*テーブル **watchlist / rotationは無い**
+
+  したがって受け付けると、LINE送信は止められても
+  **実際のwatchlistが書き換わり、巡回カーソルが前進する**。
+  「検証のつもりで本番の状態を変えた」という最悪の結果になるため、
+  対応せず**明示的に失敗させる**方針とした(機能仕様書12.13節の
+  「ウォッチリスト自動追加の通知は対象外」という仕様は変えていない)。
+
+★ 拒否されたときの見え方
+  Lambda呼び出しが`WatchlistExecutionModeNotSupportedError`で失敗し、
+  CloudWatch Logsへ「どのhandlerがどのキーを拒否したか」がERRORで残る。
+  黙って握りつぶすことはない。
+
+★ **自動実行(EventBridge Scheduler)は影響を受けない。**
+  どのScheduleもInputを持たず、`execution_mode`を渡さないためである。
+```
+
+```
+★ 評価・レビュー系4本(evaluation / weekly / monthly / quarterly review)を「拒否」にした理由
+
+  これら4本には、検証モードで副作用を隔離する仕組みがありません。
+  以前は`execution_mode`を読まず、**指定しても黙って通常運用として実行されて**いました
+  (評価結果・監査記録の書き込み、weekly_reviewはLINE送信とGitHub Issue起票)。
+  「検証のつもりで本番を動かした」事故を防ぐため、対応せず**明示的に失敗させる**
+  方針としました(Issue #287。`execution_mode` / `notification_mode`のどちらの指定も対象。
+  値が`None`のキーは「指定なし」として扱います)。
+
+★ 拒否されたときの見え方(★ 運用上の注意)
+  Lambda呼び出しが`ReviewExecutionModeNotSupportedError`で失敗し、CloudWatch Logsへ
+  「どのhandlerがどのキーを拒否したか」がERRORで1件残ります(キーの値は出しません)。
+  **Lambdaの失敗は`Errors`として計上されるため、4本とも`Errors`のAlarmを持つ以上、
+  拒否されるとAlarmが作動し、IncidentNotifier経由でLINEに異常通知が届きうる**
+  (Alarmの閾値・期間の条件を満たした場合)。これは、検証実行のつもりの操作が
+  静かに成功してしまう状態を、目に見える失敗にするための意図した挙動です。
+  拒否の前にconfigの読み込み・LINE送信・GitHub Issue起票・評価結果や監査記録の
+  書き込みは一切行われません。
+
+★ **自動実行(EventBridge Scheduler)は影響を受けません。**
+  4本のScheduleはInputを持たず、`execution_mode`を渡さないためです(Alarmも増えません)。
+```
+
+### 13.5 監査記録の`execution_mode`(起動経路)の読み方(Issue #286、2026-09-08追加)
+
+ウォッチリストのバッチ監査記録(`watchlist_auto_addition_batch`)に入る
+`execution_mode`は、13.1〜13.4の**検証モードとは別の軸**です。
+「どの経路で起動されたか」を表します。
+
+```
+scheduled  EventBridge Schedulerからの自動実行(eventにキーが無い)
+manual     人がpayloadを与えて手動起動した(job_type / batch_idを指定)
+triggered  当日の新規候補スクリーニングの完了後に、後続のメンテナンスが
+           自動で連鎖起動した(trigger_type = POST_NEW_CANDIDATE_SCREENING)
+```
+
+```
+★ 既知の限界(Issue #286では解消していない)
+
+  dispatcherが判定した経路そのものはBatchRunsTableへ保存していないため、
+  **手動でdispatchしたバッチの「集計時」の監査記録は`scheduled`になります**。
+  経路を正しく見分けられるのは、dispatcher自身が書く監査記録
+  (中止・skip時)だけです。同一batch_idの記録を突き合わせて読んでください。
+```
+
+### 13.6 データのvintage(いつ時点のデータか)の読み方(Issue #69、2026-09-09追加)
+
+1回のスクリーニングバッチは、**取得時点の異なるデータが同居した状態**で回ります。
+どの銘柄がどの時点のデータで評価されたかを事後に説明できるよう、監査へvintageを
+記録しています。★ **記録するだけで、判定は止めません**(理由は本節末尾)。
+
+#### 候補ユニバース(2ファイル)のvintage — BatchRunsTableとfinalize時点の監査ログ
+
+候補の母集団は「東証上場銘柄一覧」と「JPX400構成銘柄」の**2ファイル**から作ります。
+この2つは独立した閾値(`listed_issues_max_stale_hours` /
+`jpx400_max_stale_hours`)でそれぞれ鮮度判定されるだけで、**相互の整合は
+検査していません**。そのため両者の公開日がどれだけ離れているかを記録します。
+
+```
+universe_source              DOWNLOADED / CACHE(上場銘柄一覧側)
+universe_promoted            今回の取得が昇格したか
+universe_source_date         上場銘柄一覧の公開日
+universe_cache_age_days      ★ **現在時刻から**公開日までの経過日数(暦日、切り捨て)
+universe_jpx400_promoted     JPX400側の同じ値
+universe_jpx400_source_date  JPX400の公開日
+universe_jpx400_cache_age_days
+universe_vintage_gap_days    ★ **2つの公開日どうし**の差(暦日、絶対値)
+```
+
+```
+★ `*_cache_age_days`と`universe_vintage_gap_days`は**基準が違います**。
+  前者は「今から見て何日前のデータか」、後者は「2ファイルがどれだけ離れているか」。
+  取り違えると「片方だけが古い」と「両方とも古い」を混同します。
+
+★ どちらかの公開日が不明なときgapは**0ではなくNone**です。
+  0は「一致している」を意味し、Noneは「比較できなかった」を意味します。
+
+★ 公開日が離れているとき、CloudWatch Logsへ
+  `candidate universe vintage mismatch ... gap_days=N (処理は継続する)`
+  というWARNINGが出ます。比較できなかったときは
+  `candidate universe vintage gap unavailable ...`です。
+  平常運転では後者は出ません(昇格済みキャッシュは必ず公開日を持つため、
+  出るのは初回とキャッシュ読み取り自体が失敗した場合だけです)。
+```
+
+#### 財務・配当キャッシュのvintage — 銘柄単位の進捗行
+
+財務・配当のキャッシュは7日(168時間)のTTLのみで鮮度を制御しており、
+**キャッシュキーにJST暦日を含みません**。そのため同一バッチ内で、ある銘柄は
+当日取得の財務、別の銘柄は数日前の財務で評価されます。銘柄ごとに次を記録します
+(`WatchlistCandidateProgressTable`)。
+
+```
+financial_cache_reused_count     キャッシュを再利用した件数
+financial_cache_refetched_count  取り直した件数(期限切れ + 初回)
+financial_cache_age_hours_max    ★ **実際に使った**古さの最大(単位はhours)
+financial_cache_age_hours_min    同 最小
+```
+
+```
+★ 単位は**hours(小数)**です。候補ユニバース側の`*_days`(暦日)とは違います。
+
+★ 再利用が0件のときmax/minは**0ではなくNone**(属性そのものが書かれません)。
+  0は「0時間前の新しいデータを使った」と読めてしまいます。
+  「取り直した件数」は残るため、測っていないわけではないと分かります。
+
+★ 「捨てた古さ」は含みません。期限切れで取り直した場合、評価に使ったのは
+  新しく取得した値であるため、古さは記録しません。
+
+★ **価格系キャッシュは含みません**。価格はキャッシュキーにJST暦日を含むため、
+  日をまたいだ再利用が構造的に起きないからです。
+
+★ 本変更の反映前に書かれた行には属性がありません。読み出し側はNoneとして
+  扱います(0で埋めません)。
+
+同一バッチ内のvintageの幅は、銘柄単位の`financial_cache_age_hours_max`と
+`financial_cache_age_hours_min`を集めれば算出できます
+(バッチ単位の集計値は保存していません)。
+```
+
+#### ★ 財務キャッシュにJST暦日キーを導入しない理由(Issue #69の結論)
+
+価格キャッシュと同様に財務キャッシュへもJST暦日キーを入れれば、日をまたいだ
+再利用は構造的に無くなります。**しかし導入しません。**
+
+```
+現在   財務の再取得は1日あたり概ね400件程度
+       (新規候補300 + watchlist 716の1/7が期限切れ ≒ 100)
+日次キー導入後  watchlist 716 + 新規候補300 = 毎日1,000件超が必ず再取得
+
+=> 財務系provider呼び出しが**約2.5倍**。財務は1銘柄あたり複数系列
+   (財務・配当・履歴評価・CF・サプライズ)を取得するため、実HTTP数の増加は
+   これより大きくなります。provider側の不安定さは別Issueで実際に問題化して
+   おり、安易に増やせません。キャッシュ行数も日次で増えるため、保持期間の
+   設計とも衝突します。
+```
+
+まずvintageを**記録**し、実測が貯まってから日次キー化・バッチ単位のvintage固定・
+決算更新検知による無効化のいずれが必要かを判断します。
+
+#### ★ vintageの乖離で処理を止めていない理由
+
+vintageが離れていても、記録とWARNINGだけで**処理は継続します**。
+
+```
+候補ユニバースの取得が一時的に失敗しただけで候補の自動追加そのものが停止すると、
+「取得失敗が外から分からないまま古いデータで走り続ける」問題(Issue #223)を
+直したはずが、今度は「止まっていることが分かりにくい」別の問題になります。
+どこまでの差を許容するかの基準は、記録が貯まってから決めます。
+```
+
+## 14. Lambda Layer依存パッケージの更新手順(Issue #35、2026-08-28追加)
+
+本番Lambdaの依存Layer(DependenciesLayer)は、再現可能ビルドのため
+lock方式で管理しています(それまでは範囲指定のみだったため、`sam build`の
+実行日時によって推移的依存の解決結果が変わり、Issue #33デプロイ時に無関係な
+`platformdirs 4.11.4→4.11.5`でLayerVersionローテーションが発生しました)。
+
+- `infra/layer/requirements.in`: 人間が編集するdirect依存の正本(範囲指定)
+- `infra/layer/requirements.txt`: **自動生成物(直接編集禁止)**。全依存の
+  完全pin。SAMが実際に使うmanifest
+- `infra/layer/build-requirements.txt`: compileツール(uv)のバージョン固定
+
+再生成の標準コマンド・compile条件(Python 3.12/Linux x86_64)は
+[infra/README.md](../infra/README.md)の「Layer dependency lock」節を参照
+してください。
+
+### 14.1 依存更新の標準フロー
+
+1. **意図的な更新**(範囲変更・パッケージ追加/削除): `requirements.in`を
+   編集 → 標準コマンドで再生成 → `requirements.txt`の差分をレビュー → PR
+2. **定期更新・セキュリティ更新**(範囲内のパッチ取り込み):
+   `requirements.in`は変更せず、標準コマンドへ`--upgrade`(または
+   `--upgrade-package <名前>`)を付けて再生成 → 差分 = 更新一覧としてレビュー → PR
+3. いずれの場合も「次回デプロイでLayerVersionローテーション(Add/Removeペア)が
+   発生する意図的な変更」であることをPR上で明示してください。逆に、依存を
+   変更していないデプロイのChangeSetにDependenciesLayerの差分が現れた場合は
+   想定外なので、原因を確認してから実行してください。
+
+### 14.2 運用上の注意
+
+- CIの`layer-lock-drift`ジョブが「`.in`から再生成した結果と`requirements.txt`の
+  一致」を検証します(`.in`だけ変更して再生成を忘れるとCI FAIL)。
+  `dependency-audit`ジョブは本番Layerに実際に入る`requirements.txt`を
+  pip-audit監査します(脆弱性検出時は14.1の2の手順で更新)
+- lockを更新しない限り、`sam build`は何度・いつ実行しても同一の依存集合を
+  生成します。rollback時は過去コミットをcheckoutして`sam build`すれば当時の
+  Layerが再現されます(PyPI側でyank/削除されていない限り)
+- ※注記(Issue #796。Release W10で、同じ版でもLayerのバイト列が前回と一致しなかった): 上の「同一の依存集合」は、
+  パッケージとその版が同一であることを指します。同じ版でも、wheelの種別
+  (例: cryptographyのmanylinux_2_17とmanylinux_2_34)は、build環境(ホストのOS・glibc・
+  pip・SAM CLIとaws_lambda_buildersの版・`--use-container`の使用の有無)で変わりえます。
+  このため、同じ入力・同じ版でも、build環境が同一でなければ、DependenciesLayerのバイト列
+  (ディレクトリMD5)の一致は保証されません(一致しないことがあります)。上の「rollback時に
+  当時のLayerが再現される」も、build環境が同一でない場合は保証されません。
+  詳細はIssue #796を参照してください
+- `tzdata`は`requirements.in`へ明示的に記載しています(pandas等がWindows限定
+  markerで宣言しているため、Linux向け解決では自動には入らない。従来の
+  Windows機ビルドの本番Layerとの同一性維持と、Lambda実行環境でのzoneinfo用
+  IANAタイムゾーンデータ保証のため)。除外する場合は専用Issueで判断して
+  ください
+- Layerの入力は`infra/layer/requirements.txt`(`requirements.in`からuvで生成する完全pin)
+  です。リポジトリ直下の`requirements-lock.txt`は、CI(lint / typecheck / test /
+  dependency-audit)用の別のファイルで、Lambdaには入りません。両者は別のファイルで、
+  同じパッケージの版が一致するとは限りません
+
+## 15. NotificationLogのGSI/TTL移行(Issue #32、2026-08-28追加)
+
+NotificationLogテーブル(`jstock-notification_log`)の再送判定・dedup読み取りは
+従来「全件Scan+Pythonフィルタ」であり、通知履歴の増加に伴い読み取りコストが
+単調増加する構造でした。Issue #32で、主要オンライン読み取り(銘柄scope/
+保有scopeの最新1件取得)をGSI Queryへ移行し、保持期間(TTL)を導入します。
+
+- 保持期間: **730日**(再送判定期間・評価ホライズン最大250営業日・
+  backtest/replay・監査参照をすべて包含)。TTLはcleanup専用であり、業務ロジックは
+  削除時刻に依存しません(TTL失効後の残留は再送抑止が効き続ける安全側)
+- **PROFIT_PROTECTION_ATTENTION(利益保全注意)のみTTL対象外**(同一局面の
+  再送抑止が局面変化まで無期限に必要なため。件数は極小)。将来このtypeの件数が
+  増大した場合は別Issueで再評価する
+- 追加されるDynamoDBトップレベル属性(既存の`data` JSON本体は一切不変):
+  `nl_stock_type_key` / `nl_holding_type_key` / `nl_sent_sort`(時刻+
+  notification_idによる完全順序ソートキー)/ `nl_expires_at`(TTL、epoch秒)
+
+### 15.1 段階リリース手順(各deploy・backfillは個別に人間承認が必要)
+
+| Phase | 内容 | 単位 |
+|---|---|---|
+| A | save時のindex/TTL属性dual-write(読み取りは従来Scanのまま) | PR 32-A → main merge → deploy |
+| backfill | 既存itemへの属性付与(下記15.2) | 人間が手元で実行 |
+| B | GSI-1(`nl_stock_type_key-index`)追加 | PR 32-B → main merge → deploy |
+| C | GSI-2(`nl_holding_type_key-index`)追加 + TTL有効化 | PR 32-C → main merge → deploy |
+| 検証 | 移行完了acceptance(15.3) | `--verify`(read-only) |
+| D | 読み取りのGSI Query切替 | PR 32-D → main merge → deploy |
+
+CloudFormationは1回のupdateで1つのGSIしか作成できないためB/Cを分割しています。
+TTL有効化は「一度削除されたitemはtemplateをrevertしても復元できない」不可逆な
+データライフサイクル変更のため、GSI移行が進んだPhase Cで有効化します。
+各deployは`sam deploy --no-execute-changeset`でChangeSetのReplacement列が
+すべてFalseであることを確認してから実行してください(11節と同じ運用)。
+
+### 15.2 backfill手順(Phase Aデプロイ後・Phase D前に必須)
+
+`scripts/backfill_notification_log_index_attributes.py`を使います。既定は
+dry-run(書き込みなし)。キー生成は通常save経路と同じ関数を共有しており、
+backfillと通常writeでロジックが乖離しません。冪等のため何度でも再実行できます。
+
+```bash
+# 1. dry-run(対象件数・更新予定属性の集計を表示するだけ)
+python scripts/backfill_notification_log_index_attributes.py --table jstock-notification_log
+
+# 2. 本実行(誤爆防止のため--confirm-tableでテーブル名の再入力が必要)
+python scripts/backfill_notification_log_index_attributes.py --table jstock-notification_log --execute --confirm-table jstock-notification_log
+
+# 3. 検証(read-only)
+python scripts/backfill_notification_log_index_attributes.py --table jstock-notification_log --verify
+```
+
+parse不能なitemが1件でも検出された場合、スクリプトはexit 1となり
+「migration完了」とは見なせません。該当itemを個別に確認・解消してから
+再実行してください。
+
+### 15.3 移行完了acceptance criteria(Phase D deploy前の必須ゲート)
+
+`--verify`(read-only)が以下すべてを満たしPASSすること:
+
+1. 属性coverage 100%(全itemが期待どおりのindex属性を保持。ATTENTIONは
+   `nl_expires_at`を持たないことも検査)
+2. parse不能item 0件
+3. GSI作成済みの場合: 全distinct scope keyについて「GSI Query(降順Limit=1)の
+   latest == Scan由来のlatest」が完全一致(**この一致確認が不十分なまま
+   Phase Dへ進むと、GSIから見えないlegacy itemにより previous=None →
+   誤再送、という最重要回帰が起きます**)
+
+`--verify`はphase-awareであり、GSIが未作成の段階では等価性検査をskipと表示
+します(その段階ではfailureではありません)。ただしPhase D前は必ずGSI作成後の
+`--verify`で3.を含む全項目のPASSを確認してください。
+
+### 15.4 rollback方針(phase別)
+
+- **Phase A**: コードrevert+再deployで戻せる。書き込み済みのindex/TTL属性は
+  残存するが、Scan読み取りは`data` JSONのみを参照するため無害
+- **Phase B**: template revert(GSI-1削除)で戻せる。ベーステーブルのデータは
+  不変
+- **Phase C**: GSI-2削除・TTL無効化はtemplate revertで可能。**ただしTTLに
+  よって既に削除されたitemは自動復元できない**(730日より古いitemのみが対象の
+  ため、通常の再送判定には影響しないが、この不可逆性を理解したうえで
+  有効化すること)
+- **Phase D**: コードrevert+再deployでScan読み取りへ戻せる(データ非依存)
+
+「1つ前のmain SHAへ戻せば完全rollback」ではない点に注意してください
+(特にPhase C以降のTTL削除分)。
+
+## 16. BUY calibration用datasetのexport(Issue #28 Phase B、2026-08-28追加)
+
+買い候補判定の較正(calibration)分析に使う正規化datasetを、既存の保存データ
+(Recommendation・EvaluationResult・DecisionSnapshot、いずれも読み取りのみ)
+から生成するCLIです。**判定・閾値・スコアには一切影響しません**(dataset生成・
+exportのみ。統計分析・成功率評価・閾値提案はPhase C以降で別途扱います)。
+日次バッチ・Lambdaへは組み込まず、人間のオンデマンド実行専用です。
+
+```bash
+# canonical export(JSONL。1行目がmetadata、以降が1 Recommendation×1 horizonの行)
+jstock calibration export-dataset --output dataset.jsonl
+
+# 閲覧用CSV(dataset.csv.meta.jsonというmetadataファイルも同時に生成される)
+jstock calibration export-dataset --output dataset.csv --format csv
+
+# sample定義を非重複window方式にし、選択行のみ・horizon未到来行を除いてexport
+jstock calibration export-dataset --output dataset.jsonl \
+  --sample-definition non-overlapping-window --selected-only --no-include-pending
+```
+
+- **return_basis=PRICE_ONLY**: リターンは株価のみ(配当・株主優待・手数料・
+  税金を含まない)。metadataに常に明記されます
+- benchmark: EvaluationResult保存済みの`benchmark_symbol`(TOPIX)を事実として
+  出力し、実際のinstrument(現行コードではTOPIX連動ETF 1306.T)は
+  「export時点の現在コードによる解釈」としてmetadata側にのみ記録します
+- 行のraw粒度は「1 Recommendation × 1 horizon」で、重複Recommendationは
+  dedupしません(sample定義は行を削除せずsample_selected等の列で注釈)
+- horizon未到来はNOT_YET_EVALUABLE、到来済みで評価が無い行は
+  EVALUATION_MISSINGとして残ります(黙って行を落としません)
+
+### 16.1 記述統計レポート(Phase C1、2026-08-28追加)
+
+exportしたdatasetから記述統計のanalysis artifact(JSONL)を生成できます。
+これも読み取り専用で、判定・閾値・スコアには一切影響しません。
+良いBUYの定義・優劣判定・閾値提案は含みません(将来のPhase C3で別途扱う)。
+
+```bash
+# sample定義は3種類: raw / non-overlapping-window / action-change
+jstock calibration export-dataset --output dataset.jsonl --sample-definition non-overlapping-window
+jstock calibration analyze --input dataset.jsonl --output report.jsonl
+```
+
+- **RAW datasetの注意**: 同一銘柄の日次Recommendation重複により行は独立標本では
+  ありません(SAMPLE_DEPENDENCY_WARNING)。記述統計・カバレッジ・到達率の
+  観察には使えますが、RAW行を独立と仮定した信頼区間・有意差・優劣判定には
+  使わないでください(analyzeもRAWにはWilson区間・bootstrapを付けません)
+- non-overlapping-window等も「独立性の保証」ではなく「同一銘柄内の重複window
+  によるpseudo-replicationの軽減」です(市場共通要因・セクター相関・
+  銘柄内の非重複window間依存は残ります)
+- 全horizonを独立表示します(60営業日は将来のprimary候補としてmetadataに
+  記載されるのみ。短期・中期・長期を1つの成功率へ混ぜません)
+- 小標本セルは数値を隠さずSMALL_SAMPLE_WARNINGを付与します(閾値は
+  分析パラメータとしてartifactのmetadataに記録)
+- benchmark将来リターンによるregime別集計はex-post層別です(LOOK-AHEAD。
+  予測特徴として使わないでください)
+- リターンはPRICE_ONLY(配当・優待・税・手数料を含まない)のままです
+
+## 17. valuation集約仮説のshadow分析export(Issue #20 Phase C、2026-08-28追加)
+
+適正価格(Fair Value)の集約・grouping仮説を、保存済みRecommendationの
+判定時点値だけを入力にoffline/shadowで並行計算し、raw shadow observation
+(canonical JSONL)と記述統計summary(CSV)としてexportするCLIです。
+**判定・閾値・適正価格・買付/利確価格・usability・通知には一切影響しません**
+(観測・比較のみ。最良仮説の決定・ランキング・閾値提案は出力しません。
+将来リターンとの結合分析は16節のcalibration datasetとrecommendation_idで
+joinして別途行います)。日次バッチ・Lambdaへは組み込まず、人間のオンデマンド
+実行専用です。
+
+```bash
+# canonical export(JSONL。1行目がmetadata、以降が
+# 1 Recommendation×1 context(BUY_RAW/BUY_DECISION/SELL_RAW)×1 仮説の行)
+jstock valuation-shadow export --output shadow.jsonl
+
+# 記述統計summary(CSV)も同時に出力
+jstock valuation-shadow export --output shadow.jsonl --summary shadow_summary.csv
+```
+
+- 復元不能・保存値と照合できない記録はOBSERVATION_UNAVAILABLEとして行ごと
+  残します(黙って落としません)。現在の設定・現在の株価による再計算はしません
+- H_A(現行方式)×BUY_DECISIONでは保存済みvaluation_anchorの再構成self-checkを
+  行い、どの現行式とも一致しない記録はRECONSTRUCTION_MISMATCHとして可視化し、
+  summaryのanchor差分統計から除外します
+- 探索由来の仮説(実測相関から導出)はhypothesis_origin=
+  EXPLORATORY_DATA_DERIVEDとして事前定義仮説と区別されます(性能比較時は
+  探索に使ったsampleとvalidation sampleを分離すること)
+- SELLのusability閾値(乖離2.0倍・最少2手法)は判定記録に保存されていない
+  ため、shadow計算parameterとしてmetadataに明記されます(#21で保存済みの
+  使用可否・理由コードがhistorical factです)
+- shadow価格(shadow_entry_price等)は仮説anchor×判定時点の保存済み
+  安全余裕率による参考値であり、約定・到達の判定には使いません
+
+---
+
+## 18. read-only観測・health checkにおける副作用確認(Issue #120、2026-09-02追加)
+
+### 18.1 なぜ必要か
+
+2026-09-02 08:00 JSTに、買い候補判定・保有銘柄判定の日次バッチが**両方とも
+1銘柄も処理せずに停止**する障害が発生した。当日の判定・LINE通知はいずれも
+0件だった(データ破壊・誤判定は無し。「何も出さなかった」障害)。
+
+原因は、バッチ開始時に呼ぶ株主優待レジストリの健全性チェックが、
+名前上は読み取りAPIである `list_all()` を呼び、その内部で権利確定日の
+再計算結果を `repository.save()`(DynamoDB PutItem)へ書き戻していたこと。
+両Lambdaは当該テーブルへ**読み取り専用IAM**しか持たないため
+`AccessDeniedException` となり、dispatch前にバッチ全体が落ちた。
+
+書き戻しは「再計算値が保存値と異なるとき」だけ発生するため、権利確定日が
+繰り上がる日付境界を越えた日に初めて顕在化した。**同じコード・同じIAMのまま、
+日付だけで発火する**タイプの障害である。
+
+### 18.2 恒久ルール
+
+**実行するコマンドやメソッドの名称がread系だからという理由で、
+安全(read-only)と判断してはならない。**
+
+Production read-only verification、health check、validation、
+IAM least-privilege設計を行う際は、**呼び出し先まで含めて**次の副作用が
+無いことを確認する。
+
+| 確認対象 | 具体例 |
+|---|---|
+| repository層の状態変更 | `save` / `upsert` / `update` / `delete` |
+| DynamoDB | `PutItem` / `UpdateItem` / `DeleteItem` / `BatchWriteItem` / `TransactWriteItems` |
+| S3 | `PutObject` / `DeleteObject` |
+| キュー・非同期 | SQS `SendMessage` / SNS `Publish` / Lambda `Invoke` |
+| 外部送信 | LINE Messaging APIへの送信 |
+
+確認は名前の1段スキャンでは不十分である。**Issue #120の実バグは、
+read-like名の関数から1段だけ辿っても検出できなかった**
+(`list_all()` → `_refresh_and_persist()` → `save()` と、write動詞を持たない
+privateヘルパを1段挟んでいたため)。推移的に辿ること。
+
+### 18.3 設計時の要求
+
+- read-onlyと定義した処理にhidden writeを持たせない。
+- 書き込みを伴う場合は、**API契約・名称・IAM・テスト**からその事実が
+  判別できるようにする(例: `get_or_create_*` のように名称へ表す)。
+- 観測・健全性チェックの類は、失敗しても本体処理を止めない(fail-soft)。
+  ただし**沈黙させない**。件数等が取得できなかった事実を構造化ログへ残す。
+- fail-softの対象は観測処理自身の失敗に限る。**判定に必要なデータの取得失敗まで
+  握り潰さない**(business dataの取得失敗は従来どおり銘柄単位で失敗として扱う)。
+
+### 18.4 IAM設計との関係
+
+新しいテーブルへの権限を設計する際は、11節(テーブル追加時の注意)に加えて、
+そのLambdaが到達しうる**すべてのコードパス**の副作用を確認したうえで
+最小権限を決める。read-onlyで足りるはずの経路にwriteが混ざっている場合、
+権限を足すのではなく**その経路のwriteを外せないか**を先に検討する
+(Issue #120では、書き戻していた値が純粋な派生値であり永続化する価値が
+無かったため、IAMを広げずに読み取り側の書き込みを除去した)。
+
+## 19. 本番シークレットのローテーション手順(Issue #117 Phase R1、2026-09-05追加)
+
+### 19.0 なぜ手順が必要か(この節の前提)
+
+Secrets Managerの値を更新しただけでは、**Lambdaは新しい値を使わない。**
+
+```
+credential再発行
+  -> Secrets Managerを更新
+  -> コード無変更でデプロイ
+  -> CloudFormationが「変更なし」と判定
+  -> dynamic referenceが再解決されず、Lambdaは旧credentialのまま
+```
+
+CloudFormationのdynamic referenceは、**それを含むリソースが更新されるときにしか
+再解決されない**ためである。表面上はデプロイが成功するため、この状態は
+気づかれないまま継続しうる。
+
+Phase R1では、秘密と同じEnvironmentブロックへ**非秘密のマーカー**を置き、
+ローテーション時に運用者が明示的にその値を変えることでリソース更新を強制する。
+
+```
+LineCredentialRotationVersion     -> LINE_CREDENTIAL_ROTATION_VERSION
+EdinetCredentialRotationVersion   -> EDINET_CREDENTIAL_ROTATION_VERSION
+```
+
+```
+通常のデプロイ      マーカーを変えない -> 再解決を意図しない
+ローテーション時    マーカーを明示的に変える -> 再解決を強制する
+```
+
+マーカーは非秘密である。**秘密値・トークン・キーを絶対に入れない**
+(この値は環境変数として平文で残り、`describe-stacks`等からも見える)。
+
+### 19.1 この仕組みの既知の性質(手順の前に必ず理解すること)
+
+#### 全Lambda関数が更新対象になる
+
+LINE・EDINETの秘密は`Globals`のEnvironmentに置かれているため、
+**どちらのマーカーを変えても全Lambda関数が更新対象になる。**
+これは現アーキテクチャ上の制約であり、恒久対策(実行時取得方式)で解消する。
+マーカーの目的は更新対象を絞ることではなく、**再解決が確実に起きること**と
+**着地を非秘密の値で確認できること**である。
+
+#### 他の秘密も同時に再解決される
+
+全関数が更新されるため、Webhook署名検証用の秘密(ローテーション対象外)も
+同時に再解決される。値を変更していなければ結果は同じ値であり実害は無いが、
+**Secrets Manager側に意図しない未反映の変更が残っていると、それも一緒に
+本番へ入る。** ローテーション前に、対象外の秘密について未反映の変更が無いことを
+確認する。
+
+#### R1自体のデプロイでも一度再解決が起きる
+
+マーカー環境変数の追加はEnvironmentの変更であるため、**R1を本番へ入れる
+デプロイ自体が一度の再解決を伴う。** これは仕組みが動くことの証明にもなるが、
+「Secrets Managerの現在値が本番へ入る」ことを意味する。R1のデプロイ前に、
+各シークレットの現在値が意図した稼働中の値であることを確認する。
+
+### 19.2 共通のHuman Gate(R2で必須)
+
+以下は**それぞれ別の承認**として扱う。まとめて1回の承認にしない。
+
+```
+1  credential再発行の承認        ★ 巻き戻せない操作の直前に必ず置く
+2  Secrets Manager更新の承認
+3  ChangeSet CREATEの承認
+4  そのexact ChangeSetのEXECUTE承認   CREATE != EXECUTE
+```
+
+```
+LINEとEDINETを同一波でローテーションしない。
+失敗時にどちらが原因か切り分けられなくなるため。
+```
+
+#### 例外: marker-only検証deploy(実際のcredential rotationには適用されない)
+
+「marker-only検証deploy」とは、**secretの値そのものは一切変更せず**、
+ChangeSetのparameter override等でマーカー値のみ(例: 0→1)を変更し、
+dynamic referenceの再解決が実際に起きることを確認する操作を指す。
+具体例: Issue #227(2026-09-10実施、Release W4)。LINE・EDINET両方の
+マーカーを同時に0→1へ変更したが、Secrets Manager側の値は1つも
+変更していない。
+
+```
+marker-only検証deployは、上記「LINEとEDINETを同一波でローテーションしない」
+の対象外である。
+
+理由: 同一波を禁じる目的は、失敗時にどちらのcredential変更が原因か
+切り分けられなくなることを防ぐためである。marker-only検証deployは
+credentialを1つも変更しないため、その失敗自体が原理的に起こらない。
+```
+
+```
+★ この例外は、実際のcredential rotation(secretの値そのものを更新する操作)
+  には一切適用されない。credentialを1つでも変更する波は、検証目的を
+  兼ねていても本節冒頭の制約(同一波で行わない)を通常どおり適用する。
+  「marker-only」と呼べるのは、その波でSecrets Managerへの書き込みが
+  ゼロ件である場合に限る。
+```
+
+### 19.3 LINEチャネルアクセストークンのローテーション
+
+本システムのトークンは**長期チャネルアクセストークン(long-lived)**である
+(2026-09-04に確認)。公式仕様上の性質は次のとおり。
+
+```
+同時に有効なトークンは1つだけ
+再発行すると現行トークンは無効化される
+ただし再発行時に、現行トークンの有効期間を**最大24時間延長**できる
+```
+
+```
+★ 延長を選ばずに再発行すると、新しい値が本番へ着地するまでLINE通知が
+  全面停止する。延長の選択は独立したチェック項目として扱う。
+```
+
+手順。
+
+```
+1   Human Gate: 再発行の承認を得る
+2   コンソールで再発行する。このとき **現行トークンの有効期間を延長する**
+    (延長を選んだことを、次へ進む前に確認する)
+3   Human Gate: Secrets Manager更新の承認を得る
+4   Secrets Managerの該当シークレットを新しい値へ更新する
+    -> 入力方法は19.6を必ず参照(コマンド引数へ値を書かない)
+5   LineCredentialRotationVersionを**明示的に別の値へ変更**する
+    (例: 単調増加する整数。日付や連番でよい。秘密は入れない)
+6   Human Gate: ChangeSet CREATEの承認を得る
+7   ChangeSetをCREATEし、差分を確認する
+    -> Lambda関数がModifyになっていること(NO_CHANGESなら19.5-Cへ)
+    -> Replacementが発生していないこと
+    -> 意図しないリソースが含まれていないこと
+8   Human Gate: **そのexact ChangeSet**のEXECUTE承認を得る
+9   EXECUTEする
+10  着地確認: LINE_CREDENTIAL_ROTATION_VERSIONが新しい値になっていること
+    -> 確認方法は19.6(環境変数を全件出力しない)
+11  疎通確認: LINE通知が実際に送れること
+    -> 延長した24時間が切れる前に完了させる
+```
+
+### 19.4 EDINET APIキーのローテーション
+
+公式仕様(EDINET API仕様書 Version 2)上の性質。
+
+```
+再発行すると再発行前のAPIキーは無効化される
+新旧の併存はできない
+旧キーへ戻す手段が無い(復旧は前進のみ)
+```
+
+```
+★ LINEと違い、有効期間の延長に相当する猶予が無い。
+  再発行した瞬間から、新しい値が着地するまでEDINET取得は失敗する。
+  したがって「戻せる状態を先に作ってから再発行する」順序にする。
+```
+
+手順。
+
+```
+1   ローテーション時間帯を決める(日次バッチと重ならない時間にする)
+2   Secrets Manager更新とマーカー変更以外の準備を先に済ませる
+3   Human Gate: 再発行の承認を得る ★ここから先は巻き戻せない
+4   コンソールで再発行する(確認ダイアログでOKを押した時点で旧キーは無効)
+5   Human Gate: Secrets Manager更新の承認を得る
+6   Secrets Managerの該当シークレットを新しい値へ更新する(19.6参照)
+7   EdinetCredentialRotationVersionを明示的に別の値へ変更する
+8   Human Gate: ChangeSet CREATEの承認を得る
+9   ChangeSetをCREATEし、19.3-7と同じ観点で差分を確認する
+10  Human Gate: そのexact ChangeSetのEXECUTE承認を得る
+11  EXECUTEする
+12  着地確認: EDINET_CREDENTIAL_ROTATION_VERSIONが新しい値になっていること
+13  疎通確認: EDINETからの取得が成功すること
+```
+
+### 19.5 失敗パターンと復旧
+
+```
+ROLLBACK = FORWARD_FIX を基本とする。
+```
+
+credentialは「元に戻す」ことができない場合がある(EDINETは常に不可、LINEは
+延長期間を過ぎると不可)。**CloudFormationのアーティファクトのロールバックと、
+credentialのロールバックを混同しない。** スタックを前のバージョンへ戻しても、
+無効化された旧credentialは復活しない。
+
+```
+A  再発行は成功したが、Secrets Managerの更新に失敗した
+   -> 新しい値は手元にある。更新をやり直す。
+      再発行はやり直さない(やり直すと今の値も無効になる)
+
+B  Secrets Manager更新は成功したが、ChangeSet CREATEに失敗した
+   -> 前進して再試行する。Secrets Managerを元に戻さない
+      (旧credentialは既に無効であり、戻しても復旧しない)
+
+C  ChangeSetがNO_CHANGESになった
+   -> ★ R1の設計上これは異常。マーカーの変更が効いていない可能性がある。
+      次を確認する。
+        マーカーの値を実際に前回と違う値にしたか
+        マーカーを渡すパラメータ名が正しいか
+        既定値のまま何も渡していないのではないか
+      EXECUTEへ進まない。原因を特定するまで停止する
+
+D  デプロイに失敗した
+   -> スタックの状態を確認し、前進して修正する。
+      credentialは既に切り替わっているため、アーティファクトだけを
+      戻しても復旧しない点に注意する
+
+E  疎通確認に失敗した
+   -> まず着地確認(マーカーの値)を見る。
+      マーカーが新しい値なら再解決は起きている
+        -> Secrets Managerへ入れた値そのものを疑う
+      マーカーが古い値のままなら再解決が起きていない
+        -> Cと同じ調査へ進む
+      LINEの場合、延長した24時間が残っているうちに切り分ける
+```
+
+### 19.6 セキュリティのガードレール
+
+現アーキテクチャでは秘密がLambdaの環境変数へ平文で入る。したがって
+**確認作業そのものが漏洩経路になりうる。**
+
+```
+禁止  Lambdaの構成を全件出力すること
+      (環境変数がそのまま出力され、秘密が端末・履歴・ログへ残る)
+必須  必要なフィールドだけを --query 等で絞って取得する
+      着地確認で必要なのはマーカーの値だけであり、他の環境変数は不要
+```
+
+```
+禁止  通常の確認作業でSecrets Managerの値そのものを取得すること
+      (SecretString / SecretBinary を読み出さない)
+      値が正しいかは「疎通するか」で確認する
+```
+
+```
+禁止  秘密値をコマンドの引数に書くこと(シェル履歴へ残る)
+推奨  次のいずれか
+        コンソールのSecrets Manager画面で値を入力する(履歴が残らない)
+        やむを得ずCLIを使う場合は、権限を絞った一時ファイルから読み込み、
+        作業後にそのファイルを確実に削除する
+      いずれの場合も、値を画面へ表示させない
+```
+
+```
+禁止  秘密値を次へ書くこと
+        Issue / PR / コミットメッセージ / CIログ / スクリーンショット
+        設定ファイル / テストのfixture / この手順書
+```
+
+```
+マーカーの値には秘密を入れない。
+マーカーは平文で残ることを前提とした非秘密の版数である。
+```
+
+---
+
+## 20. DynamoDBの復旧手順(Issue #137、2026-09-05追加)
+
+### 20.1 何が設定されているか
+
+Phase Aのデータ分類にもとづき、**失うと再生成できないデータを持つ37テーブル**へ
+次の4つを`infra/template.yaml`で設定している(手動設定は行わない)。
+
+```
+PointInTimeRecoverySpecification   直近35日への時点復元
+DeletionProtectionEnabled          DeleteTable自体の禁止
+DeletionPolicy: Retain             stack削除・template除去で実体を残す
+UpdateReplacePolicy: Retain        置換時に古い実体を残す
+```
+
+cache(外部から再取得可能)と一時状態(ロック・claim・進捗・VALIDATION専用)の
+17テーブルには**意図的に付けていない**。
+
+```
+★ 一時状態は「復元してはいけない対象」である。
+  ロック・claimを過去時点へ戻すと、取得済みロックの復活や
+  送信済み通知の再送といった二次障害を起こす。
+```
+
+分類はテストで固定している(`tests/unit/test_infra_issue_137_dynamodb_data_protection.py`)。
+新しいテーブルを追加すると、保護を付けるか対象外リストへ入れるまでテストが落ちる。
+
+### 20.2 4つの機能の違い(混同しない)
+
+| 機能 | 効く契機 | 守る対象 |
+|---|---|---|
+| PITR | 復元操作 | 直近35日の**内容** |
+| DeletionProtectionEnabled | DeleteTable | **テーブル自体** |
+| `DeletionPolicy: Retain` | stack削除 / templateから定義を外す | 実体を残す |
+| `UpdateReplacePolicy: Retain` | 置換が発生したとき | **古い方**を残す |
+
+互いの代替にはならない。
+
+### 20.3 復旧目標
+
+```
+RPO_TARGET                  約5分
+RESTORE_POINT_GRANULARITY   1秒
+RTO_TARGET                  3時間以内
+BUSINESS_TARGET             可能なら次の08:00 JSTの営業バッチまでに復旧する
+```
+
+RPOが「秒単位」ではなく約5分なのは、PITRの**最新復元可能時刻が現在時刻より
+数分前**になるためである。復元時刻は1秒刻みで選べるが、直前数分ぶんは戻らない。
+
+```
+3時間はJstock側の運用目標であり、AWSが保証する値ではない。
+```
+
+### 20.4 復元の前提(必ず読む)
+
+```
+RESTORE_MODE = NEW_TABLE_ONLY
+```
+
+PITRの復元は**常に新しいテーブルを作る**。既存テーブルへのin-placeロールバックは
+できない。したがって「PITRをONにすればワンクリックで戻せる」は誤りであり、
+復元後のcutoverまでが手順である。
+
+復元先テーブルへ**引き継がれない**もの。
+
+```
+PITR設定 / DeletionProtectionEnabled / TTL / タグ / stream /
+auto scaling / resource policy / CloudWatchアラーム
+既存ARNを参照するIAM・アプリ設定も自動追従しない
+```
+
+本システムはテーブル名を`<接頭辞>-<論理名>`として単一の環境変数から解決している。
+接頭辞は54テーブル共通のため、**接頭辞の切替による復旧は使えない**
+(1テーブルだけ戻したい場合でも全テーブルが切り替わる)。
+
+### 20.5 テーブル横断の整合性
+
+```
+SHARED_RESTORE_POINT_REQUIRED = YES
+```
+
+購入・売却の確定処理は、取引・購入ロット・保有の**3テーブルを1回の
+TransactWriteItemsで同時に書いている**。したがって関連テーブルを別々の復元時刻へ
+戻すと、書き込み時には存在し得なかった不整合が生まれる。
+
+```
+関連テーブルを別々のrestore timestampへ戻すことは標準手順として禁止する。
+```
+
+復元後は最低限、次をread-onlyで検証する。
+
+```
+取引の累積と購入ロットの整合
+購入ロットと保有の整合(数量・金額の不変条件)
+orphanレコードの有無(片側にしか存在しない関連)
+3テーブルが同一の復元時刻であること
+```
+
+### 20.6 復元drillの手順(実施は別Human Gate)
+
+Production を直接巻き戻さない。隔離したテーブルへ復元して検証する。
+
+```
+PRECONDITION
+  対象テーブルでPITRが有効
+  Human の drill 承認を取得済み
+  Production の変更が無い時間帯であること
+
+RESTORE_TIMESTAMP
+  latest restorable time を確認し、その値以前の時刻を選ぶ
+  障害復旧の場合は「事象発生の直前」を選ぶ
+
+RESTORE_TARGETS
+  トランザクション整合グループ(取引・購入ロット・保有)は必ずまとめて扱う
+
+SHARED_RESTORE_POINT
+  対象テーブルすべてへ同一の復元時刻を指定する
+
+RESTORE_DESTINATION
+  本番と衝突しない名前の新規テーブルへ復元する
+  例: <接頭辞>-restoredrill-<論理名>-<日時>
+
+NETWORK/ACCESS_ISOLATION
+  復元先はアプリから参照しない。CLIのread-only検証のみ
+  Lambda の環境変数・接頭辞は変更しない
+
+NO_PRODUCTION_TRAFFIC
+  本番テーブルへは一切書き込まない
+
+SCHEMA_VALIDATION      キー構成・GSI・属性の型
+ITEM_COUNT_VALIDATION  件数が復元時刻の期待と矛盾しないこと
+BUSINESS_KEY_VALIDATION 主キーの重複・欠落・必須項目の欠落
+CROSS_TABLE_CONSISTENCY 20.5の検証を実施する
+
+TTL_RECONFIGURATION                復元先はTTLが無効。必要なら設定し直す
+TAG_RECONFIGURATION                タグは引き継がれない
+STREAM_RECONFIGURATION             streamは引き継がれない
+PITR_RECONFIGURATION               復元先のPITRは無効
+DELETION_PROTECTION_RECONFIGURATION 復元先の削除保護は無効
+
+CUTOVER_OPTIONS                    20.7を参照
+ROLLBACK
+  本番へ書き戻す場合は、実施直前に現状のon-demand backupを取得してから始める
+CLEANUP
+  drill用テーブルを削除する(保管コストを残さない)
+EVIDENCE
+  実施日時・復元時刻・検証結果・所要時間をIssueへ記録する
+```
+
+```
+drillで確認したいのは「復元できること」ではなく、
+「復元してから通常運用へ戻すまでの手順が実際に成立すること」である。
+```
+
+
+```
+★ 実施して分かったこと(2026-09-08 の drill。Issue #226)
+
+★ 1  件数の確認に ItemCount を使わない
+     復元直後の describe-table は ItemCount = **0** を返す。DynamoDB の ItemCount は
+     約 6 時間ごとの更新であり、新規テーブルでは 0 のままである。
+     ★ **必ず Select=COUNT の scan で数え直すこと。**
+     ★ これを知らないと「復元失敗」と誤判定する(本 drill で実際に 3 テーブルとも
+       0 が返り、実件数は 8 / 27 / 27 で一致していた)。
+
+★ 2  復元先を本番へ昇格する場合、**最初に** PITR と削除保護を有効化する
+     復元先は PITR = DISABLED / 削除保護 = False で作られる(引き継がれない)。
+     ★ 昇格した瞬間から **バックアップが無い状態**になる。
+     TTL / stream / タグも引き継がれない。
+
+★ 3  transactions は holdings_v2 への参照整合性を **持たない**
+     FULL_SELL は保有を消すため、取引記録が指す holding_id が holdings_v2 に
+     残らないことがある。★ 孤児が出るのは **正常**であり復元の欠陥ではない。
+     ★ 判定は「本番と復元先で孤児件数が一致するか」で行う
+       (本 drill では両方 5 件で一致し、復元が忠実であることを確認した)。
+
+★ 併せて  タグは本番側も 0 件だった。★ 復元先を残した場合の課金を
+     **タグでは追跡できない**。実額は請求で確認する。
+```
+### 20.7 実際の復旧時のcutover方針
+
+```
+第一候補  復元専用テーブルへ復元 → 検証 → 必要なレコードだけ本番へ書き戻す
+```
+
+利用者所有データは規模が小さいため、この方式が現実的である。CloudFormationの
+管理下から外れるテーブルが生じない点でも安全である。
+
+```
+本番テーブルへの書き戻しは PRODUCTION_DATA_MUTATION であり、別のHuman Gateが要る。
+runbookに書いてあることは実行してよいことを意味しない。
+```
+
+「本番テーブルを丸ごと復元テーブルへ切り替える」方式は標準にしない
+(接頭辞が全テーブル共通であり、CloudFormationの管理とも整合しないため)。
+
+### 20.8 直前数分ぶんの取りこぼし
+
+```
+RECENT_WRITE_RECONCILIATION_REQUIRED = YES
+```
+
+PITRの最新復元可能時刻には遅れがあるため、障害直前の数分間の更新は復元されない
+可能性がある。復旧時は次を確認する。
+
+```
+1  事象の開始時刻を特定する
+2  latest restorable time を確認する
+3  その差分(gap window)を明示する
+4  gap window中に利用者操作があったかを確認する
+   LINEの操作履歴・CloudWatch Logs・取引履歴などから追跡できる範囲で確認する
+5  復元されなかった操作があれば、利用者へ再登録を依頼する
+6  再登録の内容と実施をIssueへ記録する
+```
+
+個人特定情報、およびそれと結び付いた資産情報は記録・引用しない(user_manager_collaboration_protocol.md 11節)。
+
+### 20.9 テーブル置換が必要な変更を行うとき
+
+```
+「とりあえずDeletion Protectionを無効化する」を標準手順にしてはならない。
+保護を自動で外す運用にすると、保護が実質的に無効になる。
+```
+
+置換が必要かどうかは、変更するpropertyがreplacementを要求するかで決まる。
+すべての更新が置換になるわけではない。次の順で確認する。
+
+```
+1  その変更に本当にreplacementが必要か(別の手段で目的を達成できないか)
+2  対象がauthoritative dataか(失うと再生成できないか)
+3  PITR・backupの状態を確認する
+4  依存するconsumer(Lambda・IAM・CLI)を洗い出す
+5  TableNameを明示指定していることによる制約を確認する
+   同名テーブルを同時に存在させられないため、置換の可否に影響する
+6  ChangeSetを作成し、実際にreplacementが起きるかを確認する
+7  Human Gate(ここまでは調査。ここから先は承認が要る)
+8  replacementが避けられない場合のみ、そのケース固有の移行手順を設計する
+9  移行後の検証(20.5と同じ整合性チェック)
+10 古い実体のcleanupは別のHuman Gate(Retainにより自動削除されない)
+```
+
+```
+TEMPORARY_DISABLE_REQUIRED = CASE_SPECIFIC
+```
+
+Deletion Protectionの一時解除が必要なケースが**実在すると確認できた場合にのみ**、
+そのケース限定の手順として設計する。一般則にはしない。
+
+### 20.10 今回入れていないもの
+
+```
+SCHEDULED_ON_DEMAND_BACKUP = NO
+AWS_BACKUP_PLAN            = NO
+CROSS_ACCOUNT_COPY         = NO
+CROSS_REGION_COPY          = NO
+```
+
+PITRの35日で開始し、必要性は実績で判断する。35日を超える保管や、
+AWSアカウント侵害への耐性(別アカウントへの退避)が必要になった場合の拡張点として
+記録しておく。
+
+```
+★ 現在の保護は「誤操作・不具合」には有効だが、
+  「credential侵害」には十分でない。
+  同一アカウント内の強い権限を持つprincipalは、primaryもbackupも消せる。
+  この点は Issue #133 / #164 の解消と合わせて評価する。
+```
+
+PITRの課金は保存量に比例するため、保持期間の設計(Issue #138)と足並みを揃える。
+
+---
+
+## 21. 公開面へ個人情報が混入した場合の是正手順(Issue #131、2026-09-06追加)
+
+本リポジトリはPUBLICである。**Git管理ファイルだけでなく、commit message、
+Issue / PR の本文とタイトル、コメント、label、branch名も、そのまま
+インターネットへ公開される。**
+
+公開面へ書く前の遵守事項は
+[user_manager_collaboration_protocol.md](user_manager_collaboration_protocol.md)
+11節が正本である。本節はそこを通り抜けて**露出してしまった後**の手順を扱う。
+
+### 21.1 検出経路
+
+| 経路 | 対象 | 実行契機 | 失敗したとき |
+| --- | --- | --- | --- |
+| `pii-scan` ジョブ | Git管理ファイルの内容 | 全push / PR | PRが止まる |
+| `pii-scan-commit-messages` ジョブ | そのPRが持ち込むcommit message | PR | PRが止まる |
+| `pii-metadata-audit` workflow | Issue / PR の本文・タイトル、コメント、label、branch名 | 日次(06:10 JST)+ 手動 | 通知のみ。PRは止まらない |
+
+手動実行は Actions タブの `PII metadata audit` から `Run workflow`
+(`workflow_dispatch`)。ローカルからは以下(read-onlyであり書き込みは行わない)。
+
+```bash
+python scripts/audit_public_metadata_pii.py kouitic/jstock_advisor
+python scripts/scan_commit_messages_pii.py "<base>..<head>"
+```
+
+いずれも `scripts/scan_for_pii.py` の denylist を共有し、**一致した文字列は
+出力しない**(面 / 所在 / 検出理由 / ハッシュ接頭辞のみ)。是正の際もこの
+表現のまま扱い、値そのものを報告・Issueコメント・chatへ再掲しないこと。
+
+```
+★ denylist方式であり、全てのPIIを検出できる保証はない。
+  検出は事後の網であって、事前防止の代わりにはならない。
+  日次監査は「露出から検知まで最大で24時間かかる」ことを意味する。
+```
+
+commit trailer の `noreply@anthropic.com` とGitHubの `*.noreply.github.com` は
+特定個人へ到達しない機械アドレスであり、メール様式の検出から除外している
+(付与が義務づけられており、検出しても是正できないため)。除外はこの2系統に
+限定してあり、ドメイン全体は除外していない。
+
+**確認済みの偽陽性の許可リスト(Issue #393、2026-10-03追加)**: メール様式の検出は、
+メールアドレスではない文字列(テストの decorator の参照など)にも一致する。
+公開面は後から編集できず(編集履歴が残る)、残った偽陽性が日次監査を赤くし続けると、
+新しい本物の検出に気づけなくなる。そこで、**人が分類して確認した偽陽性だけ**を
+`scripts/pii_audit_known_false_positives.json` へ宣言し、その検出だけを日次監査
+(`pii-metadata-audit`)から除外している。
+
+```
+照合      (location_type, location_id, reason, hash_prefix) の完全一致のみ。
+          hash単独・所在単独・部分一致・前方一致は不可。同じ形の文字列が別の所在に
+          現れても自動ではgreenにならない(新しい検出は従来どおりred)
+reason    EMAIL_PATTERN のみ許可。DENYLIST(既知の個人情報との一致)は載せられない
+不正な許可リスト  読み込みでfail-closed(監査はexit 2。greenにならない)
+可視性    除外した検出も出力に「既知の偽陽性として除外」として残る(面 / 所在 / reason /
+          hash接頭辞と件数)。どの検出にも一致しないエントリは警告として出る(失敗にはしない)
+変えていないもの  EMAIL_PATTERN・denylist・code blockの扱い・commit message走査
+```
+
+**許可リストの挙動(事実の記述)**: 許可リストは (面, 所在ID, reason, hash接頭辞) の完全一致で照合するため、
+許可済みの文字列が**別の所在**(新しいコメントや本文)に現れると、新しい検出として再び検出される
+(除外されるのは許可リストに載せた所在だけ)。本物の個人情報の検出は許可リストへ載せず、21.2 以降の
+手順で扱う。運用上の推奨は、別途 USER の判断事項である(本節は挙動の記述に限る)。
+
+**許可リストへ追加する手順**: 検出を**人が分類**し(メールアドレスではないと確認)、
+PRでエントリを追加する(ツールによる自動追加は作らない。エントリの追加は検出の無効化に
+当たるため、PR本文へ明記し、レビューで見る)。`confirmed_by` / `confirmed_at` には
+誰が・いつ分類したかの事実だけを書く。**一致した文字列そのものは、許可リスト・PR・
+コメントのいずれにも書かない**(hash接頭辞と分類のみ)。是正(21.3)の対象になる
+**本物の個人情報の検出は、許可リストへ載せず、21.2 以降の手順で扱う**。
+
+### 21.2 検出したらまず行うこと
+
+1. **影響範囲を確定する。** どの面 / どの所在(Issue番号・comment id・
+   commit SHA・branch名) / いつ公開されたか。
+2. **露出時間を見積もる。** 投稿時刻から現在まで。日次監査での検出なら
+   最大で1日ぶん遡る。
+3. **21.3 の是正と 21.4 の不可逆性を「両方」評価する。**
+   本文を直しただけでは終わらない。
+
+### 21.3 面ごとの是正手順
+
+| 面 | 手順 | 残るもの |
+| --- | --- | --- |
+| Issue / PR の本文・コメント | 該当箇所を架空値(「所有者A」等)へ編集 | **編集履歴** |
+| Issue / PR のタイトル | 同上 | **編集履歴** |
+| label | rename ではなく削除して作り直す(renameは名前の履歴を残す) | 付与されていたIssueのタイムライン |
+| branch名 | 新しい名前でbranchを作成してpushし、旧branchを削除 | PRのタイムラインに旧head branch名、dangling commit |
+| commit message | history rewrite が必要。**mainに対しては原則行わない** | rewrite前のcommitがforkやcloneに残る |
+
+commit message の是正は force push を伴い、他の作業者の作業branchを壊す。
+**作業AIは単独で実行しない**(21.5)。未mergeかつ自分だけが使っているbranchで
+あっても、実行前に人間の判断を得ること。
+
+### 21.4 不可逆性(必ず理解しておくこと)
+
+「編集すれば消える」は**誤り**である。編集後も次が残る。
+
+- **編集履歴。** Issue / PR / コメントの edit history は、書き込み権限の無い
+  閲覧者にも表示される。編集前の本文がそこに残る。
+- **通知メール。** 投稿時点で watcher へ配信済みであり、取り消せない。
+- **外部の複製。** 検索エンジンのcache、GHArchive等の公開アーカイブ、
+  各種ミラー・スクレイパ。GitHubの管轄外であり、GitHub側を消しても消えない。
+- **fork / clone。** commit は他者の手元に残る。
+
+したがって是正の目的は「無かったことにする」ではなく、
+**追加の露出を止め、残存経路を人間が把握したうえで判断できる状態にする**
+ことである。
+
+### 21.5 Human escalation の境界
+
+作業AIが単独で行ってよいこと。
+
+- 検出の報告(面 / 所在 / 検出理由 / ハッシュ接頭辞のみ)
+- **自分が**作成した未mergeのPR本文・**自分の**コメントの編集
+- **自分が**作成し、まだ他者が使っていないbranchの作り直し
+
+必ず人間の判断を仰ぎ、AIが単独で実行しないこと。
+
+- 他者が作成したIssue / PR / コメントの編集・削除
+- Issue / PR そのものの削除
+- history rewrite(force push)、mainへの介入
+- GitHub Support への削除依頼(21.6)
+- リポジトリのPRIVATE化
+- 露出の事実をどこまで公表するかの判断
+
+判断を仰ぐ際も、値そのものを書かない。所在とハッシュ接頭辞で示す。
+
+### 21.6 GitHub Support への削除依頼の要否
+
+依頼が要るのは「**GitHub側にしか残っておらず、こちらの操作では消せない複製**」
+を消す場合である。
+
+依頼で消せる可能性があるもの。
+
+- 編集履歴(edit history)
+- 削除済みbranch / fork に残る dangling commit
+  (SHAを直接指定するURLで到達できる)
+
+依頼でも消せないもの。
+
+- 検索エンジンのcache、GHArchive等の外部アーカイブ、他者のclone
+
+```
+依頼する    実在人物の氏名・個人メールアドレス・住所・電話番号など、
+            本人へ到達しうる情報が公開面へ出た場合(人間が実施する)
+依頼しない  架空値・銘柄コード・ハッシュ接頭辞・内部の状態値のみの場合
+```
+
+依頼文へ露出した値そのものを書かない。**URLと所在で示す**
+(依頼文自体がGitHubのサポート系統へ残るため)。
+
+### 21.7 事後
+
+- 再発防止をIssueとして起票する。3つの検出経路(21.1)のどれが漏らしたか、
+  事前防止(11節)のどこを通り抜けたかを記録する。
+- denylistへ追加する場合は `scripts/scan_for_pii.py` の `_KNOWN_PII_HASHES` へ
+  **SHA-256ハッシュのみ**を追加する。平文をリポジトリへ書かない
+  (ハッシュ値の計算はGit管理外のローカルで行う)。denylistは
+  `pii-scan` / `pii-scan-commit-messages` / `pii-metadata-audit` の
+  3経路が共有するため、追加は1箇所で足りる。
+## 22. 投資仮説 baseline の pointer 不整合の復旧(Issue #272、2026-09-09追加)
+
+保有判断が「その保有だけ永久に止まる」状態になる原因の 1 つが、
+投資仮説 baseline の **pointer 不整合**である。
+
+```
+(A) pointer が無く、baseline の履歴だけがある
+(B) pointer はあるが、指す baseline が見つからない / version が食い違う
+```
+
+いずれも `get_active_baseline()` が integrity_error を返し、保有判断はその時点で
+打ち切られる。**通常経路では復旧しない**(pointer を作る `activate_baseline()` は
+integrity_error の early return より後にあるため、何度実行しても到達しない)。
+
+### 22.1 どう気づくか
+
+**新しい alert は無い。既に見えている。**
+該当保有は毎日の BATCH_SUMMARY 通知に **failed として対象つきで**現れる
+(`evaluation_status = ANALYSIS_FAILED` / `error_code = DATA_INTEGRITY_ERROR`)。
+監査ログ(`audit_log`)と保有評価レコードにも記録される。
+
+つまり **利用者は気づいているが直せない**、という状態だった。本節の CLI がその手段である。
+
+### 22.2 手順
+
+```
+1  dry-run で対象を確認する(★ 読み取りのみ。書き込みは行わない)
+     jstock baseline-repair scan
+
+   出力は holding_ref(sha256 の先頭 8 文字)・理由区分・baseline 履歴(version / status /
+   origin)の一覧。★ 所有者名・銘柄コードは出力しない(Issue #135)。
+   ★ baseline_id も出力しない。生成規則が `<holding_id>:v<version>` であり
+     **holding_id(= 所有者#銘柄コード)がそのまま埋め込まれている**ため。
+     holding 内では version が一意なので、version だけで特定できる。
+
+2  ★ 対象が 0 件なら、そこで終わる。
+   ★ 0 件は「壊れている」ではなく「対象なし」を意味する。
+
+3  対象があれば、採用する baseline を**人が決める**。
+   (A) は履歴の最新 version が既定候補として表示される。
+   ★ (B) は候補を自動で選ばない。--baseline-version の明示指定が必須である。
+
+4  ★ Production に対する修復の実行は **利用者の承認**を得てから行う。
+     jstock baseline-repair apply --holding-ref <ref> [--baseline-version <n>]
+
+5  次の 08:00 の自然実行で、その保有の判定が再開することを確認する
+   (BATCH_SUMMARY の failed が減る)。
+```
+
+### 22.3 なぜ自動で直さないのか
+
+pointer は **意図的に古い baseline を指している場合がある**
+(baseline は `supersedes_baseline_id` で連鎖し、active は必ずしも最新ではない)。
+baseline は保有判断スコアの比較基準であり、**active が変われば score が変わる**。
+
+自動修復を入れると「気づかないうちに判定基準が入れ替わる」ことになり、
+「毎日 failed が通知され続ける」よりも危険である。したがって
+**バッチ内での自己修復は実装しない**。人が確認して実行する。
+
+### 22.4 やってはいけないこと
+
+```
+★ 動作確認のために pointer を意図的に壊さない(証拠を人工的に作らない)。
+★ apply を承認なしに Production へ実行しない。
+★ scan の出力を、holding_ref 以外の形(所有者名・銘柄コード)で記録・共有しない。
+```
+
+
+## 23. LINE認証情報の欠落を可視化する変更(Issue #117 stage (b))のProduction反映の運用条件(2026-09-19追加)
+
+この節は、Issue #117 stage (b)(LINE通知clientの構築を、認証情報が無い場合に黙って
+ConsoleLineClientへ落とさず可視化する変更)をProductionへ反映するときの運用条件を定める。
+決定の出典は #117 issuecomment-5740707381(USERの決定、MANAGER経由の伝達)。
+`PRODUCTION_DEPLOY_APPROVED = NO` であり、**ChangeSetのCREATEとEXECUTEは従来どおりそれぞれ別のHuman Gate**である
+(正本は `docs/user_manager_collaboration_protocol.md` 1.5節と本書19.2節)。
+
+### 23.0 反映で何が変わるか(前提)
+
+認証情報が正常な運用の挙動は変わらない。**欠落した場合だけ**、従来は黙って通知が失われていたものが、
+次のとおり可視化される(失敗する)。
+
+```
+line_webhook                 Lambda失敗(Errors)
+dispatcher(NEW_CANDIDATE)    lease取得・BatchRuns作成の前に失敗(バッチが作られない。状態変更なし)
+buy_candidates / holdings /  NORMAL・VALIDATION+SENDは失敗。DRY_RUNは従来どおり(認証情報不要)
+  disclosure_check
+worker / terminal_failure    (Issue #430で是正済み)状態変更(リース取得・完了記録・終端記録)は継続し、
+                              通知だけNOTIFICATION_FAILED。全処理の後にErrors。MAINTENANCEのみは影響なし
+                              (reconcilerと同じ契約へ統一。是正前は状態変更の前に失敗していた)
+reconciler                   ウォッチリスト登録は継続し、通知だけNOTIFICATION_FAILED。全処理の後にErrors
+weekly_review・CLI 3本        未変更(従来どおり)
+```
+
+LINE認証情報は `infra/template.yaml` の `Globals.Function.Environment.Variables` で、`{{resolve:secretsmanager:...}}` により
+**デプロイ時に全Lambda共通の値として固定**される(19.0節)。実行時にSecrets Managerを読みに行くのではない。
+
+### 23.1 反映の窓と、実行直前の必須確認(D1。#430の運用条件を含む)
+
+```
+推奨する窓        土曜 12:00 以降 〜 日曜(JST)
+                  ★ 時刻だけを安全条件にしない。次の必須確認を全て満たさなければ、土曜12:00以降であっても実行しない。
+```
+
+窓の根拠: dispatchは月〜金の06:00のみで、バッチは遅くとも24時間(`batch_processing_timeout_hours`)で毎時のreconcilerが確定する。
+金曜開始のバッチは土曜の朝までに終端する。土曜10:00・11:00の月次・四半期レビューの後なら、LINEを使うジョブとも重ならず、
+月曜06:00のdispatchまで丸1日の是正時間が取れる。
+
+**実行直前の必須確認(全て満たすこと。read-onlyで確認する)**
+
+```
+C1 NEW_CANDIDATE_SCREENINGの進行中バッチが0であること。
+   batch_runsの最新バッチが終端状態(COMPLETED / COMPLETED_WITH_NOTIFICATION_FAILURE / ABORTED / TIMED_OUT / DISPATCH_FAILED)であり、
+   DISPATCHING / RUNNING / FINALIZE_* / NOTIFICATION_* / TIMEOUT_* が無いこと。
+   ★ Issue #430是正後は、バッチ処理中にLINE credentialが欠落してもworkerの評価・登録自体は
+     継続する(候補が失われてTIMED_OUTになる旧来のリスクは解消済み。reconcilerと同じ契約)。
+     本条件は、純粋にバッチ処理中のデプロイそのものを避ける一般的な慎重策として維持する。
+C2 WatchlistScreeningQueue / WatchlistTerminalFailureQueue / WatchlistTerminalFailureDLQ の滞留が0であること。
+   (デプロイ後に増減を判定する基準にもなる)
+C3 LINE credential関連のデプロイ前確認が正常であること。
+   Secrets Managerの該当シークレットが**空でない**ことを、値を読まずメタデータ(存在・最新バージョン・更新日時)だけで確認する。
+   空のシークレットで再デプロイすると、全Lambdaの LINE_CHANNEL_ACCESS_TOKEN / LINE_USER_ID が空になる。
+   値・環境変数を全件出力しない(19.6節のガードレール)。
+C4 ChangeSet差分が想定内であること。Lambda関数がModifyのみで、Replacementが無く、意図しない資源が含まれないこと(19.3節の7と同じ観点)。
+```
+
+read-onlyの確認は `AWS_PROFILE=jstock-observer` で行う。観測用の権限で許可されない項目が
+ある場合は、権限を回避せず、その旨を報告して判断を仰ぐ。
+
+### 23.2 デプロイ後の手動確認(D2。暫定監視。期間限定)
+
+恒久のAlarmが未整備であるため、**このデプロイ固有の暫定監視**として次を行う。
+
+```
+V3 06:00のdispatcher: Errors = 0、BatchRunsが作成される(認証情報が有効であることの証拠)
+V4 worker: Errors = 0、WatchlistTerminalFailureDLQ(C2の基準)が増えていない
+V5 バッチが終端し、NOTIFICATION_FAILED / TIMED_OUT が無い(通知が実際に送信できた)
+V6 08:00のbuy / holdings、10:00・12:30・15:30のdisclosure、毎時のreconciler: Errors = 0
+V7 ログ検索(CloudWatch Logs Insights、read-only): LineCredentialsMissingError が0件
+```
+
+```
+期間     デプロイ直後 / 翌営業日 / その次の営業日
+         ・デプロイ直後は確認できる範囲(毎時のreconcilerのErrors・キュー/DLQの滞留・ログ検索。V4・V6・V7の一部)
+         ・営業日(月〜金)はV3〜V7を確認する
+終了     ★ 2営業日連続で異常が無ければ、今回のデプロイ固有の手動監視は終了してよい。
+         恒久監視が入るまで無期限の日次手作業にはしない。
+```
+
+**留意点**: 「Errorsが止まった = 復旧」とは限らない。worker・terminal_failureの連鎖(#430)が進んだ後は、
+認証情報を直してErrorsが止まっても、DLQに残ったメッセージ・TIMED_OUTになったバッチは自動では復旧しない。
+Errorsの有無だけでなく、DLQの滞留とバッチの終端状態(NOTIFICATION_FAILED / TIMED_OUT)も見ること。
+
+**恒久監視の未整備(残る問題。2026-09-24更新)**: CloudWatch AlarmはLambda 12本すべてに
+Errors alarmが接続された(Issue #504。#503のEvaluationFunctionを含む)が、**DLQの滞留Alarm
+は依然として存在しない**。また、per-item/per-batchの例外を握り潰す設計の6関数
+(BuyCandidates/HoldingsWatchlist/WatchlistDispatcher/WatchlistWorker/
+WatchlistBatchReconciler/LineWebhook)は、Errors alarmだけでは内部異常を検知できない
+(#506/#507が終端状態の監視で補完中)。Duration alarmはEvaluationFunctionのみ(#505で
+WeeklyReviewFunctionへの追加を検討中)。
+次の3点を #132(本番ジョブ異常の自動検知)の要件として記録した(#132 issuecomment-5740709204):
+(1) WatchlistTerminalFailureDLQのメッセージ滞留監視 (2) LINE関連LambdaのErrors監視 (3) 「Errorsが止まった=復旧」とは限らない点。
+**最新の状態は29節・#132の最新の記録を読むこと**(この節へ焼き込まない)。
+
+★ **2026-10-11更新**(Issue #188の点検。infra/template.yamlの実読): 上の「DLQの滞留Alarmは
+依然として存在しない」「Duration alarmはEvaluationFunctionのみ」は2026-09-24時点の記述で、現在は
+異なる。DLQの滞留Alarm 4本(WatchlistTerminalFailure / AsyncInvokeFailure /
+BuyCandidateTerminalFailure / HoldingsWatchlistTerminalFailure。Issue #349)が接続済みで、
+Duration alarmはEvaluationFunctionとWeeklyReviewFunctionの2本、Errors alarmはIncidentNotifier
+Functionを含む13本である。Alarmは合計19本で、すべてTreatMissingData = notBreaching・AlarmActions
+接続済み。per-item例外を握る6関数の内部異常がErrors alarmだけでは検知できない点は、この更新では
+確認していない(#132の最新の記録を読むこと)。
+
+### 23.3 DLQ redrive(障害時の候補案。★未検証。正式な復旧手順ではない)
+
+```
+REDRIVE_VERIFIED = NO
+```
+
+★ **この節は、正式な復旧手順ではない。** 検証(下記の6項目)を経るまでは「障害時の候補案」としてのみ扱う。
+なお、通知だけが欠落した場合(NOTIFICATION_FAILED)は、credential復旧前に既存のretry上限へ達すると
+自動通知されず、手動の retry-notification が必要になる(USER承認済みの契約。#117 issuecomment-5740407445)。手動の retry-notification は認証情報のある環境で実行する(認証情報が無いと、状態を変えずに終了コード1で終了する。4.1節。Issue #434)。
+
+worker・terminal_failureの連鎖(#430)でDLQに溜まったメッセージについて、認証情報を直した後にWatchlistScreeningQueueへ
+戻す(SQSのDLQ redrive。移動先を指定する)ことで、dispatchから24時間以内でバッチがRUNNINGのままなら、workerが再評価して
+バッチが完了する見込みがある。**これは検証を経ていない候補案であり、この節を根拠にProductionへ実行してはならない**
+(実行はいずれにせよ、別のHuman Gateが必要なProductionの書き込みである)。
+
+正式な手順として本書へ反映する前に、次を検証で確認する(検証の実施はUSERの別途承認が必要):
+
+```
+1 RUNNINGのバッチへのredriveで、バッチが正常に復旧すること
+2 batch_id / job_type がredriveの前後で維持されること
+3 candidate lease / progress(進捗行)との整合(PENDING / PROCESSINGの行、リース取得)
+4 二重評価・二重登録が起きないこと
+5 TIMED_OUT後のredriveは安全に無効化されること(終端済みのためリース取得が失敗し、何も起きない)
+6 24時間の境界付近(タイムアウト確定の直前・直後)の挙動
+```
+
+`REDRIVE_VERIFIED = YES` になるまでは、上記は「障害時の候補案」としてのみ扱う。
+
+## 24. DLQ の滞留の確認手順(Issue #349 ⑤、2026-09-20追加)
+
+この節は、SQS の DLQ(処理に失敗したメッセージが最終的に入るキュー)に**メッセージが溜まっていないかを、観測用 role で確認する手順**を定める。
+**確認するための手順であって、気づく仕組みではない**(24.1)。
+
+### 24.1 この手順の限界(★ 最初に読むこと)
+
+```
+・4本のDLQいずれにも、CloudWatch Alarm(ApproximateNumberOfMessagesVisible>=1で即時)
+  →既存のIncidentNotificationTopic(#503)→LINE、という気づく仕組みが入った
+  (Issue #349。infra/template.yamlへのmerge時点の記載。Production deployは別
+  Human Gateのため、実際にLINEへ届くようになるのはdeploy後)。
+・ただしAlarmは「1件以上見えるか(ALARM/OK)」の1bitしか伝えない。件数・最古
+  メッセージの経過時間・メッセージ内容は本節の手順で別途確認する必要がある。
+・DLQ のメッセージは 14 日で自動的に消える(MessageRetentionPeriod = 14 日)。
+  Alarmが後からOKへ戻っても、原因が直ったとは限らない(24.5参照)。
+・「誰が・いつ(どの頻度で)確認するか」は、本節では**決めていない**(未決定。Issue #349 ⑤ の残り)。
+```
+
+### 24.2 対象のキュー
+
+キューの名前は `jstock-advisor-<種別>`(スタック名が前置される)。
+
+```
+Production に現在ある DLQ(4本とも Issue #349 で CloudWatch Alarm を接続済み)
+  jstock-advisor-watchlist-terminal-failure-dlq     ウォッチリスト評価の終端失敗の DLQ
+  jstock-advisor-async-invoke-failure-dlq           BuyCandidates / HoldingsWatchlist の非同期 invoke の失敗(OnFailure の宛先。
+                                                     1本のDLQを両関数が共有するため、メッセージ単体からはどちらの関数由来か
+                                                     区別できない。LINE通知の対象名は「非同期実行の失敗」〔#349〕)
+
+#396(#319 Phase 1)を含む反映の後に存在するキュー(現時点でコードから参照されない。dormant。
+Phase 2でdispatch側が切り替わるまで構造的にメッセージが入らないが、Alarmは監視漏れ防止のため
+USER決定により先行接続済み)
+  jstock-advisor-buy-candidate-terminal-failure-dlq
+  jstock-advisor-holdings-watchlist-terminal-failure-dlq
+
+参考(DLQ ではない。作業用のキュー。滞留は通常の処理中の値であり、DLQ の滞留と混同しない)
+  jstock-advisor-watchlist-screening / jstock-advisor-watchlist-terminal-failure
+```
+
+### 24.3 確認の方法(read-only)
+
+観測用 role(`AWS_PROFILE=jstock-observer`。18節と同じ)で、CloudWatch の SQS メトリクス `ApproximateNumberOfMessagesVisible`(見えているメッセージの数)を、日次の最大値で読む。
+
+```bash
+# 直近 14 日の日次の最大値。QUEUE を対象のキューの名前へ置き換える。
+# (Git Bash では MSYS_NO_PATHCONV=1 を付ける)
+export AWS_PROFILE=jstock-observer AWS_DEFAULT_REGION=ap-northeast-1
+QUEUE=jstock-advisor-async-invoke-failure-dlq
+aws cloudwatch get-metric-statistics --namespace AWS/SQS --metric-name ApproximateNumberOfMessagesVisible \
+  --dimensions Name=QueueName,Value=$QUEUE \
+  --start-time "$(date -u -d '14 days ago' +%Y-%m-%dT00:00:00Z)" --end-time "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  --period 86400 --statistics Maximum \
+  --query "sort_by(Datapoints,&Timestamp)[].[Timestamp,Maximum]" --output text
+```
+
+- **SQS の API(`ListQueues` / `GetQueueAttributes` 等)は、観測用 role に許可されていない**(AccessDenied を実測。権限を広げて回避しない)。したがって、キューの属性(実際の保持期間・redrive の設定)は、この手順では確認できない(`infra/template.yaml` の記載のみ)。
+- 古い滞留を知りたいときは、同じ形で `ApproximateAgeOfOldestMessage`(最も古いメッセージの経過秒数。Statistic = Maximum)を読む。
+
+### 24.4 結果の読み方
+
+```
+すべての日次の最大値が 0                          → その期間、見えているメッセージは無かった
+0 より大きい日がある                              → その日に DLQ にメッセージがあった(24.5 へ)
+データ点が無い日がある                            → ★ 「0 だった」ではなく「メトリクスが出なかった」。SQS のメトリクスは、キューに動きがあるときだけ出る。
+                                                    DLQ は通常 動かないため、データ点が飛ぶのは正常でありうる。ただし、「データ点が無い = 安全」と読んではならない
+                                                    (最新のデータ点の日付と、キューの作成日を確認する。作成が新しいキューは、データ点が少ない)
+コマンドがエラーになる                            → 「異常なし」ではなく「確認できなかった」。エラーを記録し、確認できたとは書かない
+```
+
+### 24.5 見つかったとき
+
+```
+・この手順は read-only である。**DLQ のメッセージの再処理(redrive)・削除・キューの purge は、Production の書き込みであり、Human Gate の対象**(docs/user_manager_collaboration_protocol.md)。
+  本節の範囲外であり、確認した者が実行してはならない。
+・記録して報告する(どのキューか / どの日か / 最大値 / 最古のメッセージの経過時間 / 確認した日時)。メッセージの内容は、この手順では読まない(読む方法も、許可されていない)。
+・MANAGER / USER へ報告し、対応(原因の調査・redrive の要否)の判断を仰ぐ。
+・14 日で消えるため、最古のメッセージの経過時間が 14 日に近い場合は、消える前に判断が要ることを、報告に含める。
+```
+
+★ **DLQ Alarm が OK へ戻っても、対象 job・batch が復旧したことを意味しない**(Issue #349。
+27.4 と同じ考え方)。DLQ には自動消費者が無いため、OK へ戻る経路は次の 3 通りしかなく、
+いずれも「原因が直った」ことを直接には意味しない。
+
+```
+(a) 人手で redrive/purge した           → 対応者の作業内容を別途確認する(本節の範囲外)
+(b) 14 日retentionで自然に消えた         → メッセージの内容は既に失われている
+                                          (read-only観測でも読めない。24.5のとおり、
+                                          消える前の redrive 要否判断は Human Gate)
+(c) 対応job側で根本原因が直り、再実行が成功した → これだけが実際の復旧だが、Alarmの状態
+                                          だけからは(a)(b)と区別できない
+```
+
+OKへ戻った場合も、対応するjobの直近の完了判定(4節・25節・27.3.4)を別途確認すること。
+
+### 24.6 実測の例(2026-09-20。参考値であり、保証ではない)
+
+```
+watchlist-terminal-failure-dlq     直近 14 日の日次の最大値 = 0(データ点 11 日分)
+async-invoke-failure-dlq           同 = 0(データ点 5 日分。キューの作成が比較的新しい)
+```
+出典: Issue #349 issuecomment-5746509139。
+
+## 25. BUY / holdings バッチの完了判定の手順(Issue #344、2026-09-20追加)
+
+この節は、**買い候補(BUY)と保有銘柄(holdings)のバッチが完了したかどうかを、`batch_runs` から判定する手順**を定める。
+release 後の手動実行の完了確認など、`jstock-batch_runs` を読んで完了を判断するときに使う。
+
+### 25.1 なぜ必要か(★ 最初に読むこと)
+
+```
+BUY / holdings のバッチは、完了しても batch_runs の status が RUNNING のまま残る。
+これは欠陥ではなく設計である。status を見て「まだ実行中」「ハングした」と判断してはならない。
+```
+
+- `status` は、**ウォッチリスト自動追加(永続データを更新するバッチ)の finalize 排他制御のための field** であり、BUY / holdings にとっては適用対象外である(`batch_tracker.py` の `BatchFinalizeStatus` の docstring)。
+  BUY / holdings の項目は、作成時の既定値として `RUNNING` が入るだけで、以後 `status` は更新されない。
+- 2026-09-12 の release 検証(手動実行)で、`completed` が `total` に達し `failed` が 0 なのに `status` が `RUNNING` のままであるため、完了かハングかを判断できず、運用者の手が止まった。
+  このとき運用文書に記載が無く、実装を読んで初めて判断できた。
+- ★ 危険な側の失敗: `RUNNING` を見て「ハングした」と判断し、**再 invoke(本番の二重実行)を提案する**。実行されなくても(Human Gate がある)、提案の前提が誤っていること自体が危険である。
+
+### 25.2 完了判定の手順
+
+```
+1  status は見ない。BUY / holdings にとって対象外の field である。
+2  完了は completion_finalize_completed_at で判定する(この属性があれば、finalize は完了している)。
+3  種別は batch_family で識別する(BUY_CANDIDATES / HOLDINGS_WATCHLIST)。
+4  batch item は TTL 6 時間で消える。作成から 6 時間より後には、そもそも読めない(項目が無い = 完了していない、ではない)。
+5  watchlist 系(NEW_CANDIDATE_SCREENING / WATCHLIST_MAINTENANCE)は別である。
+   そちらは status の state machine が正本である(4.1 節)。本節の手順を当てはめない。
+```
+
+### 25.3 読み方
+
+読む属性(いずれも batch item の属性。項目は `batch_id` で 1 件だけ指定する):
+
+| 属性 | 意味 |
+|---|---|
+| `batch_family` | 種別。`BUY_CANDIDATES` または `HOLDINGS_WATCHLIST`。無い・未知の値なら、本節の対象ではない(判断しない) |
+| `total` / `completed` | 対象件数と、処理が終わった件数 |
+| `completion_finalize_completed_at` | **完了の判定に使う属性**。値があれば finalize 完了 |
+| `completion_finalize_started_at` | finalize の取得時刻 |
+| `completion_finalize_failed_at` | finalize の失敗時刻(捕捉できた失敗のみ) |
+| `completion_finalize_attempt_count` | finalize の試行回数 |
+| `ttl` | 項目が消える時刻(UNIX 秒) |
+| `status` | ★ 判断に使わない(既定値の `RUNNING` が残るだけ) |
+
+```
+completion_finalize_completed_at がある                 → 完了している(status が RUNNING でも)
+completion_finalize_completed_at が無く、started_at がある → finalize の処理中、または途中で止まった(失敗の記録があれば failed_at も見る)
+                                                          started_at から 20 分(1200 秒)以上経っていれば、毎時の reconciler が再駆動の候補として扱う(バッチ側の仕組み)
+completed < total                                        → 個別の処理がまだ終わっていない(finalize の前)
+項目が無い                                                → 作成から 6 時間より後(TTL で削除された)、または batch_id の誤り。★「完了していない」とは読まない
+```
+
+★ 1 つの属性だけで結論を出さない。`completed = total` でも `completion_finalize_completed_at` が無ければ、finalize が終わったとは言えない。
+逆に、`status` が `RUNNING` であることは、完了の否定にならない。
+
+### 25.4 確認の方法(read-only)
+
+観測用 role(`AWS_PROFILE=jstock-observer`。18節・24節と同じ)で、`batch_id` を指定して 1 件だけ読む(`GetItem`)。**スキャンはしない**。
+
+```bash
+# BATCH_ID を対象のバッチの batch_id へ置き換える。
+# (Git Bash では MSYS_NO_PATHCONV=1 を付ける。status / total / ttl は DynamoDB の予約語のため別名を使う)
+export AWS_PROFILE=jstock-observer AWS_DEFAULT_REGION=ap-northeast-1
+aws dynamodb get-item --table-name jstock-batch_runs \
+  --key "{\"batch_id\":{\"S\":\"$BATCH_ID\"}}" \
+  --projection-expression "batch_id,batch_family,#st,#tot,completed,completion_finalize_started_at,completion_finalize_completed_at,completion_finalize_failed_at,completion_finalize_attempt_count,#tt" \
+  --expression-attribute-names '{"#st":"status","#tot":"total","#tt":"ttl"}' --output json
+```
+
+- ★ **読む属性は上のとおりに限定する(ProjectionExpression。許可リスト方式)**。同じ項目には、銘柄コード・holding_id(所有者を含む)・評価額を含みうる集合の属性が保存されている。**これらを読まない・出力しない・記録に書かない**(個人情報の露出を避ける。CLAUDE.md の個人情報の規則)。**項目に保存されている実際の属性名**は次のとおりである(`batch_tracker.py` の集計の読み出し。一部は Python 側の `BatchProgress` の field 名〔例: `failed_stock_codes`〕と異なる)。
+```
+項目に保存されている属性名(読まない)                  中身
+failed_codes                                          失敗した対象の識別子(buy = 銘柄コード / holdings = holding_id)
+data_insufficient_codes                               データ不足の対象の識別子(同上)
+completed_codes                                       完了報告された識別子(同上)
+attention_detected_stock_codes / attention_sent_stock_codes / evaluation_record_saved_stock_codes
+                                                      銘柄コード(holdings では holding_id)の集合
+notification_categories / detected_categories         「種別|識別子」形式の文字列の集合
+ranking_entries / near_buy_ranking_entries / watch_end_ranking_entries
+                                                      「スコア|銘柄コード|…」形式の文字列の集合
+sector_entries                                        「業種|評価額|銘柄コード」形式の文字列の集合(全保有銘柄)
+validation_recommendation_ids                         検証用の recommendation_id の集合
+```
+
+- ★ 一覧は、`batch_tracker.py` の読み出しで確認できた集合の属性である。**一覧に無い属性も、許可リストに無ければ読まない**(許可リストが安全の根拠であり、この一覧は「なぜ限定するか」を示す例)。
+- holdings では、識別子の引数に `holding_id`(= 所有者 + `#` + 銘柄コード)が渡される(`batch_tracker.py` の `BatchProgress` の docstring)。
+- `batch_id` の入手方法は、本節では定めない(Lambda のログに `batch_id=` として出る箇所があるが、正常系のすべての経路で出るとは確認していない)。**full scan で探さない**。分からなければ MANAGER へ確認する。
+- 出力が空(項目が無い)のときは、25.3 の「項目が無い」のとおりに読む(完了とも未完了とも判断しない)。
+- 検証: このコマンドの構文と観測用 role での `GetItem` の許可は、存在しない `batch_id` を指定して、エラーにならず空の応答になることを確認した(2026-09-20。実際の項目を読んだ確認ではない)。
+
+### 25.5 「終端 status を入れる」案を採らない理由(★ この節を消さないこと)
+
+```
+finalize 時に、BUY / holdings の batch item へ終端の status を入れる案は採らない。
+これは Issue #31 の承認済み設計であり、本手順で覆さない。
+```
+
+理由(`batch_tracker.py` の記述):
+
+- watchlist パイプラインの `try_acquire_finalize()` / status の state machine とは、**意図的に統合しない**。
+  毎時の reconciler が `status` の値で scan・分岐しており、BUY / holdings の項目は `status = RUNNING` のままで、`started_at` 等を持たないことで無害に skip されている。この既存の前提を壊さないため。
+  そのため BUY / holdings には、専用の `completion_finalize_*` 属性だけを追加している。
+- あわせて、`status` を BUY / holdings から取り除く案も採らない。reconciler が completion recovery の候補を見つける手段が、この `status` による scan であり、取り除くと発見できなくなる。
+- 書かなければ、後から「終端 status を付ければ直る」と考えた担当が、承認済みの設計を壊す。
+
+### 25.6 したがって、やってはいけないこと
+
+```
+・batch_runs の status = RUNNING だけを根拠に、「ハングした」「未完了」と判断する
+・上の判断に基づいて、再 invoke(本番の二重実行)を提案する
+・BUY / holdings のバッチ項目へ、終端の status を入れるコード変更を提案・実施する(25.5)
+・完了の確認のために batch_runs を full scan する、または失敗銘柄・不足銘柄の属性(所有者を含みうる)を読み出す(25.4)
+・watchlist 系のバッチへ、本節の判定を当てはめる(4.1 節の status の state machine が正本)
+```
+
+## 26. shadow 監査記録の集計 CLI の使い方(Issue #458、2026-09-21追加)
+
+判断の安全条件(G1〜G4)の shadow 監査記録(`decision_type=judgment_safety_shadow`)を集計し、`AuditLogTable` の増加量・scan の実測値を出す、**読み取り専用**の CLI である。
+Phase 2(誤検出・過剰抑制のレビュー)と、専用 Table への移行の要否を判断する材料(U13 = OPTION_C)を出すためにある。
+
+### 26.1 これは何を「しない」か(★ 最初に読むこと)
+
+```
+・【--source dynamodb(Production)】書き込み・保存・削除・invoke・通知のいずれも行わない(scan / describe_table だけを通す allowlist の proxy。それ以外の呼び出しは例外)
+・【--source local(既定)】ローカルの保管ディレクトリを作る(既存の共有 store の挙動。`AuditLogRepository()` の構築時に mkdir する。冪等で、ファイルもデータも作らない)。
+  それ以外(保存・削除・invoke・通知)は行わない。Production(DynamoDB)には触れない
+・閾値の判定・「専用 Table へ移行すべき」等の提案をしない(判断は USER / MANAGER)
+・Production を既定で読まない(既定は --source local)
+・shadow の有効化(mode の変更)はしない(別の Human Gate)
+```
+
+### 26.2 使い方
+
+```
+jstock judgment-safety-shadow report                           # ローカルの JSON(既定)
+jstock judgment-safety-shadow report --source dynamodb         # Production(read-only)
+    [--table jstock-audit_log] [--from YYYY-MM-DD] [--to YYYY-MM-DD]   # 期間は JST 暦日
+    [--describe-only]   # 表のメトリクスだけ(scan しない)。dynamodb のみ
+    [--metrics-only]    # 表・scan のメトリクスだけ(shadow の集計は出さない)
+    [--json]            # 機械可読
+    [--baseline-records 78700] [--baseline-size-bytes 153000000] [--baseline-date 2026-09-20]
+```
+
+- `--source dynamodb` は、呼び出し元の資格情報(`AWS_PROFILE` 等)で読む。観測用の `jstock-observer` で `jstock-audit_log` を Scan できる(write 権限は不要)。実行時、標準エラーへ「read-only・対象テーブル」を表示する。
+- 全件 Scan になる(2026-09-20 時点で約 78,700 件・約 153MB、概算で約 2 万読み取りユニット)。**定期実行には組み込まれていない。実行は運用者の判断で行う。**
+- 終了コード: 0 = 正常(記録が 0 件でも 0)/ 2 = 引数不正 / 3 = 読み取り失敗(認証・ネットワーク。例外の型だけを表示する)。
+
+### 26.3 読み方(誤読の防止)
+
+- **0 件は「問題なし」ではない。** SHADOW の有効化の前、または期間外である。CLI も明示する。
+- 条件別の率の分母は、`not_evaluated`(入力が無く評価できなかった条件)を**除いた**評価済みの記録数である。`not_evaluated` は「該当なし」ではなく、別掲する。
+- G3 は測定可能な 2 項目の**下限値**(測定不能の 3 項目は含まない)。G4 は保有の `FULL_PROFIT_TAKE` のみが対象(買い経路は対象外)。
+- `ItemCount` / `TableSizeBytes`(DescribeTable)は**概算**で、およそ 6 時間ごとに更新される。実測値は Scan の結果である。両者を区別して表示する。
+- 推定コストは公開単価(コード内の定数)に基づく**概算**。単価は AWS Price List API(ap-northeast-1・Standard table class・オンデマンド読み取り = 100 万読み取りユニットあたり 0.1425 USD。公開日 2026-09-11)で 2026-09-21 に確認した値。単価は変わりうるため、出力の `estimated_read_cost_basis` の確認日を見る。table class が Standard-IA の場合は別の単価(0.178)になる。
+- 月次の外挿は、shadow 記録がある日が 3 日未満のときは参考値である。
+- `unparsed` は読めなかった項目の件数(沈黙させない)。未知の `schema_version` は `unparsed` ではなく別掲する。
+
+## 27. 異常を知ったときの手順(障害対応の runbook。Issue #500〔#132 X-1〕、2026-09-21追加)
+
+この節は、**本番のジョブの異常に気づいた人(通知を受けた人、または自分で気づいた人)が、最初に何をするか**を定める。20節(DynamoDB 復旧)・21節(PII 是正)と同じ形の runbook である。
+**確認して報告するための手順であって、復旧の手順ではない**。復旧の操作(再実行・redrive・purge 等)は Production の書き込みであり、Human Gate の対象である(27.5)。
+
+### 27.1 この節の限界(★ 最初に読むこと)
+
+```
+・(2026-09-21 時点の記述。原文のまま残す)現在の infra/template.yaml、異常を自動で知らせる経路は無い。CloudWatch Alarm は evaluation Lambda の Errors / Duration の 2 本だけで、
+  どちらも AlarmActions が空(鳴っても誰にも届かない)。DLQ の滞留にも Alarm は無い(24.1)。
+  通知経路・alarm の拡張は Issue #132 の段階的な実装で入る。**最新の状態は #132 の最新の記録を読むこと**(この節へ焼き込まない)。
+  ★ **2026-09-24更新**: #503(段階1)でEvaluationFunction、#504(段階2)で残る11関数へも
+  AlarmActions(IncidentNotificationTopic経由のLINE通知)が接続され、上記「どちらもAlarmActions
+  が空」は解消済み。DLQの滞留Alarmは依然として無い(未解消のまま)。per-item例外を握る6関数の
+  内部異常はErrors alarmだけでは検知できない点も未解消(#506/#507が担当)。
+  ★ **2026-10-11更新**: DLQの滞留Alarm 4本が接続済み(#349)で、上の「DLQの滞留Alarmは依然として
+  無い」は解消済み。Alarmは合計19本(23〜24節の2026-10-11更新・27.3.2を参照)。全Alarmが
+  TreatMissingData = notBreachingのため、動くはずの日に関数が起動しなかった場合(missed schedule)は
+  Alarmでは検知されない(27.3.1の読み方)。
+・したがって「通知が来ない = 正常」ではない。24.1 と同じく、**見に行かなければ気づかない**異常がある。
+・通知が入った後も、対象外がある。秘密の取得失敗(SECRET_UNAVAILABLE)は LINE では知らせない方針(Issue #117)。
+  監視の対象は段階的に広がる(Lambda は 12 本あり、最初から全てではない)。
+・この節は「通知の文面」に依存しない。文面は Issue #501(#132 X-2)が決める。通知本文は、job 名・件数・日数・真偽値・時刻だけを出す想定
+  (識別子・銘柄・所有者を出さない。#132 の承認済み計画)。本文に無い情報は、27.3 の read-only 観測で自分で取る。
+・「誰が・いつ(どの頻度で)確認するか」は、この節では決めていない(24.1 と同じ。Issue #349 ⑤ の残り)。
+```
+
+### 27.2 最初にやること(3 つ。この順で)
+
+```
+1 記録する
+    いつ(通知の時刻、または自分が気づいた時刻)/ どの job か / 何が異常と言われたか / どの手順で知ったか。
+    記録を公開面(GitHub の Issue・PR・コメント)へ書くときは、所有者(個人を特定しうる情報)・AWS アカウント識別子・ARN を書かない(21節)。
+    個人特定情報と、保有・資産・金額情報を、同じ記録上で結び付けない(例: 所有者 + 保有銘柄、所有者 + 保有数量。user_manager_collaboration_protocol.md 11節)。
+    銘柄コード・銘柄名・保有数量は、それだけでは一律禁止ではない。必要性のない実値は、架空値・丸めた値・割合を優先する(同 11節)。
+2 状態を変えない
+    急いで直そうとして、27.5 の操作(再実行・手動 invoke・redrive 等)をしない。
+3 read-only で観測し(27.3)、27.6 の形で MANAGER / USER へ報告する
+```
+
+### 27.3 観測の手順(read-only)
+
+観測用 role(`AWS_PROFILE=jstock-observer`。18節・24節と同じ)で行う。**名前が read 系でも副作用が無いとは限らない**(18節)。ここに書いたコマンドは、参照系の API だけを使う。
+
+| 疑うこと | 見るもの | 手順 |
+|---|---|---|
+| Lambda の失敗(例外・timeout。timeout は Errors に計上される) | `AWS/Lambda` の `Errors` | 27.3.1 |
+| 実行時間が Timeout に近づいている | `AWS/Lambda` の `Duration`(Maximum) | 27.3.1 の `--metric-name` を置き換える |
+| 同時実行の枠に当たっている | `AWS/Lambda` の `Throttles` と `Invocations` | 27.3.1 の `--metric-name` を置き換える。watchlist-worker の Throttles は**平常時も日次で数百〜数千**あり、単日の値ではなく傾向で読む(Issue #4・#224) |
+| メッセージが DLQ に溜まっている | SQS の `ApproximateNumberOfMessagesVisible` | 24節 |
+| BUY / holdings のバッチが完了したか | 完了判定 | 25節 |
+| ウォッチリストのバッチが終端したか / 通知が送れたか | BatchRuns の `status` と `execution_result`(終端か。`NOTIFICATION_FAILED` / `TIMED_OUT` / `FINALIZE_FAILED` 等でないか) | 27.3.4(読み方の基準は 4.1 の状態遷移と 23.2 の V5)。BatchRuns には TTL があり、古い記録は消える |
+| ジョブが起動しなかった(missed schedule) | 該当の Lambda の `Invocations` / `Errors` のデータ点が、動くはずの日にあるか | 27.3.1(データ点の読み方を含む)。**当日が実行対象の日か**を先に確認する(weekly / monthly / quarterly は曜日条件で実行されない日がある。休場日の扱いは Issue #440) |
+| 認証情報の欠落 | ログ検索で `LineCredentialsMissingError` の**件数** | 27.3.3(参照系の `filter-log-events`。23.2 の V7 は Logs Insights を名指しするが、観測用 role では使えない) |
+| Alarm の状態 | (観測用 role では読めない) | 27.3.2 |
+
+#### 27.3.1 Lambda のメトリクスを読む
+
+```bash
+# 直近 3 日の 1 時間ごとの合計。FN を対象の関数の名前へ置き換える。
+# (Git Bash では MSYS_NO_PATHCONV=1 を付ける)
+export AWS_PROFILE=jstock-observer AWS_DEFAULT_REGION=ap-northeast-1
+FN=jstock-advisor-watchlist-worker
+aws cloudwatch get-metric-statistics --namespace AWS/Lambda --metric-name Errors \
+  --dimensions Name=FunctionName,Value=$FN \
+  --start-time "$(date -u -d '3 days ago' +%Y-%m-%dT00:00:00Z)" --end-time "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  --period 3600 --statistics Sum --query "sort_by(Datapoints,&Timestamp)[].[Timestamp,Sum]" --output text
+```
+
+```
+関数の名前(`jstock-advisor-` に続く部分。スタック名が前置される)
+  buy-candidates / holdings-watchlist / disclosure-check / evaluation / watchlist-dispatcher / watchlist-worker /
+  watchlist-terminal-failure-handler / watchlist-batch-reconciler / weekly-review / monthly-review / quarterly-review / line-webhook
+```
+
+- **データ点が無い日**は「0 だった」ではなく「メトリクスが出なかった」である(24.4 と同じ読み方)。**Lambda のメトリクスは、その関数が呼び出された期間にだけ出る**(2026-09-21 の実測: 呼び出しのあった日は `Errors` が `0.0` のデータ点として出て、呼び出しの無い日〔週末など〕は出ない)。したがって、
+  - `Errors = 0.0` は「動いて、失敗が無かった」。
+  - **動くはずの日に `Invocations` も `Errors` もデータ点が無い**のは、「異常なし」ではなく「起動していない」の疑い(missed schedule)。
+  - 「データ点が無い = 安全」と読まない。
+- コマンドがエラーになったときは「異常なし」ではなく「確認できなかった」。エラーを記録し、確認できたとは書かない。**AccessDenied は、権限を広げて回避しない**(24.3)。
+
+#### 27.3.2 Alarm の状態は、観測用 role では読めない
+
+- 観測用 role では、CloudWatch Alarm の状態(`DescribeAlarms`)を読めない(AccessDenied を 2026-09-21 に実測。**権限を広げて回避しない**)。
+- Alarm の定義(どの関数のどの値を見ているか)は `infra/template.yaml` で確認する。現在の Alarm は 19 本である(Lambda の Errors 13・Duration 2・DLQ の滞留 4。2026-10-11 に template を実読。27.1)。すべて TreatMissingData = notBreaching のため、データ点が無い期間(関数が起動しなかった日)は OK のままで、Alarm では検知されない(27.3.1)。Alarm が鳴っていないことは「他の関数も正常」を意味しない。
+- Alarm の状態を確認する必要があるときは、確認できる人(AWS の画面を見られる権限を持つ人)へ依頼する。
+
+#### 27.3.3 ログを読む(認証情報の欠落の件数)
+
+- ログの検索は参照系の `aws logs filter-log-events` を使う。Logs Insights の `start-query` は、観測用 role に許可されていない(2026-09-20 の観測で AccessDenied を実測)。回避しない。
+- **ログの本文には、銘柄コード等が含まれうる。** 本文は出力せず、**件数だけ**を読む(`--query 'length(events)'`)。公開面へは、必要な範囲で書く。件数・時刻・種別で足りるなら、それだけを書く(27.2 の 1。個人特定情報およびそれと結び付いた資産情報、AWS アカウント識別子・ARN は書かない)。
+
+```bash
+# LineCredentialsMissingError が、直近 3 日に何件出たか(件数のみ。本文は読まない)。FN を対象の関数の名前へ置き換える。
+# LINE の認証情報は全 Lambda 共通の値で(23.0)、LINE を送る関数(line-webhook / watchlist-dispatcher / buy-candidates /
+# holdings-watchlist / disclosure-check / watchlist-worker / watchlist-terminal-failure-handler / watchlist-batch-reconciler)で欠落が可視化される。
+export AWS_PROFILE=jstock-observer AWS_DEFAULT_REGION=ap-northeast-1
+FN=jstock-advisor-watchlist-dispatcher
+aws logs filter-log-events --log-group-name /aws/lambda/$FN \
+  --start-time $(( $(date -u -d '3 days ago' +%s) * 1000 )) \
+  --filter-pattern LineCredentialsMissingError --query 'length(events)' --output text
+```
+
+- 結果はページごとに 1 行ずつ出ることがある(合計する)。すべて 0 なら、その期間、その関数でこのエラーは記録されていない。
+- `0` は「その関数が動いて、このエラーが出なかった」とは限らない。動いたか(27.3.1 の `Invocations`)と合わせて読む。
+
+#### 27.3.4 ウォッチリストのバッチの状態を読む
+
+ウォッチリストのバッチ(NEW_CANDIDATE_SCREENING / WATCHLIST_MAINTENANCE)は、BUY / holdings と同じ `jstock-batch_runs` に入っている。**読み方は 25 節と違う**: 25.2 のとおり、ウォッチリスト系は `status` の状態遷移が正本である(4.1 の「バッチの状態遷移」。`completion_finalize_completed_at` で判定しない)。
+
+```bash
+# BATCH_ID を対象のバッチの batch_id へ置き換える。(Git Bash では MSYS_NO_PATHCONV=1 を付ける。status は予約語のため別名を使う)
+export AWS_PROFILE=jstock-observer AWS_DEFAULT_REGION=ap-northeast-1
+aws dynamodb get-item --table-name jstock-batch_runs \
+  --key "{\"batch_id\":{\"S\":\"$BATCH_ID\"}}" \
+  --projection-expression "batch_id,#st,execution_result,finalize_failed_at,updated_at" \
+  --expression-attribute-names '{"#st":"status"}' --output json
+```
+
+- **読む属性は上のとおりに限定する(許可リスト方式。25.4 と同じ考え方)。** 項目には、銘柄コードや集計の内容を含みうる属性がある。**全属性を読まない**。`finalize_error_message` も読まない(エラーの本文を含みうる)。
+- 25.4 と同じ制約: `batch_id` の入手方法は定めていない(dispatcher のログに `batch_id=` として出る箇所がある)。**full scan で探さない**。項目が無いときは、完了とも未完了とも判断しない(TTL で消えた場合がある)。
+- 読み方の基準は 4.1 の状態遷移: `COMPLETED`(`execution_result = NORMAL`)が正常。`ABORTED` / `DISPATCH_FAILED` / `FINALIZE_FAILED` / `TIMED_OUT` / `COMPLETED_WITH_NOTIFICATION_FAILURE` は終端だが異常(4.1 の各説明を読む)。`DISPATCHING` / `RUNNING` / `FINALIZING` / `TIMEOUT_FINALIZING` は処理中、または止まっている可能性がある(長時間 `updated_at` が動かなければ、毎時の reconciler が処理する。バッチの仕組み)。
+- 検証: このコマンドの構文と観測用 role での `GetItem` の許可は、存在しない `batch_id` を指定して、エラーにならず空の応答になることを確認した(2026-09-21)。実際の項目の中身は読んでいない。
+
+### 27.4 「Errors が止まった = 復旧」ではない
+
+Errors が 0 に戻っても、次を**別々に**確認するまでは、復旧したと書かない。
+
+```
+a バッチが終端したか
+    BUY / holdings は 25節。ウォッチリストは BatchRuns の終端 status と、NOTIFICATION_FAILED / TIMED_OUT の有無(27.3.4。基準は 23.2 の V5)。
+b DLQ に残っていないか(24節)
+    worker・terminal_failure の連鎖(Issue #430)の後は、認証情報を直して Errors が止まっても、DLQ に残ったメッセージ・TIMED_OUT になったバッチは自動では復旧しない(23.2)。
+c 通知が実際に送られたか
+    通知だけが欠落した場合、retry の上限に達すると自動では再送されない(23.3)。手動の再送は Production の書き込みで、Human Gate の対象(27.5)。
+d 「何も出さなかった」障害でないか
+    18.1 の 2026-09-02 の障害は、判定・LINE 通知が 0 件の「何も出さなかった」障害だった。Errors だけでなく、処理した件数・通知の件数が期待どおりかも見る。
+```
+
+### 27.5 してはいけないこと(Human Gate の対象。確認した者が実行してはならない)
+
+```
+・Lambda の手動 invoke、バッチの再実行、スケジュールの手動起動
+・DLQ のメッセージの redrive・削除、キューの purge(23.3 の redrive は未検証の候補案。REDRIVE_VERIFIED = NO)
+・通知の再送(retry-notification 等)、LINE への手動送信
+・4.1 に「手動で実行してください」と書かれている操作(`jstock watchlist-screening run` 等)。これも Production への書き込みなので、確認した者が独断で実行せず、報告して判断を仰ぐ
+・DynamoDB・S3 への書き込み・削除(手動での編集を含む)
+・設定(config)・kill switch・IAM・infra の変更(ChangeSet の CREATE と EXECUTE は別々の Human Gate で、承認は exact な対象に対してのみ有効)
+・Secret のローテーション・変更
+・権限を広げて AccessDenied を回避すること
+```
+
+実行の可否は docs/user_manager_collaboration_protocol.md(Human Gate)が正本である。**この節を根拠に、これらを実行してはならない。**
+
+### 27.6 報告の形
+
+MANAGER / USER へ、次を分けて報告する。
+
+```
+1 いつ・どの job・何が異常と言われたか(通知の時刻と、自分が確認した時刻)
+2 観測した値(件数・時刻・最大値。所有者は書かない。銘柄・保有数量は、必要な場合に限り、所有者等の個人特定情報と結び付けずに書く。27.2 の 1)
+3 実行した手順(27.3 のどれか)と、確認できなかったこと(AccessDenied・データ点が無い・コマンドのエラー)
+4 状態を変えていないこと(27.5 の操作を行っていないこと)
+5 判断してほしいこと(原因調査の要否。再実行・redrive・再送の要否は Human Gate)
+```
+
+- 観測の結果と、原因の推測を混ぜない。**原因が分かったと書くのは、原因を実測で確かめた後**に限る。
+- GitHub の Issue・コメントへ書くときは、PUBLIC_SANITIZED を守る(21節。混入した場合の是正手順も 21節)。
+
+### 27.7 この節が決めていないこと
+
+```
+・通知の文面(Issue #501)/ 通知経路の新設(Issue #503)/ Alarm の拡張(Issue #504・#505)/ 検知の相乗り(Issue #506)。状態は #132 の最新の記録を読む
+・誰が・いつ確認するか(24.1。Issue #349 ⑤ の残り)
+・復旧の手順そのもの(DLQ の redrive の検証は 23.3。検証には USER の別途の承認が要る)
+```
+
+## 28. 週次評価集計(WeeklyEvaluationAggregate)の切替・照合・rebuild の手順(Issue #537、2026-09-22追加)
+
+週次改善レビューが、毎週 raw の EvaluationResult を全件 Scan する方式から、週ごとの集計済みデータ(Aggregate)を読む方式へ移るための手順である。
+**実装は既定で無効**(従来の挙動のまま)。有効化・過去分の作成・切替は、それぞれ**別の Human Gate**で、本節はその順序と、各段の確認・戻し方を定める。
+
+### 28.1 何が変わるか(有効にした場合)
+
+```
+評価の保存(日次の定点評価。書き込み側)
+    暦日 7 日(evaluation_horizon_days)の評価だけ、EvaluationResult の条件付き Put と、Aggregate の加算・週の状態・再計算対象の一覧を
+    1 回の TransactWriteItems で行う。Aggregate の更新に失敗したら EvaluationResult も保存しない(翌日の日次実行で再試行)。
+週次レビュー(月曜 19:00。読み取り側)
+    前週の Aggregate を Query で読む。EvaluationResultsTable も Aggregate Table も全件 Scan しない。
+    遅延評価が届いた過去週は、marker(REVIEW_RECOMPUTE_PENDING)から特定し、その週の Metrics だけを Aggregate から再生成する。
+環境変数(SAM Parameter。既定 = false)
+    WEEKLY_AGGREGATE_WRITE_ENABLED   評価の保存側
+    WEEKLY_AGGREGATE_READ_ENABLED    週次レビューの読み取り側(backfill が COMPLETE でなければ、有効にしても読まない = 従来の経路へ戻る)
+```
+
+### 28.2 切替の順序(各段が別の Human Gate。順序を入れ替えない)
+
+```
+段 1  deploy(Aggregate Table・IAM・環境変数を追加。書き込み・読み取りとも false のまま)
+        確認: 週次レビュー・日次評価の挙動が変わっていない(従来どおり完走。監査の aggregate_read = false)
+段 2  backfill の dry-run(read-only。対象週数・行数・想定 write 数を報告) -> USER が対象と実行の可否を判断
+段 3  backfill の実行(全履歴の Aggregate を、raw から週ごとに SET で作る。再実行しても二重加算にならない。backfill 状態 = COMPLETE)
+        ★ 書き込み側を有効にする**前**に行う(実行中に届く評価を取りこぼさないため)。
+段 4  書き込み側を有効にする(WEEKLY_AGGREGATE_WRITE_ENABLED = true)+ 直後に照合(verify)
+        段 3 と段 4 の間に確定した評価を、対象週だけの照合で確認する。不一致の週は AGGREGATE_REBUILD_REQUIRED にして、指定週だけ rebuild する。
+段 5  旧方式との一致確認(照合が一致 + 同じ週の Metrics を旧方式・新方式で比較)
+段 6  読み取り側を有効にする(WEEKLY_AGGREGATE_READ_ENABLED = true)
+        確認: 次の月曜の週次レビューが完走し、監査の aggregate_read = true、EvaluationResultsTable の Scan が無いこと(ログの scan の行が出ない)
+```
+
+### 28.3 backfill・照合・rebuild の使い方(CLI。既定はローカル。Production は明示指定のときだけ)
+
+```
+jstock weekly-aggregate backfill                 # dry-run(既定)。対象週数・行数・想定 write 数を出す(何も書かない)
+jstock weekly-aggregate backfill --execute       # Aggregate ストアへ書く
+jstock weekly-aggregate verify [--week 2026-W38] [--mark-rebuild-required]   # raw と Aggregate の突合。不一致があれば終了コード 1
+jstock weekly-aggregate rebuild --week 2026-W38 [--week ...] [--execute]      # 指定週だけ raw から作り直す(dry-run 既定)
+```
+
+**対象の選択(Issue #833 E2)。環境変数 `AWS_LAMBDA_FUNCTION_NAME` では何も選ばない。**
+
+```
+--backend local      既定。ローカルの保管ディレクトリだけを読み書きする。
+                     ★ AWS_LAMBDA_FUNCTION_NAME が設定されている環境では拒否する(ローカルのつもりで Production に触れないため)。
+                     ★ --aws-region / --confirm-table / --aws-profile / --table-prefix は指定できない。
+--backend dynamodb   Production の DynamoDB(表名は {prefix}-evaluation_results / -recommendations / -weekly_evaluation_aggregate。prefix の既定は jstock)。
+                     次の 2 つが揃わなければ、1 件も読まない・書かない(サービスを構築する前に非 0 で終了する)。
+                       --aws-region <region>       既定なし。明示する
+                       --confirm-table <表名>      対象の Aggregate 表名の完全一致(jstock-weekly_evaluation_aggregate)。エラーに期待値は表示しない
+                     --aws-profile <名前> は任意(資格情報の選択。backend の選択とは独立)。
+```
+
+- **write は、上の指定に加えて `--execute`(verify は `--mark-rebuild-required`)を別に要する。** 指定が無ければ書込 API を呼ばない。dry-run・verify(突合のみ)は read-only で、**読取専用の資格情報(観測用 profile)で実行できる**。
+- 実行すると、**処理の前に** `backend` / `aws_region` / `aggregate_table` / `writes`(YES または NO(read-only))を表示する(`--backend local` のときは `backend` のみ)。`mode`(DRY_RUN / EXECUTE)は backfill・rebuild で**処理の後**に表示され、`verify` には `mode` の表示が無い。
+  **この表示は対話的な確認 Gate ではない。CLI は表示のあとで停止も確認の入力待ちもせず、そのまま処理を続行する**(`--execute` を付けていれば、表示と同時に書込が始まる)。表示を見て実行者が中断できるのは、人間がその場で見ているときだけであり、CLI は待たない。表示は、取り違えに気付くための記録として使う。
+  **誤操作を止めるのは表示ではなく、次の 2 つである。** (a) `--backend` / `--aws-region` / `--confirm-table`(Aggregate 表名の完全一致)/ `--execute` のいずれかが欠けていることによる、起動前の拒否(1 件も読まない・書かない)。(b) execute の窓の前の、呼び出し元 identity と書込権限の read-only 確認という**手順**(下の、execute の窓の前の確認に関する各項目)。対象を取り違えていないかは、`--execute` を付ける**前に** dry-run の表示で確認し、execute は確認済みの同じ指定で実行する。
+- **書込に使う資格情報は、既存の deploy 用資格情報(承認された backfill の実行窓の間だけ)とする**(USER 決定 #833_BACKFILL_CREDENTIAL_DECISION = A、#122 issuecomment-6057142430)。専用の IAM は作らない。ただし**実 write の承認とは別**であり、段 3 の実行は USER の別の execute Gate が必要(実行窓の承認を含む)。
+- 実行手順の例(Production。dry-run は読取専用 profile、execute のみ deploy 用の資格情報):
+  ★ いずれのコマンドも、実行を促す確認(y/n や入力待ち)を出さず、起動した時点で処理が始まる。`--execute` の行は、起動と同時に書込が始まる。
+
+```
+jstock weekly-aggregate backfill --backend dynamodb --aws-region <region> --confirm-table jstock-weekly_evaluation_aggregate --aws-profile <読取専用 profile>             # dry-run
+jstock weekly-aggregate backfill --backend dynamodb --aws-region <region> --confirm-table jstock-weekly_evaluation_aggregate --aws-profile <deploy 用> --execute   # 段 3(USER の execute Gate の後)
+```
+
+- **宛先は region + 表名 + 資格情報で決まる。資格情報は flag ではなく環境側(`--aws-profile` または環境の AWS_PROFILE 等)から来るため、同名の表が別のアカウントにある場合、`--confirm-table` では区別できない。** 実行の前に、呼び出し元の identity が意図したアカウントであることを read-only で確認する(例: `aws sts get-caller-identity --profile <使う profile>` の Account が、Production の Account であること。値は手順書・Issue・PR へ書かない)。execute の窓では、この確認を `--execute` の直前に必ず行う。
+- **execute の窓の前に、execute に使う deploy 資格情報自身について、backfill が実際に呼ぶ DynamoDB の read / write 権限が揃っているかを、書込を伴わずに確認する。** テスト(moto)は IAM を模擬しないため、権限不足は実行して初めて分かる(書込の途中で失敗する)。
+  - **dry-run の成功は、execute の権限の確認ではない。** dry-run は観測用(read-only)の profile で実施する。execute では別の deploy 資格情報を使うため、dry-run で read の経路を確認済みでも、execute 用の資格情報に read / write の権限が揃っていることにはならない。execute の直前に、deploy 資格情報自身について確認する。
+  - **確認する action と対象 table**(2026-10-09 時点の main の実装の call graph。対象は実際に backfill が触る Production の 3 table に限定し、ワイルドカードや過剰な権限確認へ広げない):
+    - `evaluation_results`: `dynamodb:Scan`(`execute_backfill` は全履歴を 2 回走査する: 対象週の探索〔`_discover_weeks`〕と本走査〔`_scan`〕)
+    - `recommendations`: `dynamodb:BatchGetItem`(評価と推奨の結合。`get_many`)
+    - `weekly_evaluation_aggregate`(read): `dynamodb:GetItem`(各週の state・backfill の状態)・`dynamodb:Query`(`replace_week` が現在の週の集計行を取得)
+    - `weekly_evaluation_aggregate`(write): `dynamodb:PutItem`・`dynamodb:UpdateItem`・`dynamodb:DeleteItem`(`replace_week` の `TransactWriteItems` 内)と、`dynamodb:UpdateItem`(`set_backfill_complete`)
+  - **`ConditionCheckItem` は、今回の backfill の必須権限としない。** 現行の `replace_week` の transaction には独立した ConditionCheck の項目が無く、`TransactWriteItems` の中の条件式つきの Put / Update / Delete が実体である(それぞれ `PutItem` / `UpdateItem` / `DeleteItem` の権限で足りる)。独立した ConditionCheck を使用していないため、今回の backfill では `ConditionCheckItem` は要求しない。
+  - **execute の前には、最新の main の実装が実際に呼ぶ DynamoDB の API を fresh に確認する**(実装が変われば、必要な action も変わりうる。上の一覧を固定的な一般論として扱わない)。
+  - 確認は書込を伴わない方法(例: IAM policy simulator による上の action と対象 table の可否の確認)で行う。**権限が不足していた場合は、権限をその場で拡大せず、別の資格情報へ迂回せず、execute せず、HANAKO / USER へ報告する**(fail-closed)。
+- **上の事前確認自体が実行できることを、execute の窓を始める前に確認しておく**(順序: 窓の開始前に完了しておく。窓の中で初めて試して AccessDenied になると、fail-closed で execute しないことは安全だが、承認された実行窓が消費される)。
+  - **実施主体と必要な権限**: 手順書が例示する IAM policy simulator(API は `iam:SimulatePrincipalPolicy`)は、その権限を持つ資格情報でしか実行できない。観測用(read-only)の profile は、この権限を持たないことが #830 の段階 2b で確認されている(AccessDenied)。execute に使う deploy 資格情報がこの権限を持つかは、この手順書では確認していない(未確認)ため、窓の前に実施主体と資格情報を決めて試す。
+  - **代替手段**(事実の範囲): (a) USER が AWS コンソールの IAM Policy Simulator で、deploy principal について、上の action と 3 table の可否を同じ条件で確認する(画面操作は HANAKO が具体的に提示する)。(b) read の action(`Scan` / `BatchGetItem` / `GetItem` / `Query`)は、deploy 資格情報で、最小の対象に限った read-only の呼び出し(例: 件数 1 に限った読み取り)で確認できる。**ただし、deploy 資格情報を使うこと自体が USER の承認の対象である**(#830 では、read-only の呼び出しであっても、deploy 資格情報を使うことに USER の承認が必要だった)。実施の前に USER の承認を得る。**(b) が保証するのは、その呼び出し(最小の対象への読み取り)が許可されることだけである。** IAM に条件(例: `dynamodb:Attributes` や `dynamodb:Select` で、読み取れる属性や取得の方法を制限する条件)がある場合、本番の全走査や、各週の `Query` が許可されるかどうかは、(b) の結果からは分からない(保証しない)。可否を条件も含めて確認するには、(a) を優先する。(c) write の action(`PutItem` / `UpdateItem` / `DeleteItem`)は、書込を伴わずに read の呼び出しで確認することはできない。write の呼び出しによる試行は、USER の承認なしに行わない。
+  - **拒否された場合**: 権限をその場で拡大せず、別の資格情報へ迂回せず、execute の窓を使う前に停止して、HANAKO / USER へ報告する。
+- **execute が途中で失敗・中断した場合の状態**: Aggregate は週ごとに書かれ(`replace_week`)、全週を書き終えた**後**に初めて backfill の状態が COMPLETE になる(`set_backfill_complete`)。このため、途中で失敗・中断すると**一部の週だけが書かれ、backfill の状態は COMPLETE にならない**(走査中に新しい評価が届いた週で楽観ロックが失敗した場合も同様に、その時点で止まり COMPLETE にならない)。回復は**同じ指定での再実行**(週ごとに上書きするため冪等で、二重加算にならない。28.2 段 3)。この時点では読み取り側は OFF(28.2 段 6 で初めて ON)で、backfill が COMPLETE でなければ読み取り側は ON にしても読まず従来の経路へ戻り(28.1)、raw の EvaluationResult が常に正本のため(28.4)、途中の Aggregate が判定・通知に使われることはない。
+- rebuild は、その週の raw を読んだ後に新しい評価が届いた場合、上書きせずに失敗する(届いた評価を消さないため)。もう一度実行する。
+- backfill の見積もり(2026-10-08 の dry-run 実測): 走査 90,900 件・集計対象 25,344 件・10 週・集計行 52、dry-run の所要は約 2 分。実行(--execute)は走査が 2 回になるため数分を見込む。
+  - **書込の件数には 2 つの数があり、意味が異なる。** CLI の `estimated_write_items`(2026-10-08 の dry-run の出力 = **82**)は、週ごとの固定分を 3 項目として数える**保守的な見積り**(集計行 52 + 10 週 × 3)である。一方、現行の backfill の経路(`request_recompute = False`)と現在の空の Aggregate の条件をコードから数えた、**実際の予定 write は 73 項目**である(集計行の Put 52 + 週の状態の Update 10 + REBUILD 一覧の Update 10 + backfill の COMPLETE の Update 1)。82 は dry-run の CLI の出力値、73 は現在の実行条件での実 write の見込みで、どちらも誤りではない。(CLI の見積もりの算出は、この手順書の変更では直さない。将来修正が要ると判断した場合は、別の Issue の候補として記録する。)
+
+### 28.4 戻し方(rollback)
+
+```
+読み取り側を戻す      WEEKLY_AGGREGATE_READ_ENABLED = false -> 従来の経路(raw の走査。#377 の有界メモリ版)へ即座に戻る。Aggregate・Metrics は変わらない。
+書き込み側を戻す      WEEKLY_AGGREGATE_WRITE_ENABLED = false -> 以後の評価は従来どおり保存され、Aggregate は古くなる。
+                     ★ 再び有効にする前に、対象の週を verify し、不一致の週を rebuild する(古くなった期間の評価を取りこぼしたまま読まない)。
+Aggregate Table       削除しない(DeletionPolicy Retain)。raw の EvaluationResult は常に正本として残る。
+```
+
+### 28.5 異常のとき
+
+```
+日次評価の監査 aggregate_commit_failed_count > 0    Aggregate の更新に失敗し、その評価は保存されていない(翌日に再試行される)。Aggregate Table の権限・存在・競合を調べる。
+週次レビューが「rebuild が必要」で失敗            current week が AGGREGATE_REBUILD_REQUIRED。verify で不一致を確認し、その週を rebuild してから再実行する。
+過去週が「aggregate_rebuild_required」でスキップ    その週の Metrics は作られていない(marker は残る)。rebuild の後の次回のレビューで再生成される。
+```
+
+### 28.6 この節が決めていないこと
+
+```
+・Production の Aggregate への backfill の**実行の可否・時期**(28.3 の CLI で実行できるが、実 write は USER の別の execute Gate)。★CLI の実行前の表示(backend・region・表名・writes)は対話的な確認 Gate ではなく、CLI は停止せず処理を続行する。誤操作を止めるのは、起動前の拒否(指定の欠落)と execute 前の read-only 確認の手順である(28.3)
+・切替の各段の実施の可否・時期(別の Human Gate)
+・EvaluationResults の retention(本 Issue は変更しない。データ保持期間は Issue #138)
+```
+
+## 29. 本番ジョブ異常の検知(通知経路)の Production Verification Plan(Issue #503、2026-09-24追加)
+
+CloudWatch Alarm → SNS Topic(`IncidentNotificationTopic`)→ `IncidentNotifierFunction` → LINE、
+という通知経路(段階1。#132 X-4)を Production へ反映する際の確認手順である。
+**Production の SNS Topic 新設・deploy 自体は別 Human Gate**(本節は反映後の確認のみを扱う)。
+
+### 29.1 何が変わるか(実装の要約。PR #545 merge後・infra/template.yaml実物に基づき具体化)
+
+```
+新規(infra/template.yamlに明示的に定義した5資源)
+      IncidentStateTable(fingerprint単位のclaim/dedup/stale takeover。他の履歴Tableと同じ保護)
+      IncidentNotificationTopic
+      IncidentNotificationTopicPolicy(cloudwatch.amazonaws.comへのPublish許可)
+      IncidentNotifierFunction(IAMは最小権限。GetItem/PutItem/UpdateItem/DeleteItemのみ)
+      IncidentNotifierFunctionErrorsAlarm(AlarmActionsは意図的に空。自己再帰を避ける)
+
+新規(SAMのtransformがIncidentNotifierFunctionから自動生成する付随リソース。
+      明示的にtemplate.yamlへは書いていないため、ChangeSetには上記5資源に加えて
+      これらのADDも現れる。正確なLogicalIdはChangeSet CREATE実物で確認する)
+      IncidentNotifierFunctionの実行role(IAM Role。Policiesで宣言したReadWriteIncidentState
+      Statementを含む)
+      SNSがLambdaを起動するためのLambda::Permission(Events.AlarmTopicから生成)
+      IncidentNotificationTopicへのAWS::SNS::Subscription(同じくEvents.AlarmTopicから生成)
+
+変更  EvaluationFunctionErrorsAlarm / EvaluationFunctionDurationAlarm へ AlarmActions を追加
+      (閾値・メトリクス・Dimensions は変更しない)
+
+既存2 alarm以外の既存123資源(Table/Queue/他のFunction等。ListStackResourcesで実測。
+2026-09-23時点デプロイ済みは計125資源)への差分は無い見込み(git diff bceaca29の^1との差分が
+config/infra/lambda_handlers/domain配下の#503関連ファイルのみであることをmain merge後に
+実測済み。「incident」を含むLogicalResourceIdは現行スタックに0件であることも確認済み
+= 新資源の名前衝突なし)。
+```
+
+### 29.2 確認手順(USER baseline #503 issuecomment-5796588796 の10項目を具体化)
+
+```
+1  ChangeSet差分確認   29.1の新規資源(明示5資源+SAM自動生成の付随リソース)のADDと、
+                      既存2 alarmのAlarmActions追加(MODIFY)のみであること。
+                      それ以外の既存リソースにMODIFY/REMOVEが無いこと(他プロパティの差分ゼロ)
+2  存在確認            DescribeTable(IncidentStateTable)/ GetTopicAttributes /
+                      GetFunction(IncidentNotifierFunction)/ 既存2 alarmのAlarmActionsに
+                      Topic ARNが入っていること(DescribeAlarms)
+3  人工障害を起こさない  実際のjob失敗でのみ発火する。人工的にjobを失敗させない
+4  test SNS publish    write操作のため、テスト目的のPublishは別Human Gate(本節では実行しない)
+5  正常ジョブへの影響なし deploy直後の次回 evaluation Lambda 実行(平日18:00)が、従来どおり
+                      完走し、Durationに変化がないこと
+6  IncidentNotifier    deploy後、実際にAlarmが鳴るまでInvocations=0のまま(0件は「正常」の
+   Errors/Throttles確認  確認にはならない。実着信確認[8]まで「配線済みだが未検証」として扱う)
+7  IncidentState        実際にAlarmが鳴った後、GetItemでfingerprint行のstatus=SENT・
+   claim/SENT確認        occurrence_countを確認(値そのものはPUBLIC repoへ書かない。件数・statusのみ)
+8  LINE実着信確認        実際にAlarmが鳴った際に、LINEへ#501の文面が届くこと(利用者の実機確認)
+9  duplicate suppression 7の直後にretry等で同一fingerprintが再度届いた場合、2件目以降が
+   確認                  LINE送信されないことをCloudWatch Logsで確認(本文は出さない。件数のみ)
+10 rollback方法確認      AlarmActionsを空へ戻すChangeSet(新資源自体はRetainのため残してよい。
+                      既存の判定・通知経路には一切関与しないため実害はない)
+11 運用者への明示        「Errors Alarmが鳴らないこと」は「12関数すべてが正常」を意味しない旨を
+                      明記する(下記29.3参照)
+```
+
+### 29.3 既知の限界(必ず理解しておくこと)
+
+```
+Errorsメトリクスへ計上される(このAlarmで検知できる)
+  disclosure-check / evaluation / weekly-review / monthly-review / quarterly-review /
+  watchlist-terminal-failure-handler(未捕捉例外がハンドラを抜けて伝播する)
+
+Errorsメトリクスへ計上されない(このAlarmでは検知できない)
+  buy-candidates / holdings-watchlist / watchlist-dispatcher / watchlist-worker /
+  watchlist-batch-reconciler / line-webhook
+  (per-item/per-batchの`except Exception`が広く捕捉し、re-raiseしない設計。既存の設計意図どおり)
+```
+
+**段階1の完了は自動検知の完成を意味しない。監視対象はLambda12本中1本で、W6で新設した
+待避先は含まない。** 加えて、Errorsベースの検知は上記6関数には効かない(担当は#506。
+reconcilerが持つ終端状態〔完了判定・DLQの滞留等〕を見る仕組みが要る)。
+
+### 29.4 self-monitoring の残存リスク
+
+`IncidentNotifierFunction`自身のErrorsは、自己再帰(Alarm→自身のTopic→自身のFunction→…)を
+避けるため、同一Topicへは接続していない。**このLambda自身が失敗した場合、本段階では誰にも
+通知されない。** 第二の通知経路は本Issueのscope外(#504以降)。
+
+### 29.5 この節が決めていないこと
+
+```
+・Production の SNS Topic 新設・deploy 自体(別 Human Gate)
+・#504(Errors alarmを全12関数へ拡大)/ #505(Duration alarmの拡大)/
+  #506・#507(reconciler相乗り検知)/ #508(GitHub Issue接続)の実装
+・6関数(per-item捕捉型)の内部異常検知の方式そのもの(#506/#507の担当)
+```
+
+### 29.6 Issue #504のChangeSet想定差分(2026-09-24追加)
+
+段階2(#504)は、EvaluationFunction以外の残る11関数へErrors alarmを追加する
+(既存2 alarmは#503で反映済みのため変更しない)。
+
+```
+ADD     11(BuyCandidatesFunctionErrorsAlarm / HoldingsWatchlistFunctionErrorsAlarm /
+           DisclosureCheckFunctionErrorsAlarm / WatchlistDispatcherFunctionErrorsAlarm /
+           WatchlistWorkerFunctionErrorsAlarm /
+           WatchlistTerminalFailureHandlerFunctionErrorsAlarm /
+           WatchlistBatchReconcilerFunctionErrorsAlarm / WeeklyReviewFunctionErrorsAlarm /
+           MonthlyReviewFunctionErrorsAlarm / QuarterlyReviewFunctionErrorsAlarm /
+           LineWebhookFunctionErrorsAlarm)
+MODIFY  0(既存のEvaluationFunctionErrorsAlarm/DurationAlarmは変更しない。再利用のみ)
+REMOVE  0
+```
+
+C4相当の判定基準: 上記ADD 11・MODIFY 0・REMOVE 0と一致し、既存resourceへの想定外のMODIFY・
+IAM権限の拡大・Alarmのthreshold等の変更が無いこと。実物のChangeSetとの照合は、他のPRが
+先にdeployされていた場合(config/srcの通常のCode差分)を含めて、ChangeSet CREATE後に
+再確認する(#503のRelease W8で確立した手順と同じ)。
+
+### 29.7 Issue #505のChangeSet想定差分(2026-09-24追加)
+
+段階2(#505)は、WeeklyReviewFunctionのみへDuration alarmを追加する(既存の
+EvaluationFunctionDurationAlarmは変更しない)。他10関数(WatchlistWorker/
+WatchlistDispatcher/LineWebhook/BuyCandidates/HoldingsWatchlist/DisclosureCheck/
+WatchlistBatchReconciler/MonthlyReview/QuarterlyReview/WatchlistTerminalFailureHandler)
+への追加は今回見送り(MANAGER判断)。
+
+```
+ADD     1(WeeklyReviewFunctionDurationAlarm。Threshold=240,000ms=Timeout 300秒×0.8)
+MODIFY  0(既存のEvaluationFunctionDurationAlarm/12関数のErrors alarmは変更しない)
+REMOVE  0
+```
+
+C4相当の判定基準: 上記ADD 1・MODIFY 0・REMOVE 0と一致し、既存resourceへの想定外のMODIFY・
+IAM権限の拡大・Alarmのthreshold等の変更が無いこと。240秒という値の実測による裏付けは
+次回自然実行(2026-09-28 19:00 JST)後に行う(29.2項目3〔人工障害を起こさない〕と同じ理由で、
+それまでの人工的な実行はしない)。
+
+## 30. Release W9 の Production Verification Plan(2026-09-24追加。骨子)
+
+段階2〜3の複数Issue(#504・#505・#506・#507・#368・#349)をまとめてProductionへ反映する
+grouped release(社内呼称 W9)の確認手順である。29節(#503。段階1)の実行経路
+(Alarm → SNS → IncidentNotifier → LINE)を前提に、その先の監視対象・通知内容の
+拡張分を扱う。
+
+★ **W9の正式対象はこの6件(#504・#505・#506・#507・#368・#349)である**(USER決定)。
+このうち#349は2026-09-24時点で**実装完了・PR #554でレビュー中(未merge)**であり、
+**W9 ChangeSet CREATEは#349のmerge完了後まで保留**する(既存USER決定〔HANAKO-20260924-075〕
+のとおり)。#349のVerification観点は30.8として下記に追加した(実装・PR段階の内容に
+基づく。merge・deployを前提にした記載ではない)。**最新の対象範囲・進捗はIssue #503の
+最新コメント(Release W9 inventory)を読むこと**(この節へ焼き込まない)。
+
+### 30.1 この節が扱わないこと
+
+```
+・#503自体のend-to-end(Alarm→SNS→IncidentNotifier→IncidentState claim/SENT→LINE→
+  duplicate suppression)の自然発生確認は29.2項目7〜9が正本であり、本節では重複させない
+  (W9反映後もこの経路自体の設計は変わらないため)
+・#508(GitHub Issue自動起票)は本節の対象外(別release候補。#132 Phase 4)
+・Production の ChangeSet 新設・deploy 自体(別 Human Gate)
+```
+
+### 30.2 P0: deploy直後(read-only)
+
+```
+・stack status = UPDATE_COMPLETE / FAILED event 0件 / rollbackなし
+・#537(Issue #537)のWRITE/READ flagが両方ともfalseのまま(環境変数を直接確認。
+  W9はこの2値を変更しない)
+・#504由来の新設Errors alarm 11本・#505由来の新設Duration alarm 1本、計12資源の存在確認
+・WatchlistBatchReconcilerFunctionRoleのIAM差分が想定どおり(#506由来のsns:Publish
+  〔Resource=IncidentNotificationTopicのみ〕・#507由来のcloudwatch:GetMetricData
+  〔Resource="*"。CloudWatchメトリクスがARNを持たないため〕の2 Statement追加のみで、
+  想定外の権限拡大が無いこと)
+```
+
+### 30.3 P1: 次回reconciler自然実行(毎時)
+
+```
+・invocation正常終了(Errors=0を最優先で確認)。
+  ★ #507が追加したCloudWatch GetMetricData呼び出しには例外処理が無く、この呼び出しが
+  失敗(throttling・AccessDenied等)すると、reconciler Lambdaの実行全体が失敗する
+  (この回に本来行うはずだったtimeout finalize retry・maintenance trigger等の処理も
+  含めて失敗として記録される。実装が意図した「握り潰さない」設計であり、バグ修正の
+  対象ではないが、Errorsの原因切り分けにおいて最優先で確認すべき項目)
+・GetMetricData成功(AccessDeniedなし)
+・#506/#507が追加した検知(missed schedule / 候補ユニバース連続失敗 / queue backlog /
+  watchlist削除ゼロ継続)のfalse positiveが無いこと(誤検知でLINEが飛んでいないこと)
+・既存flag(config/watchlist_screening_rules.yamlのenabled / scheduled_run_enabled。
+  #506/#507は専用のkill switchを新設せずこれらを再利用している)のsemanticsが
+  変わっていないこと
+```
+
+### 30.4 P2: 次回対象通知(#368)
+
+```
+・通知本文の株価表示が「MM/DD終値」の形(as-of日付付き)になっていること
+・#368のdeploy前に保存された既存Recommendationレコード(price_as_of_dateを持たない)を
+  参照する通知では、日付を省略した「終値」表示にfallbackし、エラーにならないこと
+```
+
+### 30.5 P3: Evaluation horizon経過後(#368)
+
+```
+・reached_partial_profit_start_price / reached_recommended_limit_price /
+  reached_full_profit_consideration_price / business_days_to_reach_sell_priceが
+  EvaluationResultへ実際に保存されること(利確目安への到達確認。SELL側)
+```
+
+### 30.6 P5: 2026-09-28 19:00 JST(週次レビュー自然実行。#377/#539)
+
+```
+・Errors=0・正常完了(W9反映後、実際にこの時刻の自然実行で確認する初回)
+・Max Memory Used・実際のDuration値を実測し、#377(PR #539)のOOM修正がProduction
+  反映後も有効であることを確認する
+・#505のWeeklyReviewFunctionDurationAlarmがOKのままであること(240秒を大きく
+  下回ることを期待。既存の9/21実行の実測値はpre-#539のデータのため参考にしない)
+```
+
+### 30.7 ロールバック時の留意点(#368)
+
+`Recommendation`はImmutableSnapshot(`extra="forbid"`のfrozenモデル)である。W9反映後に
+新規保存された`price_as_of_date`入りのRecommendationレコードを、rollback後の旧コードが
+読もうとするとデシリアライズに失敗する(既存の別フィールド〔`company_quality_score_
+model_version`〕と同型の既知パターン)。**実害が出るのは「W9反映後に新規保存された
+レコードを、その後rollbackした旧コードが読む」場合のみ**で、反映直後(新規レコードが
+まだ無い間)のrollbackは安全である。
+
+### 30.8 #349(DLQ滞留の監視・発報)のVerification観点
+
+★ 2026-09-24時点、#349はPR #554として実装・レビュー・mainへのmergeまで完了。以下は
+mainへ反映されたPR #554の実装内容に基づくVerification観点である。Productionへの
+deploy・verification完了を意味するものではない。実装内容が変わった場合はこの節も更新する。
+
+```
+対象4本(真正のDLQ。命名規約ではなく、(a)redrive chainの終端として配線されている
+  〔RedrivePolicy.deadLetterTargetArn / EventInvokeConfig.DestinationConfig.OnFailure.
+  Destinationの宛先として参照〕、または(b)MessageRetentionPeriod=1209600〔14日。
+  運用調査用の長期保持〕を持つ、の**和集合**〔かつ自身はRedrivePolicyを持たない〕で特定。
+  (b)はiteration 3で追加された基準で、まだどこからも配線されていない孤立DLQを
+  (a)だけでは拾えない退行への対応)
+  WatchlistTerminalFailureDLQ / AsyncInvokeFailureDLQ /
+  BuyCandidateTerminalFailureDLQ / HoldingsWatchlistTerminalFailureDLQ
+  (後2本は#319 Phase 1で未wiringのdormant DLQだが、Phase 2でdispatch側が
+  切り替わった際の監視漏れを防ぐため先行して対象に含める。USER決定)
+
+Alarm設計(4本共通)
+  Namespace=AWS/SQS, MetricName=ApproximateNumberOfMessagesVisible,
+  Statistic=Maximum, Period=300, EvaluationPeriods=1, Threshold=1,
+  ComparisonOperator=GreaterThanOrEqualToThreshold, TreatMissingData=notBreaching,
+  AlarmActions=[IncidentNotificationTopic](#503。新規のTopic・Topic Policyは追加しない)
+```
+
+P0(deploy直後・read-only。#349分)
+```
+・AsyncInvokeFailureDLQ・WatchlistTerminalFailureDLQ・BuyCandidateTerminalFailureDLQ・
+  HoldingsWatchlistTerminalFailureDLQの4本すべてにAlarmが接続されていること
+  (Namespace/MetricName/Statistic/Period/EvaluationPeriods/Threshold/
+  ComparisonOperator/TreatMissingData/AlarmActionsが上記設計どおりであること)
+・新規のSNS Topic・Topic Policyが追加されていないこと(既存IncidentNotificationTopicを
+  そのまま再利用する設計のため)
+```
+
+P1(次回reconciler自然実行等。平常時のノイズ確認)
+```
+・4本のDLQがいずれも空(平常時)のあいだ、通知・ログのノイズが増えないこと
+  (TreatMissingData=notBreachingにより、データ点が飛ぶ時間帯もALARMにならないことを含む)
+```
+
+P4相当(自然発生時。人工的なDLQ投入・人工Alarm発火は行わない)
+```
+・DLQへメッセージが実際に滞留した場合、既存の#132/#503通知経路(Alarm→SNS→
+  IncidentNotifier→LINE)へ正しく接続され、実際にLINEへ届くこと
+  (`_extract_alarm_target()`のQueueName dimensionへのfallback経路を含む。
+  FunctionName dimensionを持つ既存alarm〔#503〜#505〕の経路は変更していない)
+・Alarmが「OK」へ戻っても、対象job・batchが復旧したことを意味しない
+  (redrive・purge・retention経過のいずれでもQueue depthは0に戻るため。
+  「OK = 復旧」と読まない。29節の「Errorsが止まった = 復旧ではない」と同種の注意)
+```
+
+## 31. release前validationの責務境界とChangeSet CREATE/EXECUTEの限界(Issue #559、2026-09-25追加)
+
+Release W9のChangeSet EXECUTEが、`IncidentNotificationTopicPolicy`(AWS::SNS::
+TopicPolicy)の2 StatementにSidが無いことをSNS APIが拒否して失敗した事象(直接原因は
+Issue #557で修正済み。Production は自動rollbackによりW8時点のまま安全に保たれた)を
+受け、release前のvalidation層それぞれが**何を検証でき、何を検証できないか**を
+Issue #559で調査し、本節へ反映する。
+
+### 31.1 CHANGESET_CREATE_COMPLETE ≠ EXECUTION_WILL_SUCCEED
+
+```
+CloudFormationは、ExecuteChangeSetを呼ぶまでリソースへの実際の変更を一切行わない
+(AWS公式ドキュメント: "CloudFormation doesn't make changes until you execute the
+change set." — CreateChangeSet APIリファレンス)。
+```
+
+ChangeSet **CREATE**が`CREATE_COMPLETE`になることは、テンプレートの構文・型・
+IAM capability・既存stackとの差分計算が成功したことを意味するのみであり、
+**実際のリソースプロバイダAPI(例: SNSの`SetTopicAttributes`)がその内容を受理する
+ことを保証しない。** downstream AWS APIが呼び出し時にのみ行うbusiness rule検証
+(今回のSNS TopicPolicyの複数Statement Sid一意性制約はその一例)は、CREATE_COMPLETE
+では検出できず、**EXECUTEで初めて顕在化する。**
+
+`CREATE_COMPLETE = このChangeSetをEXECUTEしてよい`という運用上の意味は変わらない
+(差分確認・Human Gateの前提として引き続き必須)。ただし`CREATE_COMPLETE = EXECUTEが
+必ず成功する`ではないことを、release実施者・承認者の双方が前提として持つこと。
+
+### 31.2 validation層ごとの責務境界(現状の実測。2026-09-25時点)
+
+```
+sam validate / --lint        テンプレートの構文・SAM構文・基本的な型検証。
+                              CI未導入(手動実行のみ)。AWS API固有のsemantic制約は
+                              検証しない(設計上の対象外)
+
+cfn-lint(v1.57.0で実測)     テンプレートのresource schema検証(例: 存在しない
+                              propertyの検出。E3002)。Issue #559のスパイクで実測
+                              (レビュー対応: PR #562。当初の記載を訂正): 今回
+                              #557で実際に起きた欠陥(Sidの**欠落**。複数Statementの
+                              いずれかにSid自体が無い)は**検出できない**(exit=0)。
+                              一方、Sidの**重複**(複数StatementのSidが同じ値)は
+                              **検出できる**(E3512 "array items are not unique
+                              for keys ['Sid']")。つまりcfn-lintは一意性
+                              (uniqueness)チェックは持つが、必須性
+                              (presence/required)チェックを持たない、という
+                              非対称な検出力である。今回のIncidentNotificationTopic
+                              Policyの実際の欠陥は「欠落」型だったため、cfn-lintを
+                              CIへ導入していても本件は防げなかった。CI未導入
+
+repo独自のinfra unit test    `tests/unit/test_infra_*.py`。repo内の情報(template.yaml
+(tests/unit/test_infra_*.py)  の静的構造)から導出できる契約を検証する。AWS API固有の
+                              semantic制約は、**過去に実際にAWS APIから拒否された
+                              制約について、resource typeベースで汎用化した契約を
+                              都度追加する**ことでのみカバーされる(例:
+                              `test_infra_issue_557_topic_policy_sid.py`の
+                              AWS::SNS::TopicPolicy横断テスト、
+                              `test_infra_issue_559_sqs_policy_sid_contract.py`の
+                              AWS::SQS::QueuePolicy予防的テスト)。**悉皆的な
+                              AWS API仕様の再実装ではない**(全AWS semantic
+                              constraintを事前に網羅することは現実的でない)
+
+CloudFormation ChangeSet     テンプレート差分の計算のみ。AWS API側のbusiness
+CREATE                       rule検証は行わない(31.1)
+
+Production ChangeSet EXECUTE 実際のリソースプロバイダAPI呼び出しが発生する、
+                              唯一AWS API側のsemantic制約を検証できる段階。
+                              ここで失敗した場合はCloudFormationの自動rollbackが
+                              安全網として働く(実害ゼロで収束する設計)が、
+                              「事前検知ができた」ことは意味しない
+```
+
+(上の「自動rollbackが安全網として働く」が働くかどうかは、EXECUTEのコマンドでのDisableRollbackの指定に関わる。指定の扱いと、失敗・UPDATE_FAILEDのまま残った場合の扱いは31.4を参照。Issue #793、2026-10-04追記)
+
+**実AWS環境でのpreflight/dry-run(ChangeSet CREATE〜EXECUTEを別accountの
+staging環境で先行実行する等)は、本節時点では採用していない。** CI/release
+pipelineへAWS credentialを新規・広範に持たせることになり、Issue #164(長期
+broad credentialの恒久利用)・Issue #359(deploy principalの権限設計)が指摘する
+懸念と衝突するため、着手にはUSER判断が必要(Issue #559 USER_DECISIONS_REQUIRED。
+2026-09-25時点でDEFER)。
+
+### 31.3 新しいAWS API semantic制約が判明した場合の拡張方針
+
+将来、今回と同種の欠陥(CloudFormation上はvalidだが実AWS APIで拒否される設定)が
+別のresource typeで判明した場合の追加手順:
+
+```
+1  実際のAWS APIエラー(HandlerErrorCode・エラーメッセージ)を実測で記録する
+   (推測で一般化しない。31.2の「悉皆的な再実装ではない」原則どおり、実際に
+   遭遇した制約のみを個別に追加していく)
+2  制約の対象がresource type固有か、Issue固有のLogicalIdに限定されるかを
+   AWS公式ドキュメントで一次確認する(可能な範囲で。今回のSNS/SQSのように、
+   AWS公式が「一部のサービスではSidを要求する場合がある」と例示している
+   ケースもあれば、明示の一次情報が見つからない場合もある〔#559参照〕)
+3  `tests/unit/test_infra_issue_<N>_*.py`へ、そのresource type全体を走査する
+   汎用テストを追加する(LogicalId固有の回帰テストと、resource typeベースの
+   汎用テストの2段構成。#557/#559のパターンを踏襲する)
+4  一次情報が無い・未確認のまま予防的に対象を広げる場合は、テストの
+   docstringで「確認済みの制約」と「予防的な備え」を明確に区別する
+   (#559のAWS::SQS::QueuePolicyテストの例に倣う)
+5  cfn-lintは一意性(uniqueness)違反は検出できるが必須性(presence)違反は
+   検出できないという非対称な検出力を持つ(31.2実測)。新しい制約が
+   「欠落」型か「重複」型かを見極めたうえで、欠落型はcfn-lintに頼らず
+   3の repo独自contract testを主たる防御とする。重複型はcfn-lintが既に
+   検出できる可能性があるため、CI導入時はその点を活かせる(ただし本節
+   時点でcfn-lint自体はCI未導入)。いずれの型であっても、Production
+   ChangeSet EXECUTE時のHuman Gateでの差分確認を最終防御として維持する
+```
+
+本節は Issue #559(design-defect・priority:P2)の実装(PR-1〜PR-3)の一部として
+追加した。判定ロジック・通知内容・保存データ形式・Production挙動は変更していない。
+
+### 31.4 ChangeSet EXECUTEのDisableRollbackの指定と、UPDATE_FAILEDのまま残った場合の扱い(Issue #793、2026-10-04追加)
+
+31.2は、Production ChangeSet EXECUTEで失敗した場合にCloudFormationの自動rollbackが安全網として働くと述べている。本節は、その安全網が働くかどうかが、EXECUTEのコマンドでのDisableRollbackの指定に関わることを記録する。
+
+#### 31.4.1 EXECUTEのコマンド
+
+USER決定(Release W10のChangeSet EXECUTE承認。Issue #122 issuecomment-5974803370。原文のまま引用):
+
+```
+既存のProduction deploy資格情報を使用し、aws cloudformation execute-change-set の経路で実行してください。失敗時に自動rollbackするよう、必ず --no-disable-rollback を明示してください。sam deploy による直接EXECUTEは禁止します。
+```
+
+(同じ文書の次の1文「今回のEXECUTE承認は、この既存ChangeSet 1件に対してのみ有効です。」はW10の承認の範囲を定めるもので、本節の規則ではないため引用から省いた。原本を参照。)
+
+本節の整理(★USER決定の引用ではない):
+
+```
+1  EXECUTEのコマンドは、DisableRollbackの既定値に依存せず、--no-disable-rollback(rollbackを有効にする指定)を明示する
+2  EXECUTEのコマンドとそのDisableRollbackの指定を、releaseの実行記録へ残す
+   (W10の実績: W10の実行記録のEXECUTE_COMMAND / ROLLBACK_SETTING。#783 issuecomment-5974880432)
+```
+
+事実(規則ではない):
+
+```
+・samconfig.tomlのdisable_rollbackが効くのは、SAM CLI自身がChangeSetを実行する場合である。本手順書の経路
+  (CREATE = sam deploy --no-execute-changeset / EXECUTE = aws cloudformation execute-change-set)では、
+  EXECUTEはsamconfig.tomlの値を受け取らない。したがってEXECUTEが失敗したときのrollbackの有無は、
+  execute-change-setの指定で決まる(出典: Issue #793。SAM CLIの公開ソースの読解。読んだのはdevelopの最新で、
+  実際に使われた版ではない)
+・「--disable-rollbackを指定しなければrollbackが有効か」は、裏付けが取れていない。AWS CLI 2.36.8のhelpは
+  execute-change-setの--disable-rollbackにDefault: "True"と記載している。一方、31節の冒頭(導入文)はRelease W9の
+  EXECUTE失敗が自動rollbackで収束したと記録している。2つが食い違い、どちらがサービスの実挙動かは、AWSを
+  呼ばずには確定できない。本節が既定値の主張をせず「明示する」と定めるのは、このためである
+・W10の実績: aws cloudformation execute-change-setに--no-disable-rollbackを明示して実行し、stackの
+  DisableRollback = Falseを確認し、UPDATE_COMPLETE(FAILED_EVENTS 0・rollbackなし)で終端した
+  (#783 issuecomment-5974880432)
+```
+
+#### 31.4.2 失敗した場合・UPDATE_FAILEDのまま残った場合
+
+USER決定(同じ文書。原文のまま引用):
+
+```
+失敗またはrollbackが発生した場合は、追加操作を自己判断で行わず、その状態を記録して停止してください。
+```
+
+事実(AWS CLI 2.36.8のhelpの記載。規則ではない。どの操作を実行するかはUSER判断であり、実行者は自己判断で実行しない):
+
+```
+・execute-change-setの--disable-rollback: "Preserves the state of previously provisioned resources when an
+  operation fails."(rollbackを無効にすると、失敗時にリソースの状態が保持される。stackがUPDATE_FAILEDの
+  まま残りうる。Issue #793の想定であり、W10では起きていない)
+・rollback-stack: "Rolls back the specified stack to the last known stable state from CREATE_FAILED or
+  UPDATE_FAILED stack statuses."。ただし "This operation will delete a stack if it doesn't contain a last
+  known stable state."
+・continue-update-rollback: UPDATE_ROLLBACK_FAILED(rollback自体が失敗した状態)からUPDATE_ROLLBACK_COMPLETE
+  へ進める
+・上記以外の復旧(例: 修正を入れた新しいChangeSetで前へ進める。ChangeSetのCREATEとEXECUTEは別のHuman Gate)を
+  含め、どれを選ぶかはUSER判断
+```
+
+本節はIssue #793の実装として追加した(docsのみ)。判定ロジック・通知内容・保存データ形式・Production挙動は変更していない。
+
+## 32. 本番ジョブ異常のGitHub Issue自動起票(Issue #508。#132 X-9)の Verification Plan(2026-09-25追加)
+
+`IncidentNotifierFunction`(29節の通知経路)へ、本番ジョブ異常のGitHub Issue自動起票・
+コメント追記(`services/incident_github_issue_service.py`)を追加する機能である。
+**本節は`issue_creation_enabled`をfalse→trueへ切り替える際の確認手順のみを扱う。
+切替操作自体・コード変更・config値の変更は本節の対象外**(32.6参照)。
+
+### 32.1 前提
+
+```
+config/incident_notification.yaml の issue_creation_enabled(既定 false)
+  false の間: GitHub API・Secrets Manager呼び出しを一切行わない
+             (正常なスキップ。LINE通知経路〔29節〕には一切影響しない)
+  true化    : deployとは別のHuman Gate(#508 USER決定。追加条件として明記)。
+             Lambda LayerでYAMLを配布する静的設定のため、YAML編集だけでは
+             反映されない(config編集 + 再deployが必要。5.1節のreview_improvement.yaml
+             と同じ制約)
+```
+
+Issue #508 の USER 決定(issuecomment。Phase A の USER_DECISIONS_REQUIRED への回答)。
+
+```
+U-3  ALLOW(PUBLIC repositoryへの自動Issue作成を許可)。ただし
+     Production環境での人工テストIssue作成は禁止
+U-4  EXISTING_GITHUB_APP_REUSE(既存のGitHub App資産〔infrastructure/github/
+     client.py。5.1節でWeeklyReviewFunctionが使うものと同一〕を再利用。
+     新規認証方式は導入しない)
+U-5  OPEN→COMMENT / CLOSED→NEW ISSUE(同一fingerprintの再発時、OPEN Issueには
+     コメント追記、CLOSED後は旧Issue番号参照付きの新規Issueを作成する。
+     reopenはしない)
+```
+
+### 32.2 切替前の確認事項(1): GitHub App資産の疎通確認
+
+`IncidentNotifierFunction`は新規のGitHub Appを作らず、5.1節でセットアップ済みの
+GitHub App資産(`GithubAppSecretArn`/`GithubRepository`のCloudFormation parameter・
+Secrets Managerの秘密鍵)を`WeeklyReviewFunction`と共有する(U-4)。したがって
+本節の確認は**新規セットアップではなく、既存資産が引き続き有効であることの確認**である。
+
+```
+1  Lambda環境変数確認   IncidentNotifierFunctionの環境変数に GITHUB_APP_SECRET_ARN /
+                       GITHUB_REPOSITORY が設定されていること(値そのものではなく
+                       変数名の存在のみをPUBLIC repositoryへ書く。ARN実値は書かない)
+2  Secret疎通確認       secretsmanager:GetSecretValueで復号できること・JSON形式が
+                       {app_id, installation_id, private_key} の3項目を持つこと
+                       (5.1節の既存確認手順と同一。値そのものは記録しない)
+3  GitHub App権限確認   対象リポジトリへのインストールが有効であり、
+                       Issues: Read and write / Metadata: Read-only の権限を
+                       保持していること(GitHub UI。5.1節セットアップ時に付与した
+                       ものが失効・変更されていないかの再確認)
+4  既存機能への相乗り確認 5.1節のWeeklyReviewFunction側(review_improvement.yaml の
+                       issue_creation_enabled)が現在どちらの値でも、本節の確認には
+                       影響しない(secretは共有だが、GithubIssueClientの呼び出しは
+                       関数ごとに独立しており、片方の状態がもう片方の疎通確認結果を
+                       左右しない)
+```
+
+### 32.3 切替前の確認事項(2): labelの非混在確認
+
+```
+config/review_improvement.yaml   issue_labels: [rule-improvement, auto-generated]
+config/incident_notification.yaml issue_labels: [production-incident, auto-generated]
+```
+
+両者は`auto-generated`を共有するが、重複判定・close運用の実体は`auto-generated`
+ではない。`services/incident_github_issue_service.py`の`_SEARCH_LABEL`は
+`"production-incident"`固定であり、stale claim復旧時の実在確認
+(`search_open_issue_by_marker()`)は`production-incident`ラベル**かつ**
+fingerprintマーカー(HTMLコメント)の両方が一致する場合のみ既存Issueとして扱う。
+`rule-improvement`ラベルのIssue(週次改善レビュー由来)を誤って本機能のdedup対象に
+取り込むことはない(実装を実読して確認済み)。
+
+```
+1  既存label確認   切替前に `production-incident` ラベルを持つ既存OPEN Issueが
+                  0件であること(gh issue list --label production-incident)。
+                  0件でなければ、それが本機能によるものか他の経路による手動付与かを
+                  切替前に確認する(手動付与された同名labelがあると、fingerprint
+                  マーカーが一致しない限り実害は無いが、誤認の元になるため)
+2  search label確認  `_SEARCH_LABEL`(コード実読)と
+                  `config/incident_notification.yaml`の`issue_labels`先頭要素が
+                  一致していること(現状は両方"production-incident"。切替前に
+                  再読して確認する)
+```
+
+### 32.4 切替前の確認事項(3): IAM(exact resource scope)の確認
+
+Issue #508 の USER 決定 U-2(PARTIAL/resource-scoped限定でPROCEED。#133 全体の
+解消は待たない条件として「exact ARN指定・wildcard禁止」を付した)に対応する。
+
+```
+1  template確認     infra/template.yaml の IncidentNotifierFunction の Policies で、
+                   secretsmanager:GetSecretValue の Resource が
+                   !Ref GithubAppSecretArn(exact ARN 1件)のみであり、
+                   `*` や `arn:aws:secretsmanager:...:secret:jstock/*` 等の
+                   wildcard/prefixマッチが無いこと(コード実読で確認済み。
+                   デプロイ前にも再確認する)
+2  IncidentStateTableのIAMも同様に確認  dynamodb:GetItem/PutItem/UpdateItem/DeleteItemの
+                   Resourceが!GetAtt IncidentStateTable.Arn(exact ARN)のみで
+                   あり、Scan/Queryの権限が付与されていないこと(GSIが無く
+                   fingerprint単位のみで足りるため。既存設計)
+3  ChangeSet差分確認  デプロイ時のChangeSet CREATEで、上記2つのStatement以外に
+                   IncidentNotifierFunctionへ新たなIAM Permissionが追加されて
+                   いないこと(30〜31節の一般手順どおり、想定外のADD/MODIFYが
+                   無いことを確認してからEXECUTEする)
+```
+
+### 32.5 切替後に確認すること(自然発生のincidentのみ。32.6参照)
+
+```
+1  allowlist確認     実際に作成されたGitHub Issueの本文・コメントが、
+                    IncidentIssueNotice が持つフィールドのみで構成されていること
+                    (job・occurred_at・fingerprint・occurrence_count・
+                    failure_stage・failure_count・consecutive_days・is_ongoing)。
+                    stack trace・生exception message・AWS account ID・ARN・
+                    request ID・secret・tokenのいずれも含まれないこと
+                    (`domain/notification/incident_github_issue_message.py`の
+                    build_incident_issue_body()/build_incident_comment_body()が
+                    出力する固定の文型どおりであることを実物で確認する)
+2  再発契約(U-5)確認  同一fingerprintが再発した場合:
+                      - 前回のIssueがOPENのまま      -> 新規Issueを作らず、
+                        既存Issueへ「### 再発(N回目)」形式のコメントが
+                        追記されること(occurrence_countが前回と異なる)
+                      - 前回のIssueがCLOSED済み       -> reopenされず、
+                        本文冒頭に "Previous issue: #<旧番号>" を含む
+                        新規Issueが作成されること
+                    確認は自然発生時のみ。人工的に再発条件を作らない(32.6)
+
+   ★ 上記は「occurrence_countが実際に増えた場合」の期待結果であり、
+     「同一fingerprintを再受信するたびに必ず新しいコメントが付く」という
+     意味ではない(`services/incident_github_issue_service.py`の
+     `_post_comment()`/`_reconcile_stale_comment()`実読で確認)。
+
+     - 既存OPEN Issueへのコメント追記は**occurrence単位の重複抑止**に従う。
+       `last_commented_occurrence_count == notice.occurrence_count`の場合
+       (今回のoccurrenceについて既に投稿済み)は追加投稿しない
+     - 同一fingerprintの再受信(例: dedup window内でのSNS/Lambda retry)は、
+       LINE側がSUPPRESSEDのままoccurrence_countを進めないことが多く、
+       **同一fingerprintの再受信とoccurrence_countの増加を同一視しない**
+       (occurrence_countは`IncidentStateTracker`の状態から読むのみで、
+       GitHub側の呼び出し自体はoccurrence_countを進めない)
+     - 処理中claim(`comment_claim_occurrence_count`が今回のoccurrenceと
+       一致し、`comment_claim_expires_at`が未失効)の間は、他実行が
+       処理中のため何もしない(無条件の即時投稿を要求しない)。
+       stale claim(claim期限切れ)の場合は、GitHub側の実在確認
+       (`find_comment_by_marker()`)を先に行ってから再claimして投稿する
+       (既存実装のstale takeover契約どおり)
+3  LINE経路からの独立性確認  `lambda_handlers/incident_notifier_handler.py`の
+                    `_process_signal()`/`_send_line()`と
+                    `services/incident_github_issue_service.py`を実読して
+                    確認した設計は次のとおりであり、GitHub処理の成否と
+                    LINE経路の挙動は独立に確認する(いずれのケースも、対象
+                    実行のCloudWatch Logs INFOログ`incident_notifier claim
+                    source=... fingerprint=... outcome=...`でclaim outcomeを
+                    確認したうえで、期待結果と実測を照合する。Lambdaの
+                    ErrorsメトリクスやDynamoDBのstatusだけで因果関係を
+                    断定しない)。
+
+   a  LINE送信対象・LINE成功
+      (outcome ∈ {CLAIMED_NEW, CLAIMED_AFTER_DEDUP_WINDOW,
+       CLAIMED_STALE_TAKEOVER}、`_send_line()`のpush_messageが成功)
+      期待結果: LINEは`mark_sent`済みで正常に完了していること。GitHub処理
+      (`_attempt_github_issue()`)は成功・失敗いずれの場合も、その例外が
+      `_process_signal()`側の外側try/exceptで完全に捕捉され、Lambda呼び出し
+      自体を失敗させないこと(=この場合IncidentNotifierFunctionのErrorsが
+      増えないこと)。GitHub側の失敗がLINEの成功結果を覆さないことを確認する
+   b  LINE送信が重複・処理中により抑止
+      (outcome ∈ {SUPPRESSED_DUPLICATE, SUPPRESSED_ACTIVE_CLAIM})
+      期待結果: 既存の抑止動作(LINE送信を行わない)がそのまま維持されて
+      いること。GitHub処理はLINEのoutcomeに関わらず試行される設計だが、
+      これは既存の抑止契約を変更するものではない。**「抑止されたので
+      GitHub処理側がLINEを追加送信する」ことを合格条件にしない**
+      (そのような経路はコード上存在しない)
+   c  LINE自体が失敗(outcome ∈ 上記CLAIMED_*、push_messageが例外)
+      期待結果: 既存の`release_claim()`(outcomeがCLAIMED_NEWならfingerprint
+      行を削除。それ以外は行を残したまま`claimed_at`を古い値へ書き換えて
+      即座にstale takeover可能にし、`occurrence_count`を-1して打ち消す)と、
+      例外の再送出(SNS/Lambda retryへ委ねる既存契約)が変わっていないこと。
+      **この場合、IncidentNotifierFunctionのErrorsが増えることは想定内**
+      (LINE自身の既存retry契約による。#508より前から存在する挙動)であり、
+      これを「GitHub経路がLINE経路を壊した」証拠として使わない。
+      outcomeがCLAIMED_NEWでLINEが失敗した場合は、fingerprint行削除後の
+      部分再生成による重大な回帰(既存コードのコメントに実測記録あり)を
+      避けるため、GitHub処理自体が今回スキップされる
+      (`github_safe_to_attempt = False`)。CLAIMED_AFTER_DEDUP_WINDOW /
+      CLAIMED_STALE_TAKEOVERでLINEが失敗した場合はGitHub処理は試行される
+      (LINE失敗との因果関係を混同せず、GitHub側の成否とLINE側のErrors
+      増加を別々に確認する)
+
+   ★ 上記3ケースのうち、対象期間中に自然発生しなかったものは
+     「未観測/検証待ち」とし、確認できなかったことをもってPASS扱いにしない
+     (検証のための人工障害〔LINE認証情報の意図的な無効化等〕は発生させない。
+     32.6参照)
+4  DynamoDB確認       IncidentStateTableをfingerprint単位でGetItemし、
+                    github_issue_number・github_issue_create_status・
+                    previous_github_issue_number(再作成時のみ)を確認する
+                    (値そのものはPUBLIC repositoryへ書かない。件数・statusのみ)
+```
+
+### 32.6 禁止事項・この節が決めていないこと
+
+```
+・Production環境での人工的なテストIssue作成は禁止(U-3)。CloudWatch Alarmの
+  人工発火・SNS Publish・Lambdaの手動invokeによる本機能の動作確認は行わない。
+  自然発生のincidentでのみ32.5を確認する
+・issue_creation_enabledをfalseからtrueへ実際に切り替える操作(別Human Gate。
+  本節はその後の確認手順のみ)
+・コード変更・config値の変更(本節はいずれも行わない。#508はコード面では
+  PR #563〔D5〕・PR #565〔D9〕で完了済み)
+・GitHub App本体の新規作成・インストール(5.1節で既に完了済み。本機能は
+  U-4により既存資産を再利用するのみ)
+```
+
+### 32.7 ロールバック手順
+
+```
+1  config/incident_notification.yaml の issue_creation_enabled を true から
+   false へ戻す
+2  sam build && sam deploy で再デプロイする(Productionへ反映するbuildなので、36.3の5に従い
+   sam build --use-container で行う。静的設定のため、config編集単独では
+   反映されない。32.1参照)
+3  ロールバック後もIncidentStateTableの既存レコード(github_issue_number等)と、
+   既に作成済みのGitHub Issueはそのまま残る(削除・close操作は本節の対象外。
+   必要な場合は別のHuman Gateで判断する)
+4  ロールバック後はfalse運用時と同じ挙動に戻る(GitHub API・Secrets Manager
+   呼び出しは発生しない。29節のLINE通知経路には影響しない)
+```
+
+### 32.8 参考
+
+```
+・障害対応runbook(27節。Issue #500)
+・#508 Acceptance Criteria(Issue本文)・USER決定 U-1〜U-5(issuecomment)
+・GitHub App資産のセットアップ手順(5.1節。本節は再実行しない。既存資産の
+  疎通確認のみ)
+・本番ジョブ異常の検知(通知経路)のVerification Plan(29節。Issue #503)
+```
+
+本節はIssue #508(#132 X-9)のPhase B(PR #563・PR #565。コードはmainへmerge済み)
+の残作業として、docsのみ追加した。判定ロジック・通知内容・保存データ形式・
+Production挙動は変更していない。`issue_creation_enabled`の実際の切替はいずれの
+Human Gateも経ておらず、本節の追加によってもProduction上の挙動(既定falseのまま)は
+変わらない。
+
+## 33. 買付余力(available cash)機能のProduction初期化・rollout(Issue #596、#128 A6b、2026-09-26追加)
+
+`#128`(Portfolio Capital Allocation Epic)の基盤機能A1〜A6a(下表)が、
+本節執筆時点(2026-09-26)ですべて`main`へmerge済みだが、**いずれもまだ
+Productionへdeployされていない**(ChangeSet CREATE/EXECUTEはいずれも
+別Human Gate。各PRのmerge自体はAWSリソースを一切作成・変更しない)。
+本節は、これらをまとめて初めてdeployする際の初期化戦略・順序・
+rollback・verificationを整理する。
+
+### 33.1 merge済みの内訳
+
+```
+A1  #584(available_cashモデル/永続化)             PR #587  556e6ae5  2026-09-25T09:34:53Z
+A2  #589(棚卸し更新reconcile、CLI)                PR #599  00b0b536  2026-09-26T00:28:34Z
+A3  #590(LINE会話型BUY/SELLとの整合)              PR #620  97fe226e  2026-09-26T09:12:50Z
+A4  #591(BUY時のavailable cash不足検知)           PR #621  616d4e48  2026-09-26T11:10:26Z
+A5a #592(LINE会話型UIからの参照・棚卸し更新)      PR #614  f543b85f  2026-09-26T06:05:47Z
+A5b #593(LINEリッチメニュー8ボタン化定義)         PR #615  ff158f89  2026-09-26T07:15:33Z
+A5c #594(CLIからの参照・棚卸し更新)               PR #608  b0912a54  2026-09-26T02:54:12Z
+A6a #595(AvailableCashTable新設・IAM配線)         PR #617  46d30a80  2026-09-26T07:26:04Z
+```
+
+A6b(本Issue、#596)自体はコード変更を伴わない(本節の追加のみ)。
+
+### 33.2 初期化戦略(既存owner・auto-backfillしない契約)
+
+**既存owner(既に保有銘柄・ウォッチリスト等を利用中の所有者)へ
+`available_cash=0`を自動的に割り当てることはしない。** 未登録owner
+(=一度も棚卸ししていない)と、棚卸しした結果0円である状態は明確に
+区別する契約(#584 T4・#589 T12)であり、自動backfillはこの契約と
+根本的に矛盾する(backfillした瞬間、実際には棚卸しをしていないという
+事実が失われる)。
+
+deploy後、既存ownerが初めてLINE「買った」「売った」を試みると、
+`AvailableCashNotRegisteredError`により明示的に拒否される(#590/#591。
+「買付余力が未登録のため、売買登録ができませんでした。」)。この影響を
+避けたい場合は、**deploy直後に、LINEの「余力管理」メニュー(6.2節)で対象owner全員の
+初回棚卸しを事前に済ませておくこと**(自動化はしない。対応するかは運用判断)。
+★ CLI(3.5節の `jstock available-cash`)はローカルのストアだけを読み書きし、Productionには
+反映されないため、この初期化には使えない(Issue #923。`AWS_LAMBDA_FUNCTION_NAME` が
+設定された環境では拒否される) ★。
+
+### 33.3 デプロイ順序
+
+A1〜A6aはすべて同一の`main`上に既にmergeされているため、**初回deployは
+これらすべてを含む1回のChangeSet CREATE/EXECUTE(`sam build && sam deploy`。
+buildは36.3の5に従い`sam build --use-container`)で行う**。個別のPRごとに段階的にdeployする必要はない(Phase A設計時点
+〔#590 issuecomment〕では並行実装中で段階deployを想定していたが、
+全PRがmerge済みの現時点ではその前提は解消している)。
+
+```
+1  infra/template.yaml(AvailableCashTable新設・LineWebhookFunctionへの
+   IAM配線)とLambdaコード(conversation_service.py等)は同一ChangeSetで
+   同時に反映される(SAMの通常のdeployフロー。個別のtable/IAMのみを
+   先行させる特別な手順は不要)
+2  デプロイ前に、上記33.1の8 PRがすべて対象branch(main)に含まれている
+   ことをfresh確認する(`git log --oneline` 等で各mergeCommitの存在を
+   確認)
+3  ChangeSet実行後、リッチメニュー(#593)の実際のset-default(画像
+   アップロード・LINE側への登録)は本節の対象外の別Human Gate(6.2節末尾
+   参照)。この切替が済むまで、利用者はメニューボタンから「余力管理」を
+   選べない(「買った」「売った」経由の連動自体は#590/#591によりデプロイ
+   直後から有効になる)
+```
+
+### 33.4 ロールバック
+
+```
+infra(#595)  AvailableCashTableは`DeletionPolicy: Retain`・
+             `UpdateReplacePolicy: Retain`(Issue #137と同水準)のため、
+             ChangeSetのロールバックでtable自体が失われることはない。
+             ロールバックしてもtableは残る(空のまま、または途中まで
+             書き込まれたデータを保持したまま)ため、再度前方向へ
+             deployし直せば整合する
+code         既存のLambda deployロールバックと同型(前回のPRODUCTION_SHAへ
+             再deploy。本Issue固有の新しい手順は不要)
+data         backfillを行わないため、ロールバックによる「不整合な
+             部分適用データ」のクリーンアップは原理上発生しない
+             (#590のTransactWriteItems原子性により、部分書き込みは
+             残らない)
+```
+
+### 33.5 Production verification
+
+本機能はscheduled batchではなくuser-initiated操作(LINE/CLI)のため、
+既存の「次回自然実行(平日08:00等)の観測」というverification様式は
+そのままでは当てはまらない。
+
+```
+推奨verification: 「次に実際の利用者がLINE/CLIでreconcile・BUY・SELLを
+実行した際、AvailableCashTableへ正しく記録されること」を自然な初回利用
+機会として観測する(#377等、他Issueの「次回自然実行観測」と同じ精神を
+user-initiated機能向けに読み替えたもの)。人工的なProduction実行
+(検証目的のLambda手動起動等)は18節の例外手続きが必要なため、基本方針
+としない。
+
+確認観点:
+  - AvailableCashTableに実際にレコードが作成/更新されること
+  - 未登録ownerでのBUY/SELLが明示的に拒否されること(誤って自動0円初期化
+    されていないこと)
+  - 余力不足のBUYが「買付余力が不足しているため」の専用メッセージで
+    拒否されること(汎用の「最新の保有状況が変更された」メッセージに
+    なっていないこと)
+```
+
+### 33.6 参考
+
+```
+・買付余力の参照・棚卸し更新(CLI、3.5節)
+・LINEメニューボタンからの登録(6.2節末尾、rich menu set-default前提)
+・DynamoDBの復旧手順(20節。AvailableCashTableも同水準の保護対象)
+```
+
+本節はIssue #596(#128 A6b)として、docsのみ追加した(コード変更を伴わない)。
+実際のChangeSet CREATE/EXECUTE・rich menu set-defaultはいずれも別Human Gate
+であり、本節の追加によってもProduction上の挙動は変わらない。
+
+## 34. BUY/holdings dispatchのSQS緊急停止手順(Issue #533、#319 Phase 2、2026-09-27追加)
+
+Issue #533は`BUY_CANDIDATE_SQS_DISPATCH_ENABLED`/`HOLDINGS_WATCHLIST_SQS_
+DISPATCH_ENABLED`(既定`false`)で銘柄・holding単位のfan-out経路を切り替える
+機構を追加した。**本節執筆時点でこの機構は無効(Phase 2。有効化=Phase 3は
+別Human Gate)であり、本節の手順はPhase 3有効化後にのみ必要になる。**
+
+### 34.1 通常のrollback(env var切替のみ)
+
+env var切替はdispatch側(BuyCandidatesFunction/HoldingsWatchlistFunctionが
+新規メッセージをどちらの経路へ送るか)のみを制御し、**worker Lambda・SQS Event
+Source Mapping自体の有効/無効とは独立**である。したがって通常のrollback
+(SQSを試験的に有効化した後、legacy(非同期自己再帰呼び出し)へ戻す場合)は
+以下だけでよい:
+
+```
+1  env var(BuyCandidateSqsDispatchEnabled / HoldingsWatchlistSqsDispatchEnabled)
+   をfalseへ戻すChangeSetを作成・実行する(通常のChangeSet CREATE/EXECUTE
+   Human Gate)。
+2  以後、新規batchはlegacy経路(dispatch_async)へ切り替わる。
+3  env var切替前にQueueへ送信済みのメッセージは、Event Source Mappingが
+   有効なままであれば引き続きworker Lambdaで処理され続け、自然に処理し
+   切られる(通常はこれで十分。追加のpurge操作は不要)。
+```
+
+**Queue残件の確認(2の後、必要なら)**: AWS ConsoleまたはCLIで対象Queueの
+`ApproximateNumberOfMessages`(+`ApproximateNumberOfMessagesNotVisible`)を
+確認し、両方0であれば処理完了。
+
+```bash
+aws sqs get-queue-attributes \
+  --queue-url <BuyCandidateQueueまたはHoldingsWatchlistQueueのURL> \
+  --attribute-names ApproximateNumberOfMessages ApproximateNumberOfMessagesNotVisible
+```
+
+### 34.2 緊急停止(Event Source Mapping自体の無効化。Human Gate)
+
+SQS側で異常な大量メッセージ・worker Lambdaの異常動作等により、Queueの
+自然消化を待たずに即時停止したい緊急ケースに限り、Event Source Mapping自体を
+無効化する。**これは34.1のenv var切替とは別のHuman Gateであり、AWS操作
+(ChangeSetを経由しない直接のAWS CLI/Console操作)であることに注意する。**
+
+```
+1  対象のEvent Source Mapping UUIDを確認する:
+
+   aws lambda list-event-source-mappings \
+     --function-name <stack名>-buy-candidate-worker
+   (holdingsは <stack名>-holdings-watchlist-worker)
+
+2  UUIDを使って無効化する(Enabled=falseへ更新するのみ。削除ではない):
+
+   aws lambda update-event-source-mapping --uuid <UUID> --enabled false
+
+3  再開する場合は同じUUIDでEnabled=trueへ戻す:
+
+   aws lambda update-event-source-mapping --uuid <UUID> --enabled true
+```
+
+**無効化してもQueue内のメッセージは削除されない**(単に配送が止まるだけ)。
+無効化中に新規メッセージがdispatch側から送られ続けると、Queueに蓄積し続ける
+(dispatch側のenv var切替〔34.1〕と併用し、まずdispatch自体を止めてから
+Event Source Mappingを止めるのが通常の緊急停止の順序)。
+
+蓄積したメッセージを完全に破棄する必要がある場合(再開を諦める場合)は、
+`aws sqs purge-queue --queue-url <QueueURL>`を使う(**破棄は取り消せない**。
+実行前にQueue深度・内容を必ず確認し、実施はUSER承認を得ること)。
+
+### 34.3 参考
+
+```
+・DLQ滞留の確認手順(24節。BuyCandidateTerminalFailureDLQ/HoldingsWatchlist
+  TerminalFailureDLQも同じ手順で確認できる)
+・異常を知ったときの手順(27節)
+・本節の対象Event Source MappingはPhase 2時点で未有効化(BUY_CANDIDATE_SQS_
+  DISPATCH_ENABLED等が既定false)のため、本節の手順が実際に必要になるのは
+  Phase 3有効化後のみ
+```
+
+## 35. Secretsリソースポリシー(第二の防壁)の有効化前提・lockout時の復旧手順(Issue #680、#133 UNIT2、2026-09-28追加)
+
+Issue #680は`SecretResourcePolicyEnabled`(既定`false`)で、jstockが保持する
+Secrets Managerシークレット5件へ、identity policyとは独立したresource
+policy(allow-listに無いprincipalをexplicit Denyする「第二の防壁」)を適用する
+機構を追加した。**本節執筆時点でこの機構は無効(コード・IaCのmerge単独では
+AWS上の状態は変更されない)であり、本節の手順はEnabled=true適用(別Human
+Gate)後にのみ必要になる。**
+
+### 35.1 Enabled=true適用前の必須前提(machine-enforced + human確認の両方)
+
+```
+機械的に強制されるもの(infra/template.yamlのRulesセクション、Issue #680)
+  SecretResourcePolicyEnabled=trueかつAdminPrincipalArn/DeployPrincipalArn
+  のいずれかが既定のダミー値のままだと、stack操作(create-change-set等)
+  自体が失敗する(CloudFormation Rulesによる機械的拒否)。
+
+human判断が必要なもの(Rulesでは検証できない)
+  1  AdminPrincipalArnへ設定する値は、IAM roleのARN自体
+     (arn:aws:iam::<account>:role/<name>)であり、CloudTrail・
+     AWS Console・AccessDeniedExceptionメッセージ等で表示される
+     sts::assumed-role形式(arn:aws:sts::<account>:assumed-role/<name>/
+     <session>)ではない。後者をそのまま設定すると、aws:PrincipalArn
+     条件キーの実際の評価値(IAM role自体のARN)と一致せず、allow-list
+     が機能しない(=そのprincipalがDenyされる)。
+     ★ DeployPrincipalArnはIAM user(2026-09-28 fresh確認。下記参照)
+     のため、この種のsts::assumed-role形式との混同は原理的に起こらない
+     (IAM userはassumeされないため、常にuser自体のARNのみが存在する)。
+     ただし値そのものは陳腐化しうる(#164でdeploy principal自体が
+     変更された場合。本パラメータの同期更新が必要)。
+  2  管理者principalがAWS SSO(IAM Identity Center)経由のroleである
+     場合、実際のARNは`arn:aws:iam::<account>:role/aws-reserved/
+     sso.amazonaws.com/<region>/AWSReservedSSO_<permission-set-name>_
+     <hash>`という長い形式になる。**permission setの削除・再作成
+     (名称は同じでも内部hashが変わる)で、このARNは静かに変わる**。
+     SSO経由の管理者principalを設定する場合は、permission setの
+     再作成がAdminPrincipalArnの値を陳腐化させうることを運用者が
+     認識しておくこと(自動検知の仕組みは無い。#680のscope外)。
+  3  下記「IAM Policy Simulatorの適用範囲」を参照。ADMIN(AdminPrincipalArn)
+     ・RUNTIME 2 role(IncidentNotifierFunctionRole/
+     WeeklyReviewFunctionRole)はいずれもIAM roleであり、simulationだけ
+     でno-lockoutを確認することはできない(RESIDUAL_RISK)。DEPLOY
+     (DeployPrincipalArn)はIAM userであり(2026-09-28、サブちゃんレビュー
+     指摘F9でfresh確認)、別経路でend-to-end事前確認が可能である。
+```
+
+★★ **IAM Policy Simulator(`iam:SimulatePrincipalPolicy`)がresource
+policy込みのend-to-end評価(no-lockout確認)に使えるかどうかは、
+principalがIAM role/IAM userのどちらかで異なる(2026-09-28、USER
+Human Gate指摘F7・サブちゃんレビュー指摘F9で判明)。**
+
+```
+principal種別のfresh確認結果(read-only、jstock-observer profile)
+  AdminPrincipalArn         = IAM role(AWS SSO/IAM Identity Center経由)
+  DeployPrincipalArn        = IAM user(Issue #164が問題とする、長期
+                              access key・広範権限を持つ既存のIAM user
+                              と一致。roleの一時credentialではない)
+  IncidentNotifierFunctionRole
+  WeeklyReviewFunctionRole  = いずれもIAM role(Lambda実行role)
+```
+
+旧版の本節・Issue #680 PR本文にあった「AdminPrincipalArn/
+DeployPrincipalArnはいずれもSSO由来のIAM role」という前提(F7時点の
+記述)は誤りであり、削除した。DEPLOYがIAM userである点は、
+`infra/template.yaml`のDeployPrincipalArn Defaultの書式
+(`arn:aws:iam::<account>:user/not-configured`)・resource policy定義
+直前のコメント(「管理者role・deploy user」)とも整合する。
+
+#### IAM Policy Simulatorの適用範囲(用語定義)
+
+用語(AWS公式ドキュメント`SimulatePrincipalPolicy` APIリファレンス・
+IAM User Guide「IAM policy testing with the IAM policy simulator」に
+基づく):
+
+```
+IDENTITY_POLICY_CHECK
+  PolicySourceArn=対象principal、ResourcePolicyパラメータ無しでの
+  simulation。そのprincipalのidentity-based policy側の許可のみを
+  評価する。IAM roleに対しても機能する(PolicySourceArnはuser/group/
+  roleいずれでもよい)。ただしresource-based policy(本Issueのexplicit
+  Deny)を一切考慮しないため、「resource policyがあっても最終的に
+  allowされるか(=lockoutしないか)」の確認にはならない。
+
+RESOURCE_POLICY_CHECK_FOR_IAM_USER
+  PolicySourceArnがIAM userの場合に限り、ResourcePolicyパラメータへ
+  実際のresource-based policy文字列を渡すことで、identity policyと
+  resource-based policyを合成したend-to-end評価が可能(AWS公式:
+  「You can also optionally include one resource-based policy to be
+  evaluated ... for IAM users only.」)。**本IssueではDeployPrincipalArn
+  (IAM user)にこの経路が使える**(2026-09-28 fresh確認)。ただし
+  `ResourceArns`・`ContextEntries`(`aws:PrincipalArn`)を正しく指定
+  しないと検査として機能しない(2026-10-01 F13。下記RESIDUAL_RISKへの
+  対処bを参照)。
+  ★ **この経路が使えるのは、DEPLOYが現在IAM userだからに過ぎない**
+  (2026-10-01、サブちゃんレビュー指摘F15)。Issue #164(Production
+  deploy用の長期credentialの是正)がDEPLOYをIAM role化した場合、この
+  経路は使えなくなり、RESIDUAL_RISKの対象にDEPLOYが再び含まれる
+  ことになる。#164着手時は、本節(35.1)のRESIDUAL_RISKの記述を
+  合わせて見直すこと。
+
+RESOURCE_POLICY_CHECK_FOR_IAM_ROLE
+  非対応。AWS公式ドキュメント(SimulatePrincipalPolicy APIリファレンス、
+  `ResourceArns`/`ResourcePolicy`パラメータの説明)に明記:
+  「Simulation of resource-based policies isn't supported for IAM
+  roles.」また、resourceのpolicyはsimulatorが自動取得しない
+  (「The simulation does not automatically retrieve policies for the
+  specified resources.」)ため、そもそも自動的にresource policyが
+  加味されることも無い。**AdminPrincipalArn・2 runtime roleの3者が
+  該当する。**
+```
+
+#### RESIDUAL_RISKへの対処(Enabled=true適用前に組み合わせるもの)
+
+**RESIDUAL_RISK**(ADMIN・RUNTIME 2 role=IAM roleについて、pre-apply
+simulationではresource policy込みのend-to-end許可を機械的に証明
+できない。DEPLOY=IAM userは下記bで別途end-to-end確認が可能なため
+対象外)への対処として、Enabled=true適用前は以下a〜fを組み合わせる:
+
+```
+a  IDENTITY_POLICY_CHECK
+   ADMIN/DEPLOYそれぞれのidentity-based policyが、対象secretへの
+   7 action(resource policyのAction一覧と同一: GetSecretValue/
+   PutSecretValue/DeleteSecret/UpdateSecret/RotateSecret/
+   PutResourcePolicy/DeleteResourcePolicy)を許可していることを
+   SimulatePrincipalPolicyで確認する(resource policyは考慮されない
+   ため、ADMINについてはこれは必要条件の一部にすぎない)。
+   ★★ **ResourceArnsへ5 secretの実ARNをまとめて指定すること
+   (2026-10-01、サブちゃんレビュー指摘F19・MUST相当)**。省略すると
+   既定で`*`になり、RUNTIME 2 role(下記)のようにidentity policyの
+   `Resource:`が対象secretの実ARNへscope済み(`infra/template.yaml`の
+   該当IAM policy)の場合、`*`という文字列はそのResourceパターンと
+   一致せず`implicitDeny`に見えてしまう(F10が「正しい状態」と明記した
+   構成が、手順上は権限不足に見える)。逆にADMIN/DEPLOYは広範権限
+   (`Resource: "*"`相当)のため、ResourceArns省略でも`allowed`が
+   返りやすく、対象secretへの実際のアクセス可否を確認したことに
+   ならない。両principal種別とも、この誤りの影響を受ける(前者は
+   false deny、後者はfalse allow)。
+   ★ 本項目はResourcePolicyパラメータを渡さないため、bのような
+   「1回のsimulationにつき1つのresource-based policyのみ」という
+   制約(F18参照)は適用されない。ResourceArnsへ5 secret分を一括で
+   指定し、principalごとに1回(ADMIN/DEPLOY/RUNTIME 2 roleの計4回)
+   実行すれば足りる(F18のように5 secret×principal分へ増やす必要は
+   ない)。
+   ★ **将来の既知リスク(2026-10-01、サブちゃんレビュー指摘F16)**:
+   この「DEPLOYは7 actionを許可している」という前提は、現在DEPLOYが
+   広範権限(AdministratorAccess相当)を持つことに依存している。
+   Issue #164のscope項目3(deployに本当に必要な権限範囲を洗い出し、
+   管理者相当からの縮小可否を判断する)が適用されると、DEPLOYの
+   identity policyが7 actionの一部(特にDeleteResourcePolicy/
+   PutResourcePolicy等の管理系action)を含まなくなる可能性があり、
+   その場合この確認項目はF10がRUNTIME 2 roleで検出したのと同型の
+   矛盾を起こす。#164着手時は、この項目も合わせて見直すこと。
+   ★ RUNTIME 2 role(IncidentNotifierFunctionRole/
+   WeeklyReviewFunctionRole)は、7 actionではなく**secretsmanager:
+   GetSecretValueのみ**を許可していることを確認する(2026-09-28、
+   サブちゃんレビュー指摘F10で修正。両roleの実際のidentity policyは
+   最小権限によりGetSecretValueのみであり、これが正しい状態である。
+   チェックリストを満たすためにPutSecretValue等を追加付与しては
+   ならない。それは#133/#680が縮小しようとしているblast radiusを
+   逆に広げる)。
+   ★★ **resource軸の期待値(2026-10-01、サブちゃんレビュー指摘F20)**:
+   F19によりaはResourceArnsへ5 secret分のARNをまとめて渡すため、
+   RUNTIME 2 roleについては**github-app secretのみ`allowed`、残り
+   4 secret(edinet-api-key/line-channel-access-token/line-user-id/
+   line-channel-secret)は`implicitDeny`になるのが正しい結果**である
+   (両roleのidentity policyは`Resource: !Ref GithubAppSecretArn`
+   〔`infra/template.yaml`の該当IAM policy〕のみへscopeされており、
+   他4 secretへのGetSecretValueはそもそも許可していない。resource
+   policy側のallow-listもgithub-app secretのみこの2 roleを含み、
+   残り4 secretはADMIN/DEPLOYの2者のみである)。**この4件の
+   implicitDenyはチェック失敗ではない。これを解消しようとして
+   allow-listやidentity policyを広げてはならない**(F10がaction軸で
+   警告したのと同型の、resource軸でのblast radius拡大になる)。
+
+b  RESOURCE_POLICY_CHECK_FOR_IAM_USER(DEPLOYのみ。pre-apply時点で
+   得られる、simulationによる唯一の真のend-to-end確認)
+   ★★ **2026-10-01、サブちゃんレビュー指摘F13(MUST)で判明**:
+   単純にResourcePolicyパラメータを渡すだけでは、以下2つの理由で
+   このsimulationは検査として機能しない(allow-listが実際には誤って
+   いても`allowed`が返りうる〔落ちない検査〕、逆に正しい設定でも
+   `explicitDeny`に見えうる、という両方向に信頼できない結果になる)。
+   正しい手順は以下のとおり:
+
+   1  ResourceArnsへ、対象secretの実際のARN(該当secretの
+      `*SecretResourcePolicy`が`SecretId`に指定しているARN)を明示的に
+      指定する。省略すると既定で`*`になり、resource policyの
+      `Resource:`(secretの実ARNへscope済み)と一致するとは限らず、
+      Denyステートメントが評価対象に入らない可能性がある
+      (F13-2。AWS公式: 「The simulation does not automatically
+      retrieve policies for the specified resources.」と同根で、
+      Resourceの対応もsimulator側で自動的には解決されない)。
+   2  ContextEntriesへ、`aws:PrincipalArn`(ContextKeyType=string、
+      ContextKeyValues=[DeployPrincipalArnの値])を明示的に渡す。
+      IAM Policy Simulatorが自動供給するcontext keyは
+      `aws:PrincipalAccount`/`aws:PrincipalId`/`aws:PrincipalType`/
+      `aws:Type`/`aws:UserId`/`aws:UserName`のみであり、
+      `aws:PrincipalArn`は含まれない(AWS公式:
+      「You provide the values for all other condition keys that
+      your policies reference.」)。resource policyのDeny条件は
+      `StringNotEquals: {aws:PrincipalArn: [...]}`という**負の
+      (negated)条件演算子**であり、AWS公式ドキュメント
+      (IAM JSON policy elements: Condition operators)に
+      「If the policy condition requires that the key is not
+      matched, such as StringNotLike or ArnNotLike, and the right
+      key is not present, the condition is true.」と明記の
+      とおり、参照するcontext keyが欠落するとnegated条件は
+      **true(=Deny側が成立)** と評価される。ContextEntriesを
+      渡さずに実行すると、たとえ正しくallow-listされている
+      principalであっても`explicitDeny`に見えかねない
+      (F13-1)。
+   3  ★ **5 secretそれぞれについて個別に実行する(2026-10-01、
+      サブちゃんレビュー指摘F18)**。`ResourcePolicy`パラメータは
+      「1回のsimulationにつき1つのresource-based policyのみ」を
+      対象にでき(AWS公式: 「You can include only one resource-based
+      policy in a simulation.」)、そのpolicyは`ResourceArns`に
+      列挙した**すべての**resourceに対して「あたかも付与されている
+      かのように」扱われる(AWS公式: 「Each resource in the
+      simulation is treated as if it had this policy attached.」)。
+      5 secretの実resource policyはそれぞれ`Resource:`が別の
+      ARNを指す別個のstatementであるため、ResourceArnsへ5件の
+      ARNをまとめて渡しつつResourcePolicyに1件分のpolicy文書しか
+      渡さないと、他の4件はそのpolicy文書の`Resource:`と一致せず
+      Denyが評価対象に入らない(F13-2と同型のfalse green)。
+      **ResourceArns=[secret Xの実ARN]とResourcePolicy=[secret X
+      自身のresource policy文書]を1組として、5 secret分(5回)
+      individual に実行すること。**
+
+   PolicySourceArn=DeployPrincipalArn、CallerArnを別途指定せずに
+   simulateする(DeployPrincipalArnがIAM userのため、CallerArn省略時は
+   PolicySourceArnがそのままcallerとして評価される。AWS公式:
+   「If you do not specify a CallerArn, it defaults to the ARN of the
+   ... entity ... in PolicySourceArn.」)。上記1・2・3を満たしたうえで、
+   **5 secretそれぞれについて**、7 actionすべてが`allowed`となることを
+   確認する。
+   ★ **negative control(2026-10-01、サブちゃんレビュー指摘F14。
+   F18により5 secret分へ拡張)**:
+   5 secretそれぞれについて、同じResourceArns・ResourcePolicy(その
+   secret自身のもの)のまま、ContextEntriesの`aws:PrincipalArn`だけを
+   allow-list外の任意のARN文字列(実在のprincipalである必要はない。
+   Production無改変で実施可能)へ差し替えて再実行し、7 actionすべてが
+   `explicitDeny`になることを確認する。このnegative controlが通る
+   ことで、上記の`allowed`判定が1・2・3の不備による「落ちない検査」の
+   産物ではなく、resource policyのCondition自体が実際にPrincipalArnで
+   弁別していることを裏付ける。
+   **合計5 secret×(陽性1回+negative control 1回)=10回のsimulate
+   呼び出しが必要**であり、1 secretのみの実行結果を根拠に「DEPLOYは
+   確認済み」と記録すると、残り4 secretについて未検証のまま
+   allow-listの誤りを見逃す過大評価になる(F18)。
+   1・2・3・negative controlのすべてを、5 secret全件について満たした
+   とき、この結果がDEPLOYについてのpre-apply時点での実質的な
+   end-to-end証跡であり、eの適用後verificationは重複確認の位置づけに
+   なる。
+
+c  RESOURCE_POLICY_STATIC_REVIEW(静的検証。ADMIN・RUNTIME 2 roleに
+   ついてはsimulationの代替、DEPLOYについてはbの追加的な裏付け)
+   resource policy自体(`infra/template.yaml`の各
+   `*SecretResourcePolicy`リソース)のCondition[StringNotEquals]
+   allow-listに、AdminPrincipalArn/DeployPrincipalArn/
+   IncidentNotifierFunctionRole.Arn/WeeklyReviewFunctionRole.Arnの
+   4者が過不足なく列挙されていることを、テンプレートを直接読んで
+   確認する。この4者はCloudFormationの`!Ref`/`!GetAtt`で本文と同一
+   値を参照するため、パラメータ値さえ正しければ(下記d)、resource
+   policy側でこの4者がDenyされないことは構成上保証される
+   (`test_issue_680_secret_resource_policy.py`が同じ4者allow-list
+   を回帰的に固定していることも参照)。
+   ★ **negative path**: 上記4者以外のprincipal(allow-list外の既存
+   principal。例: 他workloadのrole)が実際に拒否されることは、
+   simulationではなくこの静的検証(explicit Deny + Principal "*" +
+   Condition[StringNotEquals]という構成上の保証)で確認する
+   (2026-09-28、サブちゃんレビュー指摘F11でPR本文からdurable文書へ
+   明記を移した)。
+
+d  principal ARN fresh確認(本節1・2で既述)
+   AdminPrincipalArn/DeployPrincipalArnへ設定する値が、それぞれの
+   principal種別に応じた正しいARN形式(ADMIN=role自体のARN、
+   DEPLOY=user自体のARN。いずれもsts::assumed-role形式ではない)で
+   あり、SSO permission setの再作成等で陳腐化していない直近の実際の
+   値であることを、ChangeSet CREATE直前にfreshに確認する。
+
+e  適用後の即時verification(ADMIN・RUNTIME 2 roleについて、pre-apply
+   simulationの代わりにend-to-end許可を確認する唯一の実測手段。
+   DEPLOYはbで既にpre-apply確認済みのため、ここでは一貫性の再確認)
+   ChangeSet EXECUTE直後に、a・cの机上確認ではなく実際のAWS呼び出し
+   (GetSecretValue、read-only)でADMIN/DEPLOY/RUNTIME 2 roleの
+   アクセスが引き続き許可されることを実測確認する。想定外の
+   AccessDeniedが発生した場合は即座に35.2節の復旧手順へ進む。
+   ★ **未解消のresidual gap(2026-09-28、サブちゃんレビュー指摘F12)**:
+   ここで実測できるのはGetSecretValue等の通常操作のみであり、
+   ADMINのsecretsmanager:DeleteResourcePolicy/PutResourcePolicy
+   (35.2節の復旧経路が実際に依存する権限)は、実際にlockoutが発生して
+   35.2節の手順を実行する場面までend-to-endでは実測されない。ADMINは
+   IAM roleのためbのような事前simulationも使えず(RESOURCE_POLICY_
+   CHECK_FOR_IAM_ROLE非対応)、この2 actionについては「aのidentity
+   policy確認」と「cの静的検証」の組み合わせのみが事前の裏付けであり、
+   pre-apply時点でのend-to-end実測手段は存在しない。人為的にlockout
+   状態を作ってDeleteResourcePolicyを試験することは、Production環境
+   への意図的な障害注入であり行わない方針とする(このresidual gapは
+   受容する)。
+
+f  rollback/lockout復旧準備
+   eの実測確認で問題が見つかった場合に備え、35.2節の復旧手順
+   (AdminPrincipalArn principalでの復旧)がすぐ実行できる状態
+   (認証情報・実行権限を事前に用意した状態)でEXECUTEに臨む。
+```
+
+**a〜fの組み合わせであっても、pre-apply時点での数学的証明ではない
+(ADMIN・RUNTIME 2 roleについてはeが実際の初回証跡。DEPLOYはbで
+pre-apply証跡を得られるが、ADMINのDeleteResourcePolicy/
+PutResourcePolicyはeでも実測されない〔上記gap参照〕)。これは受容
+されたRESIDUAL_RISKであり、ADMIN・RUNTIME roleについて「simulationで
+(resource policy込みの)no-lockoutを確認済み」という表現は用いない。**
+
+### 35.2 lockout発生時の復旧手順(deploy principalが締め出された場合)
+
+resource policyのexplicit Denyは、意図しない設定(誤ったARN・allow-list
+からの意図しない除外)が発生した場合、**deploy principal自身が対象secretへの
+7 action(GetSecretValue等)を拒否される**状態になりうる。この場合、通常の
+「code revertしてChangeSetを再適用する」というrollbackは**そのままでは
+機能しない**(ChangeSet実行はdeploy principalの認証情報で行われるため、
+resource policyを修正するChangeSetの適用自体が同じDenyの対象になる。
+循環的な自己ロックアウト)。
+
+```
+★ 重要な前提: account rootがexplicit Denyを上書きできるかは未検証。
+  Secrets Managerのresource-based policyがroot principalを自動的に
+  除外するかどうかは、AWS操作を伴う実機検証が必要であり、本Issueの
+  read-only設計フェーズでは確認していない。**「rootなら直せる」を
+  復旧計画の前提にしない。**
+
+復旧手順(deploy principalがlockoutされた場合)
+  1  deploy principalではなく、**AdminPrincipalArn principal**の認証
+     情報を使う(allow-listに含まれるため、対象secretへのDeny対象
+     7 actionが引き続き許可される。35.1節RESIDUAL_RISK a・cで事前
+     確認・eでGetSecretValue等は実測確認済みであることが前提。ただし
+     AdminPrincipalArnはIAM roleであるため、resource policy込みの
+     simulationはできず、DeleteResourcePolicy/PutResourcePolicy自体は
+     この段階までend-to-endでは実測されていない〔35.1節eのgap参照〕)。
+  2  Admin principalとして、以下いずれかの方法でresource policyを
+     修正する:
+       a(推奨)Admin principalの認証情報でsam deploy/aws cloudformation
+         update-stackを実行し、正しいAdminPrincipalArn/
+         DeployPrincipalArn(または誤って除外されたallow-listエントリ)
+         を修正したtemplateを再適用する(通常のChangeSet手順と同じ)。
+       b(緊急回避、CFN状態とのdrift注意)Admin principalの認証情報で
+         `aws secretsmanager delete-resource-policy --secret-id <secret
+         ARN>`を直接実行し、resource policyを即座に除去する。この方法は
+         CloudFormationのstack状態を経由しないため、**実施後は速やかに
+         (a)の手順でtemplateとの整合を取り戻すこと**(そのままでは次回
+         のstack更新時にCloudFormationが「resourceの実際の状態がstackの
+         認識と食い違っている」形でdrift検知・エラーになりうる)。
+  3  修正後、deploy principalが再び対象secretへアクセスできることを
+     確認する(read-only確認。GetSecretValue等の実行結果で確認)。
+```
+
+```
+★ 本手順が機能する前提そのもの(AdminPrincipalArnのidentity policyが
+  secretsmanager:DeleteResourcePolicy等を実際に許可していること)は、
+  35.1節RESIDUAL_RISK a(IDENTITY_POLICY_CHECK)・c(静的検証)で
+  **Enabled=true適用前に必ず確認しておくこと**。ただし、AdminPrincipalArn
+  はIAM roleであるため、resource policy込みのend-to-end許可を
+  simulationで証明することはできない(35.1節参照)。**この2 action
+  (DeleteResourcePolicy/PutResourcePolicy)自体は、35.1節eの適用後即時
+  verificationでも実測されない(GetSecretValue等の通常操作しか確認
+  しないため)。実際にlockoutが発生し本節の手順を実行する場面まで、
+  end-to-endでは未実測のまま残る(35.1節e、2026-09-28 F12。受容された
+  residual gap)。** この事前確認を怠ると、本節の復旧手順自体が機能
+  しない状態でlockoutが発生しうる。
+```
+
+### 35.2.1 ADMIN principal(SSO ロール)の ARN が変わった場合の lockout(Issue #830。確認 5)
+
+35.2 は deploy principal が締め出された場合の手順である。ここでは、**ADMIN principal
+(`AdminPrincipalArn`。IAM Identity Center〔SSO〕経由の IAM role)の ARN が、
+`SecretResourcePolicyEnabled = true` の適用後に変わった場合**を扱う。
+
+```
+リスク(事実)
+  ・SSO 経由の role の名前は AWSReservedSSO_<permission-set-name>_<unique-suffix> の形で、
+    ARN には unique suffix が含まれる。Permission Set に紐づく対象 AWS アカウントへの assignment が
+    失われ、IAM Identity Center が対応する AWSReservedSSO role を削除・再作成した場合などに、
+    再作成後の role の unique suffix(= ARN)が変わり得る。自動検知の仕組みは無い(35.1 節の 2)
+    ★ 変わる条件をここで網羅しない。運用上の安全境界は次のとおり:
+      AdminPrincipalArn は永続不変ではない → stale になると allow-list から外れて lockout する
+      → activation の直前と、Permission Set / assignment を再作成した後に、fresh に確認する
+  ・適用後に ARN が変わると、新しい ARN は allow-list(`aws:PrincipalArn` の StringNotEquals)に
+    無いため、ADMIN は対象 5 シークレットの 7 action(PutResourcePolicy / DeleteResourcePolicy を含む)を
+    explicit Deny される。通常の経路(ADMIN による resource policy の撤回・修正)が使えなくなる
+
+事前確認の整理(適用前に完全には証明できない = RESIDUAL_RISK)
+  ADMIN principal の identity policy  案 C(管理者用 managed policy の内容を GetPolicy / GetPolicyVersion で
+                                      read-only に確認)で確認した(#830。2026-10-08 時点の、その時点の ADMIN role について。
+                                      全 action を無条件に許可し、Deny が無い)
+                                      ★ この確認は、Permission Set / assignment の再作成で作られる『新しい ADMIN role』へは
+                                        自動的には引き継がれない(再作成後の role の権限の内容が、以前と同一とは限らない)。
+                                        『過去に案 C で確認済み』を、新しい ADMIN role も確認済みの意味に読まない。
+                                        新しい ADMIN role について、identity policy 側を再確認する(35.2 の復旧経路が依存する
+                                        Secrets Manager の操作 = secretsmanager:GetResourcePolicy / DescribeSecret /
+                                        PutResourcePolicy / DeleteResourcePolicy を含む)。この再確認は、identity policy 側の
+                                        read-only の確認であり、resource policy 込みの end-to-end の確認ではない(下)
+                                      ★ 再確認の方法・資格情報・担当(#830 の段階 2a + 案 C と同じ read-only の方法):
+                                          方法    #830 の『段階 2a』と『案 C』を合わせたもの(2 つは別の段階で、一対一ではない)
+                                                  ・段階 2a: 新しい ADMIN role の permissions boundary の有無(iam:GetRole)・
+                                                    付いている managed policy(iam:ListAttachedRolePolicies)・
+                                                    inline policy(iam:ListRolePolicies)を確認する
+                                                  ・案 C: 管理者用 managed policy の内容を iam:GetPolicy / iam:GetPolicyVersion で読む
+                                          資格情報 観測用(read-only)の認証情報。書込・権限の拡大・別の認証情報による迂回はしない
+                                          担当    DEVELOPER_WITH_DEPLOY が行い、結果(許可 / 拒否 / 条件つきの区分のみ。
+                                                  実 ARN・Account ID・ロール名・policy 名は記録しない)を Issue へ記録する
+                                          拒否された場合  観測用の認証情報が上記の呼び出しを拒否したら、権限を拡大せず、別の認証情報で迂回せず、
+                                                  その時点で停止して報告し、USER の判断(承認)を得る。承認なしに deploy 資格情報へ切り替えない
+                                      ★ 想定外の構成を検出した場合(fail-closed。上の拒否された場合と同じく、判定できないことを『確認済み』にしない):
+                                          想定する構成  #830 の案 C の実施時点(2026-10-08)と同等 = permissions boundary が無い /
+                                                  managed policy が管理者用の AWS 管理 policy 1 件のみ(他の managed policy は 0 件)/
+                                                  inline policy が 0 件 / その管理者用 policy が全 action を無条件に許可し Deny を持たない
+                                          想定外とみなす  次のいずれか 1 つでも当てはまる場合(判定できない場合を含む)
+                                                  ・permissions boundary が設定されている
+                                                  ・managed policy が上の 1 件でない(追加・差し替え・件数の変化、顧客管理 policy の付与)
+                                                  ・inline policy が 1 件以上ある
+                                                  ・管理者用 policy の内容が『全 action を無条件に許可・Deny なし』でない
+                                                    (Deny・Condition・NotAction・NotResource・Resource の限定のいずれかがある)
+                                                  ・結果を読めない・取得が完了しない(拒否・応答の欠落・ページングの未完・予期しない応答)
+                                          検出したら  1 『確認済み』として扱わない(OK・問題なしと記録しない。推測で補わない)
+                                                  2 先へ進まない(新しい ADMIN ARN を前提にする ChangeSet の提示・CREATE・EXECUTE、
+                                                    SecretResourcePolicyEnabled = true の activation、再有効化の手順の次の step へ進まない)
+                                                  3 その時点で停止して報告し、USER の判断を得る(検出した区分だけを書く。実 ARN・Account ID・
+                                                    ロール名・policy 名は記録しない)
+                                                  4 権限を拡大せず、別の認証情報で迂回して確認し直さず、自己判断で『支障なし』と解釈しない。
+                                                    構成が想定外でも identity policy が許可している可能性はあるが、それを根拠に進めない
+                                                  ※ 緊急回避(SecretResourcePolicyEnabled = false の ChangeSet)を行うかどうかも USER の判断
+                                                    (CREATE と EXECUTE は、それぞれ元から USER の Human Gate)
+                                          ※ この条件は、上の『案 C は resource policy 込みの end-to-end の確認ではない』『Organizations の SCP は
+                                            未確認』『DEPLOY principal は別の確認対象』『#830 の AC b は変更しない』の各記述を変更・緩和しない
+  DEPLOY principal(IAM user)          ADMIN とは別の確認対象。上の ADMIN の案 C の結果を、DEPLOY について『同じ意味で確認済み』と読まない。
+                                      通常復旧・緊急回避はいずれも DEPLOY principal に依存する(ChangeSet の CREATE / EXECUTE を行う主体)。
+                                      #830 の AC b(IAM user である DEPLOY について、resource policy を含めた simulation =
+                                      RESOURCE_POLICY_CHECK_FOR_IAM_USER。35.1 節)と関連する。
+                                      ★ 本手順書は、この simulation を『実施済み』とは書かない。観測用の認証情報では
+                                        iam:SimulatePrincipalPolicy が拒否され、ADMIN 側は USER 決定で案 C へ移行した経緯があるが、
+                                        それは DEPLOY 側の AC b の実施を意味しない。DEPLOY 側で何が確認済みで、何が activation の前に
+                                        残っているか(activation gate)は、#830 の記録を参照する。本手順書は #830 の activation の
+                                        前提を変更・縮小しない(未確認のものを確認済みへ格上げしない)
+  Organizations の SCP                案 C では確認していない(未確認)。SCP が Secrets Manager の操作を制限していれば、
+                                      identity policy が Allow でも実操作は拒否され得る。
+                                      IAM Policy Simulator を実施する場合は、条件により SCP も評価対象になり得る
+  resource policy 込みの end-to-end
+  simulation                          IAM role では不可(`SimulatePrincipalPolicy` は IAM role について
+                                      resource-based policy 込みの simulation をサポートしない。35.1 節)。
+                                      これは SCP の扱いとは別の制約
+  実際の no-lockout                   適用前に完全には証明できない(RESIDUAL_RISK)
+
+予防(適用の前・直前に必ず行う)
+  1  適用の直前に、ADMIN に設定する role の ARN を再取得し、USER が管理者用 Permission Set で
+     サインインして確認した ARN と一致することを、照合値(ARN の SHA-256 の先頭 12 桁)で確認する。
+     ARN は『IAM role 自体の ARN』であり、assumed-role 形式ではない(35.1 節の 1)。
+     実 ARN・Account ID・ロール名・照合値は、Issue・PR・手順書へ書かない(照合値は担当者間のメッセージで受け渡す)
+  2  Permission Set / assignment を削除・再作成する作業の前に、AdminPrincipalArn の更新が必要になることを
+     作業手順に含める(再作成の後ではなく、前に気付く)。再作成した後は、適用の判断の前に fresh に確認し直す
+  3  Permission Set / assignment を再作成して ADMIN role が作り直された後は、新しい ADMIN role について、
+     identity policy 側を再確認する(事前確認の整理の ADMIN の項のとおり。以前の案 C の結果を引き継がない)。
+     想定外の構成を検出したら、同じ項の fail-closed 条件に従い、確認済みとして扱わず先へ進まない
+  4  下の『確認できていないこと』を、適用を判断する人が把握していること
+
+通常復旧(ADMIN の ARN が変わって lockout したが、deploy principal は allow-list に残っている場合)
+  前提  deploy principal(`DeployPrincipalArn`。IAM user)が allow-list に残っていること
+        ★ #164(deploy 用の長期認証情報の是正)で deploy principal の種別・ARN が変わる場合は、
+          先にこの復旧経路を見直す
+  1  deploy principal の認証情報を使う
+  2  USER が新しい Permission Set でサインインし、新しい ADMIN role の ARN を確認する
+  3  実 ARN を Issue・PR・手順書へ記録せず、既存のルール(上の予防の 1)に従い、照合値で対象 ARN を確認する
+  4  新しい ADMIN role について、identity policy 側を再確認する(secretsmanager:GetResourcePolicy / DescribeSecret /
+     PutResourcePolicy / DeleteResourcePolicy を含む。以前の案 C の結果を、新しい role の確認として扱わない。
+     方法・資格情報・担当・想定外の構成を検出したときの fail-closed 条件〔確認済みとして扱わない・先へ進まない・
+     停止して報告し USER の判断を得る〕は、事前確認の整理の ADMIN の項のとおり)
+  5  AdminPrincipalArn を新しい ARN へ更新した ChangeSet を CREATE し、EXECUTE する
+     (CREATE と EXECUTE は、それぞれ USER の Human Gate)
+  6  修正後、ADMIN が対象シークレットへアクセスできることを read-only で確認する
+  ★ 因果順は『新しい ADMIN ARN の取得・照合 → AdminPrincipalArn の更新 → ChangeSet』である。
+    ChangeSet を作る前に、新しい ADMIN ARN を取得・確認している必要がある
+
+緊急回避(新しい ADMIN ARN を先に取得できない場合。通常復旧とは分けて行う)
+  1  deploy principal で SecretResourcePolicyEnabled = false の ChangeSet を CREATE し、EXECUTE する
+     (CREATE と EXECUTE は、それぞれ USER の Human Gate)。resource policy が除去され、lockout が解除される
+  2  lockout が解除されたこと(ADMIN が対象シークレットへアクセスできること)を read-only で確認する
+  ★ false に戻しただけで復旧は完了ではない。『OFF にすれば復旧完了で、そのまま後日 true に戻せる』
+    ものとして扱わない。再度 true にする前に、次の再有効化の手順が必要である
+
+緊急 OFF 後の再有効化(この順序で行う。省略しない)
+  1  lockout の解除を確認する(上の緊急回避の 2)
+  2  新しい ADMIN role の ARN を取得し、照合値で確認する(通常復旧の 2・3 と同じ)
+  3  template / parameter(AdminPrincipalArn)を新しい ARN へ更新する
+  4  #830 の activation preflight を再実施する(ADMIN の確認 1・2・4、新しい ADMIN role の identity policy 側の確認
+     〔secretsmanager:GetResourcePolicy / DescribeSecret / PutResourcePolicy / DeleteResourcePolicy を含む。
+     想定外の構成を検出したら、事前確認の整理の ADMIN の項の fail-closed 条件に従い先へ進まない〕、
+     DEPLOY 側の確認状態の再評価、未確認事項〔下〕の再評価など。前回の結果を流用しない)
+  5  exact な ChangeSet を作る
+  6  USER の CREATE の Human Gate
+  7  USER の EXECUTE の Human Gate
+
+確認できていないこと(未確認。復旧経路に数えない。確認済みへ格上げしない)
+  ・account root が explicit Deny を迂回できるか(35.2 節のとおり未検証)
+  ・Organizations の SCP が Secrets Manager の操作を制限していないか(案 C では確認していない)
+  ・サインイン時のセッション policy の有無
+  ・シークレットの暗号化鍵(KMS)の key policy(customer managed key の場合)
+```
+
+### 35.3 #137(PITR・削除保護)との関係
+
+本節の対象はresource policyによるアクセス拒否(lockout)であり、#137が
+扱うデータの誤削除・誤更新からの復旧(PITR)とは別種の障害である。
+resource policyのlockoutはsecret item自体を削除・破損しないため、PITRでの
+復旧対象ではない(#138の責務分離〔本文の#137/#138責務差〕と同じ考え方を
+lockout/data-loss軸へ適用したもの)。
+
+### 35.4 参考
+
+```
+・Issue #680(PR本文にProduction適用前確認計画〔旧称: simulation計画〕の
+  詳細。2026-09-28 F7対応で改称)
+・#133(secretsmanager least privilege調査、本機構の発見契機)
+・Issue #830(ADMIN principal の確認〔USER の AWS コンソールでの確認 + 管理者用 managed policy の内容の
+  読取〕と、35.2.1 の lockout リスク・復旧手順の文案。2026-10-08)
+・#164(deploy principal自体のlong-term credential是正。DeployPrincipalArn
+  の値が#164の変更と同期する必要がある。DeployPrincipalArnが現在IAM user
+  であること自体が#164の是正対象であり、35.1節RESIDUAL_RISKのb・F15の
+  前提が#164適用後に崩れる点に注意)
+・AWS公式ドキュメント(35.1節のIAM Policy Simulator制約の根拠。
+  2026-09-28、USER Human Gate指摘F7対応で確認。2026-10-01、サブちゃん
+  レビュー指摘F13でCondition operatorsのページを追加確認):
+  - IAM User Guide「IAM policy testing with the IAM policy simulator」
+    https://docs.aws.amazon.com/IAM/latest/UserGuide/access_policies_testing-policies.html
+  - IAM API Reference「SimulatePrincipalPolicy」
+    (`ResourcePolicy`/`ResourceArns`パラメータの説明に
+    "Simulation of resource-based policies isn't supported for IAM
+    roles." と明記。`ResourceArns`の説明に「The simulation does not
+    automatically retrieve policies for the specified resources.」も
+    明記)
+    https://docs.aws.amazon.com/IAM/latest/APIReference/API_SimulatePrincipalPolicy.html
+  - IAM User Guide「IAM JSON policy elements: Condition operators」
+    (negated条件演算子〔StringNotEquals等〕は、参照するcontext keyが
+    request context に無い場合 true と評価されると明記。
+    「IAM policy simulatorが自動供給するcontext key」は
+    IAM User Guideの上記ページに一覧がある)
+    https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_elements_condition_operators.html
+```
+
+本節はIssue #680(#133 UNIT2)として追加した。実際のChangeSet CREATE/
+EXECUTE・SecretResourcePolicyEnabled有効化はいずれも別Human Gateであり、
+本節の追加自体・IaC定義の追加自体によってもProduction上の挙動は変わらない
+(トグルの既定はfalseのまま)。
+
+## 36. Release Build/Artifact ProvenanceとDeploy設定driftの検出(Issue #649・#650、2026-10-02追加)
+
+### 36.1 背景(実際に発生した事象)
+
+```
+near-miss(#338 finding (a)。実害なし)
+  release build直前、作業ツリーのHEADがrelease targetとは別branchに
+  なっていたことに気づき、detached checkoutしてからbuildしたため
+  事なきを得た事象。「気づいたから避けられた」のであり、手順が
+  防いだのではない。
+
+実害あり(#649へのTARO実例報告、2026-09-27。#529 corrective IAM fixの
+  deploy作業)
+  sam build/sam deployを実行した作業ツリーが、意図したorigin/mainでは
+  なく別のfeature branchのままだった。ChangeSetはCREATE_COMPLETE・
+  EXECUTEはUPDATE_COMPLETEを返したが、意図したIAM是正が実際には
+  含まれていなかった。検出はdeploy完了後のread-only確認(対象roleの
+  inline policyを直接確認)によってのみ行えた。ChangeSet CREATE前の
+  `git log`目視確認だけでは検出できなかった
+  (REVIEWED_SOURCE != BUILT_SOURCEの典型例)。
+
+実害あり(#650。Release W6、#314 W6_ARTIFACT_CAUSE_ANALYSIS)
+  ChangeSetが全Lambda・両Layerを更新対象と誤って計算した直接原因が、
+  `infra/samconfig.toml`(git管理外)の`s3_prefix`値と、deploy済み
+  artifactの実際のS3 key prefixとの食い違いだったことが実測された。
+  bucket・md5(全14成果物)は同一で、接頭辞の有無だけが違っていた。
+```
+
+いずれも「承認したsource/build/deploy入力と、実際にbuild・deployされた
+artifact・ChangeSetとの一致」を機械的に確認する手順が存在しないことに
+起因する、同じroot cause family(deploy-time provenance検証の欠如)
+である。本節は#649(build対象SHA固定・artifact同一性)と#650
+(deploy設定drift)を統合し、ChangeSet CREATEの前後にまたがるゲート
+(36.8参照)を定める。あわせて、#533の実例(2026-10-02判明。36.2参照)を
+踏まえ、release targetそのものの妥当性を確認するRELEASE_SCOPE_GATEを
+最初のゲートとして追加する。
+
+### 36.2 Release scope確認(RELEASE_SCOPE_GATE)
+
+**実例(#533、2026-10-02判明)**: 2026-10-01T15:37:54Zのdeployは
+#705/#708向けのrelease target(main HEAD丸ごと)を対象としたが、main上には
+#533(SQS dispatch worker Lambda追加)のように、当時のDesign-First期間中
+「この期間中はdeployしない」と明示的に留保されていた変更も含まれていた。
+結果としてこの留保意図を確認しないままdeployが実行され、留保中のコードが
+意図せずbundleに含まれた(実害は無かった。該当トグルは既定falseのまま
+であり、機能自体は有効化されていない)。
+
+★ USER判断(2026-10-02): Production deployの単位は、今後も**USER承認済みの
+release target SHA全体**のままとする。以下はいずれも採用しない。
+
+```
+- mainの一部commitだけをcherry-pickしてProduction用branchを作る
+- ChangeSetから特定Issue由来のLambda/Layerだけを恣意的に除外する
+- build成果物の一部だけ過去版へ差し替える
+```
+
+問題はdeployの単位ではなく、**deployする前に、そのrelease targetへ
+「Productionへの反映を明示的に留保している変更」が含まれていないかを
+確認するgateが無かったこと**である。本節はそのgateを定める。
+
+```
+RELEASE_SCOPE_GATE(build前、36.3のBRANCH_GATE等より前に実施する)
+
+1  前回Production SHA(直近のdeployで実際に反映されたSHA。36.5の
+   BUILD_ARTIFACT_IDENTITY記録や、describe-stacksのLastUpdatedTimeから
+   逆算する)から、今回のrelease target SHAまでにmainへ入った全PR/Issueを
+   列挙する(`git log <前回Production SHA>..<release target SHA>
+   --merges`等)
+
+2  列挙した変更それぞれについて、以下3項目を確認する(値はIssue自身の
+   最新コメント・ISSUE_STATE_SNAPSHOTから読み取る。記載が無い場合は
+   MERGE_APPROVED=YES(main merge済みという事実)のみを認め、残り2項目は
+   UNKNOWNとして3以降の判断対象に含める):
+
+   MERGE_APPROVED       = YES/NO(USER承認を経てmainへmerge済みか)
+   CODE_DEPLOY_APPROVED = YES/NO/UNKNOWN(コードをProduction環境へ配置
+                          してよいか。feature flag等でコードがdormant
+                          であっても、配置自体の承認とは別軸)
+   ACTIVATION_APPROVED  = YES/NO/N/A(コードが実際に有効化されてよいか。
+                          feature flag型の変更で、トグルON自体が別の
+                          Human Gateになっている場合に適用する。
+                          flagを持たない変更はN/A)
+
+3  いずれか1件でもCODE_DEPLOY_APPROVED=NO、または「明示的なDEPLOY_HOLD」
+   (Design-First期間中の留保等、Issue自身が明記しているもの)が
+   存在する場合、ChangeSet CREATEへ進まない
+
+4  3に該当した場合の対応は以下のいずれかとする(USER判断):
+
+   A  USER Human Gateでdeploy留保を解除する
+   B  対象変更をmainへ正式にrevertし、新しいmain SHAをrelease targetとする
+   C  release自体を延期する
+
+   ★ 「mainから対象変更だけを抜き取ってdeployする」(cherry-pick・
+   ChangeSetからの部分除外・成果物の部分差し替え)はいずれも採用しない
+   (上記USER判断)
+
+5  CODE_DEPLOY_APPROVED=YESだがACTIVATION_APPROVED=NOの変更(feature
+   flag既定OFF等)は、ChangeSet CREATEへ進んでよい。この場合、deploy後の
+   記録は「deployされていない」ではなく「CODE_DEPLOYED=YES /
+   ACTIVATION_APPROVED=NO / ACTIVATION_STATE=OFF」として明確に区別する
+   (#533がこの実例。本節末尾参照)
+
+6  UNKNOWNの扱い(USER判断 2026-10-04。下の「」内は Issue #122
+   issuecomment-5974589887 の4節の原文の引用で、引用部分は変更しない)
+
+   「CODE_DEPLOY_APPROVEDについて: release target SHA全体について、CODE_DEPLOY_APPROVED = NO が0件 / 有効な DEPLOY_HOLD が0件 / release scopeの棚卸しが完了 / USERがそのSHAのChangeSet実差分を確認したうえでEXECUTEを明示承認 した場合、そのEXECUTE承認を、当該release target SHAに含まれるProduction到達変更すべての CODE_DEPLOY_APPROVED = YES とみなす。」
+
+   「ACTIVATION_APPROVEDについては分けます。deployと同時に機能が有効になる変更 → EXECUTE承認を ACTIVATION_APPROVED = YES とみなす / shadow・dormant・feature flag OFFなど、deployしても利用者向け機能が有効にならない変更 → deployは許可する。activationは別Human Gate / 明示的に ACTIVATION_APPROVED = NO かつdeployだけで有効化される変更 → EXECUTE不可。」
+
+   上の引用の位置づけ(本節の整理。USER判断の引用ではない):
+   ・手順2でUNKNOWNとなった項目は、上の引用の条件がそろった時点(USERが当該SHAのChangeSet実差分を
+     確認したうえでEXECUTEを明示承認した時点)で、CODE_DEPLOY_APPROVED / ACTIVATION_APPROVEDの
+     値が定まる
+   ・手順3の停止条件(CODE_DEPLOY_APPROVED=NO / 明示的なDEPLOY_HOLD)は変わらない。
+     手順3は「明示的なDEPLOY_HOLD」(Issue自身が明記しているもの)と書き、引用の条件は
+     「有効な DEPLOY_HOLD」と書く。両者の文言は同一ではなく、範囲の異同は本節では定めない
+   ・shadow・dormant・feature flag OFFの変更は、EXECUTE承認でdeployまでを承認する。
+     activationは別のHuman Gateのままである
+```
+
+**CODE_DEPLOY_APPROVEDとACTIVATION_APPROVEDを分離する理由**: feature
+flag型の変更(#533のSQS dispatch、#582のvaluation confidence shadow、
+#680のsecret resource policy等、本project全体で多用されている既定OFF
+パターン)では、「コードをProductionへ配置してよい」ことと「配置した
+コードを実際に有効化してよい」ことは別のHuman Gateである。この2軸を
+分離せず単に「deployしない」とだけ記録すると、#533のように実際には
+コードがdeployされているのに記録上は「未deploy」のままという食い違いが
+生じる。
+
+**#533の記録例**(2026-10-02、USER判断を反映。詳細は#533本体の
+writebackを参照):
+
+```
+#533
+CODE_DEPLOYED       = YES(2026-10-01T15:37:54Zのdeployでbundleに含まれた)
+ACTIVATION_APPROVED = NO(SQS dispatch経路の有効化は未承認)
+ACTIVATION_STATE    = OFF(BuyCandidateSqsDispatchEnabled /
+                      HoldingsWatchlistSqsDispatchEnabled、いずれもfalse)
+PRODUCTION_IMPACT   = dormant codeのみ
+```
+
+#### 36.2.1 デプロイ単位の明確化(USER 決定 2026-10-03。Issue #785)
+
+原本: Issue #122 の USER_DECISION_RECORD(issuecomment-5968760192)の「1. デプロイの単位」。
+以下の引用は USER の発言の原文である(要約・言い換えをしていない)。引用の外の記述は、引用元の所在を示すだけで、規則を追加しない。
+
+> 案1「全量のリリース」で決定します。
+>
+> 手順書36.2の、デプロイ対象は承認済みのmain SHA全体とし、一部コミットを抽出したrelease branchは作らない という原則を維持します。案3の例外は新設しません。
+>
+> 今回判明した「1ファイルの変更でも共有Layer等によって15関数すべての成果物が変わる」という構造を考えると、#725や#778だけを論理的に独立扱いしても、実際のCloudFormation/SAMのリリース単位とは一致しません。
+>
+> したがって以前の私の「#725は独立ChangeSetにできるなら分ける」という判断は、次のように明確化します。独立ChangeSet化は、mainの同一SHAから作成しても他の未デプロイ変更を含まない場合に限る。今回のリポジトリ構造ではその条件を満たさないため適用しない。手順書36.2を優先する。
+>
+> A/B/Cは今後も「変更内容のリスク分類・レビュー単位」として分けて構いませんが、Productionへの物理的なデプロイ単位は1つのmain SHAです。
+>
+> また、これは「83件を今すぐデプロイしてよい」という意味ではありません。デプロイ単位とrelease readinessは別です。
+>
+> (中略。現時点の release readiness のゲートの列挙、および次回の release の範囲を述べた段落は、原本を参照)
+
+※ 上の引用の「83件」は USER の発言の原文である。この件数は、後に Issue #783 で単位を明記して測り直され、どの単位とも一致しない単位不明の見積もりだったため、本書は件数の根拠にしない。現在の件数は Issue #783 の最新の記録を参照すること。
+
+本小節は 36.2 の冒頭の USER 判断(2026-10-02)を変更しない。上の決定は、その原則を維持したうえでの明確化である。
+
+#### 36.2.2 single window の定義(USER 決定 2026-10-03。Issue #785)
+
+原本: Issue #122 の USER_DECISION_RECORD(issuecomment-5968256759)の「17. 運用手順書」。以下の引用は USER の発言の原文である。
+
+> single window：以下で定義します。1回のUSER承認を起点として、Production向けChangeSetのCREATE、差分確認、EXECUTE、完了確認までを連続して扱う1つの変更セッション。同セッションが完了または中断した後に作り直したChangeSetは、新しいwindowとして再承認を必要とする。つまり、「同じ日だから同じwindow」ではありません。
+
+本書の他の箇所の「window」(rotation window、non-overlapping-window 等)は、この定義の対象ではない(別の意味で使われている)。
+
+### 36.3 Build前ゲート(BRANCH_GATE / SHA_GATE / CLEAN_TREE_GATE)
+
+Production release buildの直前に、以下を**必須手順**とする:
+
+```
+1  git fetch origin main
+2  git rev-parse HEAD と git rev-parse origin/main(または、USER承認済みの
+   正確なrelease target SHA)を比較し、一致することを確認する
+   (「originをfetchして見た」だけでは不十分。実際にbuildするHEADとの
+   突き合わせが必要。#649実例はここが欠けていたことが直接原因)
+3  git status --porcelain が空であることを確認する(untracked/uncommitted
+   差分を含んだままbuildしない)
+4  1〜3のいずれかが不一致の場合、`git checkout <release_target_sha>`で
+   detached HEADへ切り替えてからbuildする(現在の作業branchのHEADの
+   ままbuildしない)。build完了後、`git checkout <元のbranch>`で
+   作業branchへ戻し、detached状態を放置しない
+```
+
+★ 推奨(#649 OD1): 上記3を都度確認するのではなく、Production release
+buildでは常にrelease target SHAへのdetached checkoutを既定の手順とする
+(人間の見落としに依存しない構造的な防止。「気づいたから避けられた」
+near-missは、気づきに依存しない設計でのみ構造的に防げる)。ただし
+運用手順の変更であるため、実施可否はrelease実行者の判断に委ねる
+(いずれを選んでも36.4以降の記録項目は変わらない)。
+
+**releaseのbuildの方式と入力の検査(USER判断 2026-10-04。Issue #796・#798)**
+
+原本: Issue #122 のUSER_DECISION_RECORD(1・2 = issuecomment-5977840842。K5 = issuecomment-5978398097)。
+以下の引用はUSERの発言の原文である(要約・言い換えをしていない)。引用の外の記述は、置き場所と
+手順の整理であり、★USER判断の引用ではない。
+
+> 1. STANDARD_RELEASE_BUILD_WITH_CONTAINER = 採用
+>
+> 2. BUILD_INPUT_BYTE_CONSISTENCY_GATE = 採用
+>
+> K5はaとします。
+> デプロイにおいて複数の経路、パターンを設けるのは想定外のエラーを生じうるのでDockerを必須とする
+
+36.3冒頭の手順1〜4に続けて、次を**必須手順**とする(本手順書のrelease build全般に適用する):
+
+```
+5  buildは `sam build --use-container` で行う(Dockerが必要)。releaseのbuildの経路はこの1つだけとし、
+   例外を設けない(K5)。Dockerが使えない場合は、releaseのbuildをしない。container buildの記録は36.4
+6  build前に、buildの入力(`config/`・`src/`・`infra/layer/`)の作業ツリーのバイト列が、release target SHAの
+   gitの内容と同一であること(worktree bytes = Git SSoT)を確認する(USERの決定2。36.5.1の条件C)。方式(E1):
+     git ls-files --eol -- config src infra/layer
+   の出力の各行のうち、作業ツリー側(`w/`)が `crlf` または `mixed` の行が1件も無いこと。
+   1件でもあれば、その作業ツリーではreleaseのbuildを始めない。確認の例(出力が空であること):
+     git ls-files --eol -- config src infra/layer | grep -E '^i/[^ ]+ +w/(crlf|mixed)'
+7  `sam build`の終了コードが0であることを、build直後に確認する。0でない場合は、deploy(ChangeSet CREATEのための
+   `sam deploy`を含む)へ進まない。確認は、`sam build`を単独で実行した直後のシェルの終了コードで行う。シェルによっては、
+   `| tee`等のパイプを付けると終了コードが隠れるため付けない(例: bashは`pipefail`が無いと`$?`が最後のコマンドの値になる)。確認した終了コードは36.4のBUILD_EXIT_STATUSに記録する
+```
+
+```
+読み方(事実)
+  ・出力の `i/` はgit管理の内容(index)、`w/` は作業ツリーのバイト列。`.gitattributes`の`eol=lf`
+    (Issue #802。対象は`config/`・`src/`・`infra/layer/`)により、新しくcheckoutした作業ツリーは
+    `w/lf` または `w/none`(改行なし)になる
+  ・`.gitattributes`は、checkoutで書き換えられたファイルにだけ効く。#802のmergeより前に作った作業ツリーは、
+    再checkoutするまでCRLFのまま残る(`git status --porcelain`は、改行コードだけの違いを差分として示さない
+    ため、36.3の3ではこの状態を検出できない。E1はこの状態を検出するためのものである)
+実測(測定日 2026-10-05。Issue #796・#802)
+  ・#802より前に作った作業ツリー(core.autocrlf = true)で、対象435件のうち403件が `w/crlf` だった
+  ・同じ条件でmain(#802のmerge後)を新しくclone + checkoutした作業ツリーでは、`w/crlf`・`w/mixed`は0件
+    (`w/lf` 408件・`w/none` 27件)だった
+  ・E1に該当した作業ツリーを直すための一括変換の手順は、本節では定めない(release target SHAを新しく
+    checkoutした作業ツリーでbuildするか、対象ファイルを再checkoutした作業ツリーでE1を満たしてから
+    buildするかは、release実行者が選ぶ。いずれもE1を満たすことが条件)
+```
+
+★ 本手順書の他の節(rollback・設定変更の手順)にある `sam build && sam deploy` の記載も、Production
+へ反映するbuildとして行う場合は、上の5に従う(`sam build --use-container`)。
+
+### 36.4 Build記録(DEPLOYED_PROVENANCE_RECORD)
+
+release実行記録(Issue #314に蓄積されているW1〜W9形式のUSER判断記録・
+TARGET/CONTENT/REVIEW/EXECUTE_COND/AFTER形式のコメント)へ、以下の
+fieldを追加する:
+
+```
+BUILD_SOURCE_SHA                        = sam build実行時のgit rev-parse HEAD
+BUILD_SOURCE_BRANCH                     = sam build実行時のgit branch --show-current
+                                           (detached HEADの場合は"DETACHED"と記録する)
+BUILD_TIMESTAMP                         = sam build開始時刻(UTC)
+BUILD_EXIT_STATUS                       = sam buildの終了コード(0のみ許容。0でなければdeployへ進まない。36.3の7)
+BUILD_SOURCE_SHA_MATCHES_RELEASE_TARGET = YES/NO
+```
+
+新しいツール・スクリプトは作らない。36.3の手順を踏めば、これらの値は
+手動記録で足りる(#649 Design-First期間の方針。自動化は将来のfollow-up
+候補)。
+
+releaseのbuildは、36.3の5によりcontainer build(`sam build --use-container`)に限る。上記に加えて、
+buildに使ったイメージ・そのdigest・architecture・toolchainを記録する(USER判断 2026-10-04の条件D。
+Issue #796・#798。USER判断の原文は36.5.1に引用)。toolchainの例: Python・pip・SAM CLI・
+aws_lambda_buildersの版。
+イメージはdigestを固定せず、記録のみとする(MANAGER判断 K2 = Issue #796 issuecomment-5978344793。
+イメージの更新による差は、36.5.1の期待差分の事前申告とartifact hashの比較で検出する)。
+条件D自体は、USER判断の決定4(ConfigLayerのLF化とcontainer build化を同一releaseに含める場合)の
+条件として示された。36.3の5によりreleaseのbuildはすべてcontainer buildになるため、この記録はすべての
+releaseのbuildで行う。決定4の他の条件(E・Fなど)を他のreleaseにも適用するかは、36.5.1の整理2のとおり、
+本節では定めない。
+
+```
+BUILD_IMAGE         = container buildに使ったイメージ(tag)
+BUILD_IMAGE_DIGEST  = 同イメージのdigest
+BUILD_ARCHITECTURE  = build時のarchitecture
+BUILD_TOOLCHAIN     = build時のtoolchain(上記の例のとおり)
+```
+
+### 36.5 Build artifact identityの記録(PRE_CREATE GATE)
+
+**前節(36.3〜36.4)までの手順は「正しいsourceからbuildしたこと」しか
+保証しない。** buildした成果物が、実際にChangeSetが参照するS3オブジェクト
+そのものであることまで確認しなければ、build後に成果物が差し替わる・
+別branch由来の余計な変更が混入している(対象の修正さえ含まれていれば
+grepは素通りする)・古いS3オブジェクトがキャッシュ的に再利用される、
+といった経路を検出できない(2026-10-02、ChatGPTレビューMUST-1指摘。
+旧版の本節はspot checkに留まり、artifactの実体同一性を検証していな
+かった)。
+
+**ARTIFACT_CONTENT_SPOT_CHECK(補助確認。identity verificationの代替
+ではない)**
+
+```
+sam build後、.aws-sam/build/配下の対象Lambda/Layerディレクトリに、
+今回のrelease targetに含まれるはずの変更が実際に存在することを
+grep等で確認する(例: 特定関数の新規ヘルパー関数名、更新された
+依存パッケージの.dist-infoディレクトリ名)。対象は今回のrelease
+targetに含まれる主要なfix・機能変更とする(悉皆的な確認ではない)。
+
+★ これは「期待する変更が含まれているか」のspot checkに過ぎない。
+別branch由来の無関係な変更が同時に混入していても、対象の修正さえ
+存在すればこの確認はPASSする。**artifactの実体同一性(以下の
+BUILD_ARTIFACT_IDENTITY)の代替にはならない。**
+```
+
+**BUILD_ARTIFACT_IDENTITYの記録(本節の主手順)**
+
+`.aws-sam/build/<LogicalId>/`配下のLambda/Layer成果物は、SAM CLIが
+`sam deploy`(`sam package`相当の内部処理)実行時に、**ディレクトリ
+全体のMD5ハッシュ**をS3オブジェクト名(key)としてそのまま使用する
+(read-onlyでSAM CLI自身の実装を確認した実測結果。推測ではない):
+
+```
+samcli/lib/package/utils.py::zip_folder()
+  md5hash = dir_checksum(folder_path, followlinks=True)  # ディレクトリ全体のMD5
+  (zipfile名を"data-<md5hash>"とした上でzip化)
+
+samcli/lib/package/utils.py::zip_and_upload()
+  uploader.upload_with_dedup(zip_file, precomputed_md5=md5_hash, ...)
+
+samcli/lib/package/local_files_utils.py::get_uploaded_s3_object_name()
+  precomputed_md5を**そのまま**S3オブジェクト名として返す
+  (docstring: "Generate the file name that will be used while creating
+  the S3 Object based on the file hash value")
+
+samcli/lib/package/s3_uploader.py::upload_with_dedup()
+  docstring: "This construction of remote_path is critical to
+  preventing duplicate uploads of same object"
+```
+
+すなわち、`sam deploy`実行時に標準出力へ出る`Uploading to <prefix>/<key>`
+(新規アップロード)・`File with same data already exists at <prefix>/<key>`
+(内容が前回と同一のため再利用)の`<key>`は、**偶然一致する文字列ではなく、
+ビルドディレクトリ内容のMD5ハッシュそのもの**である(SAMの重複アップロード
+防止〔dedup〕機構の実装そのものに由来する)。これを根拠として、以下を
+BUILD_ARTIFACT_IDENTITYとして記録する:
+
+```
+1  `sam deploy --no-execute-changeset`実行時の標準出力から、対象Lambda/
+   Layerごとの`Uploading to <prefix>/<key>`または`File with same data
+   already exists at <prefix>/<key>`行を**全て保存する**
+2  ★ 前回と同一内容の成果物は新規アップロードされず`File with same
+   data already exists`になる。これは異常ではない(意図せず変更して
+   いないartifactが実際に不変であることの裏付けでもある)。想定して
+   いた変更対象の成果物が`File with same data already exists`になって
+   いる場合は、buildが期待どおりの変更を含んでいない可能性を示す
+   **警報**として扱う
+3  Lambda/Layerごとに以下の形式で記録する:
+
+   BUILD_ARTIFACT_IDENTITY
+     WatchlistBatchReconcilerFunction = jstock-advisor/<key>
+     DependenciesLayer                = jstock-advisor/<key>
+     ConfigLayer                      = jstock-advisor/<key>
+     ...(対象Lambda/Layerごとに列挙)
+```
+
+#### 36.5.1 期待差分の事前申告とartifact hashの比較(USER判断 2026-10-04。Issue #796・#798)
+
+原本: Issue #122 のUSER_DECISION_RECORD(issuecomment-5977840842)。以下の引用はUSERの
+発言の原文である(要約・言い換えをしていない)。引用の外の記述は、引用元の所在と、条件の
+手順書上の置き場所を示すだけで、USERの文言を超える規則を追加しない(例の値・閾値は定めない)。
+
+> 3. DEPENDENCIES_LAYER_EXPECTED_DIFF_DECLARATION = 採用
+>
+> 4. CONFIG_LAYER_LF_CHANGE_AND_CONTAINER_BUILD_SAME_RELEASE = 採用（条件付き）
+>
+> CONDITIONS_FOR_4 =
+>   A. ConfigLayer の LF 化と container build 化を、release 前に別々の変更要因として明示する
+>   B. それぞれの変更によって「どの artifact が変わるはずか」を事前申告する
+>   C. build 前に worktree bytes = Git SSoT を確認する
+>   D. container build のイメージ / digest / architecture / toolchain を記録する
+>   E. ConfigLayer / DependenciesLayer の artifact hash を前回 Production と比較する
+>   F. 想定外の artifact 差分が 1 件でもあれば CREATE / EXECUTE を止める
+>   G. ChangeSet 上で両 Layer の version 更新が事前申告どおりであることを確認する
+>   H. Lambda 15関数の code artifact に想定外差分がないことを確認する
+>   I. 同一releaseに含める理由を release tracking Issue に明記する
+
+本節の整理(★USER判断の引用ではない):
+
+```
+1  決定3(DependenciesLayerの期待差分の事前申告)
+   DependenciesLayerの期待差分を、ChangeSet CREATEの前に事前申告する。申告の内容は、変更要因と、
+   その変更によって「どのartifactが変わるはずか」(条件Bの文言)とする。
+   申告のないDependenciesLayerの差分は想定外として扱い、14.1の3のとおり、原因を確認してから
+   実行する。
+2  決定4(ConfigLayerのLF化とcontainer build化を同一releaseに含める場合)の条件A〜I
+   条件A〜Iは、決定4の同一releaseの場合の条件として示された。他のreleaseにも同じ条件を
+   適用するかは、本節では定めない。手順書上の置き場所:
+     A・B   上の1の事前申告。2つの変更要因を別々に明示し、それぞれで変わるはずのartifactを申告する
+     C      build前のゲート(36.3)の項目として、別に追記する(本節の範囲外)
+     D      36.4(container buildの記録。36.3の5によりreleaseのbuildはすべてcontainer buildになるため、
+            結果としてすべてのreleaseのbuildで記録する。E〜Iは据え置き)
+     E・F   下の3
+     G・H   36.6.1
+     I      下の4
+3  前回Productionとのartifact hashの比較(条件E・F)
+   ConfigLayerとDependenciesLayerのartifact hash(36.5のBUILD_ARTIFACT_IDENTITYの`<key>`)を、
+   前回Productionが参照しているartifactのkey(deploy済みstackのprocessed template。36.7と同じ
+   `aws cloudformation get-template --template-stage Processed`)と比較する。
+   事前申告にない想定外のartifact差分が1件でもあれば、ChangeSet CREATE / EXECUTEを止める。
+   これは決定4の同一releaseの場合の条件E・Fとして示されたもので、他のreleaseにも適用するかは、
+   本節では定めない。
+4  同一releaseに含める理由(条件I)
+   ConfigLayerのLF化とcontainer build化を同一releaseに含める場合は、その理由をrelease tracking
+   Issueに明記する。
+5  `.gitattributes`の`eol=lf`を`src/`と`infra/layer/`へ広げた変更(Issue #802。USER承認 =
+   #802 issuecomment-5979840501)による期待差分
+   この変更の後に新しくcheckoutした作業ツリーでは、`src/`と`infra/layer/`のバイト列が、
+   core.autocrlfに依らずLFになる(git indexの内容は変わらない)。したがって、次回releaseの
+   Lambdaのcode artifact(15関数が同じ`src/`を共有する)のhashは、前回Productionと異なりうる。
+   これは期待差分であり、上の1・2のA・Bと同じく、変更要因として明示し、どのartifactが変わるはず
+   かを事前申告する。事前申告にないcode artifactの差分は、上の3のとおり想定外として扱う。
+   DependenciesLayerのartifact hashが`infra/layer/`の改行コードの影響を受けるかは、
+   本節では未確認(実測していない)。確認するまでは、事前申告の対象に含める。
+   既存のworktreeの扱い・renormalize・release時のbyte整合確認は、#798・#796 γ-3の手順で定める
+   (本節の範囲外)。
+```
+
+### 36.6 ChangeSet artifact identityの照合(POST_CREATE / PRE_EXECUTE GATE)
+
+ChangeSet **CREATE後・EXECUTE前**に行う(31.1節のとおりCREATE_COMPLETEは
+EXECUTEの成功を保証しないが、本節のartifact identity照合はCREATEの
+成否とは独立に、**EXECUTEしてよいかの最終防御**として位置づける)。
+
+```
+1  `aws cloudformation describe-change-set`(または`get-template
+   --change-set-name <arn> --template-stage Processed`)で、変更対象
+   リソース(Lambda Function Code / Layer Content)が実際に参照する
+   S3 Key(`<prefix>/<key>`形式)を取得する。Lambda/Layerごとに以下の
+   形式で記録する:
+
+   CHANGESET_ARTIFACT_IDENTITY
+     WatchlistBatchReconcilerFunction = jstock-advisor/<key>
+     DependenciesLayer                = jstock-advisor/<key>
+     ConfigLayer                      = jstock-advisor/<key>
+     ...(36.5のBUILD_ARTIFACT_IDENTITYと同じLambda/Layer一覧)
+
+2  Lambda/Layerごとに、36.5のBUILD_ARTIFACT_IDENTITYと本節の
+   CHANGESET_ARTIFACT_IDENTITYの`<key>`部分を**文字列として完全一致**
+   で突き合わせる(36.5節の根拠により、`<key>`はcontent MD5そのもの
+   なので、一致 = 内容が同一であることの直接証明になる。「文字列が
+   同じならcontent identity」という推測ではなく、SAM CLI自身の
+   dedup実装に基づく)
+
+   ARTIFACT_IDENTITY_MATCH = YES / NO(Lambda/Layerごと)
+
+3  **いずれか1件でもARTIFACT_IDENTITY_MATCH = NO、または照合不能
+   (片方のkeyが取得できない等)の場合、EXECUTEへ進まず停止する。**
+   ChangeSetは今回のbuild成果物とは異なる(より古い、または何らかの
+   理由で異なる内容の)S3オブジェクトを参照している可能性があり、
+   原因を特定してからやり直す
+```
+
+2026-10-01のRelease(#705・#708、ChangeSet
+samcli-deploy1790849724/a8ca2b28-7d39-436e-8f32-40aa76efeecf)では、
+build直後に`.aws-sam/build/DependenciesLayer`内の`urllib3-2.8.0.dist-info`
+/ `pyjwt-2.15.1.dist-info`、および`.aws-sam/build/WatchlistBatchReconciler
+Function`内の対象関数定義の存在をARTIFACT_CONTENT_SPOT_CHECKの手順で
+確認し、deploy後に対象関数の`LastModified`・新Layer版numberのattachを
+実測確認した。**ただし、この実例はspot checkとdeploy後のLastModified
+確認までを行ったものであり、本節のBUILD_ARTIFACT_IDENTITY /
+CHANGESET_ARTIFACT_IDENTITYの記録・突き合わせは実施していなかった
+(2026-10-02、ChatGPTレビュー指摘により判明。過大な実績主張を訂正する)。**
+本節は新たに明文化した手順であり、次回のrelease実行が初めての実地
+検証機会になる。
+
+#### 36.6.1 ChangeSet上のLayerのversion更新とLambdaのcode artifactの確認(USER判断 2026-10-04の条件G・H)
+
+36.5.1の条件G・H(原文は36.5.1に引用)を、ChangeSet CREATEの後・EXECUTEの前に確認する。
+決定4(ConfigLayerのLF化とcontainer build化を同一releaseに含める場合)の条件として示された
+もので、他のreleaseにも適用するかは、本節では定めない。
+
+```
+G  ChangeSet上で、ConfigLayerとDependenciesLayerのversion更新(Add / Remove)が、36.5.1の
+   事前申告どおりであることを確認する
+H  全てのLambda関数のcode artifactのkeyに、事前申告にない想定外の差分がないことを確認する
+   (36.6の1〜3のCHANGESET_ARTIFACT_IDENTITYのkeyを使う)
+F  上のG・Hで想定外の差分が1件でもあれば、EXECUTEへ進まない(36.5.1の3)
+```
+
+### 36.7 Deploy設定(samconfig.toml)の非センシティブ値drift確認(#650)
+
+```
+`infra/samconfig.toml`は、PUBLICリポジトリ化に伴い意図的にgit管理外
+(.gitignore:22)である(commit adb0f51、2026-07-30: 実際のAWSアカウントID・
+Secrets Manager ARNを含むため)。この制約により、samconfig.tomlを
+git管理へ戻すことはできない(#650 Phase A調査。アカウントID露出になる)。
+```
+
+代わりに、ChangeSet CREATE前に以下を確認する:
+
+```
+1  infra/samconfig.toml(git管理外、実際にdeployで使われる値)の
+   非センシティブ値(stack_name / resolve_s3 / s3_prefix / region /
+   confirm_changeset / capabilities / disable_rollback、および
+   `[default.build.parameters]`の use_container)を確認する
+2  infra/samconfig.toml.example(git管理下、tracked baseline)の
+   対応する値と比較し、一致することを確認する
+   (parameter_overrides内のSecrets ARN・アカウントID自体は比較・
+   記録の対象外。値そのものをログ・Issueへ書き出さない)
+3  不一致があれば、意図的な変更か設定ドリフトかを判別し、意図的な
+   変更であれば同時にsamconfig.toml.exampleも更新する。原因不明の
+   不一致があればChangeSet CREATE前に停止し、原因を特定する
+```
+
+2026-10-02時点のfresh確認: `infra/samconfig.toml`と
+`infra/samconfig.toml.example`の非センシティブ値(stack_name /
+resolve_s3 / s3_prefix / region / confirm_changeset / capabilities /
+disable_rollback)は一致している。また、2026-10-01のdeploy
+(36.5〜36.6参照)後、`aws cloudformation get-template --template-stage
+Processed`で実際に使われているS3 Keyが`jstock-advisor/<md5>`形式
+(`s3_prefix = "jstock-advisor"`を反映した形式)であることを実測確認し、
+現在のsamconfig.toml.exampleの値がProduction実態と一致していることを
+確認した(#650 7節のEDGE_CASEで指摘されていた「比較の基準自体が
+ずれている可能性」への対応)。
+
+2026-10-05追記(Issue #796 γ-3。MANAGER判断 K1): releaseのbuildをcontainer buildに固定する(36.3の5)
+ため、`infra/samconfig.toml.example`に`[default.build.parameters]`の`use_container = true`を足し、
+上の1の確認項目に`use_container`を加えた。`infra/samconfig.toml`(git管理外)側に同じ節があることは、
+次のreleaseのdrift確認で確認する(git管理外のため、この追記の時点では確認していない)。
+実測の限定(事実): samconfigのbuild節だけで`sam build`がCLI引数なしにcontainerで動いたことは、
+1回の実測・SAM CLI 1.164.0のみで確認した(Issue #796 issuecomment-5979112271)。実測した設定は、
+`use_container`と`skip_pull_image`の2つを持つ合成のsamconfigだった(`skip_pull_image`も効いた)。
+`infra/samconfig.toml.example`は`use_container`のみで、`skip_pull_image`は未決定のため含めていない。
+他の版・環境、および`use_container`のみの設定では未確認のため、36.3の5のとおり`--use-container`を
+明示してbuildする。
+
+選択肢としてファイル分割(センシティブ/非センシティブを別ファイルへ
+分離する案)も検討したが、SAM CLIが複数config fileを直接mergeしない
+ため新規ツール化を伴う。Design-First期間の方針により、本節のような
+手順化(選択肢B)を採用し、ファイル構造は変更しない(#650 4節)。
+
+### 36.8 ChangeSet CREATE前後のゲート(まとめ)
+
+**PRE_BUILD / PRE_CREATE GATE**(ChangeSet CREATEより前。36.2〜36.5・36.7)
+
+```
+[ ] RELEASE_SCOPE_GATE: release targetに含まれる全変更のCODE_DEPLOY_APPROVED/
+                    ACTIVATION_APPROVEDを確認し、DEPLOY_HOLDが無いことを
+                    確認した(36.2。最初に実施する)
+                    (UNKNOWNの項目の扱いは36.2の手順6による)
+[ ] BRANCH_GATE    : 現在のbranch / release target SHAをfreshに確認した(36.3)
+[ ] SHA_GATE       : git rev-parse HEADがrelease target SHAと一致する(36.3)
+[ ] CLEAN_TREE_GATE: git status --porcelainが空である(36.3)
+[ ] CONTAINER_BUILD: releaseのbuildを`sam build --use-container`で行った。例外なし(36.3の5)
+[ ] BUILD_INPUT_BYTE_CONSISTENCY: buildの入力(config/・src/・infra/layer/)の作業ツリーのバイト列が
+                    gitの内容と同一である(E1: `git ls-files --eol`の作業ツリー側にcrlf / mixedが0件。36.3の6)
+[ ] BUILD_EXIT_STATUS = 0: `sam build`の終了コードが0である。0でなければdeployへ進まない(36.3の7。
+                    終了コードは36.4のBUILD_EXIT_STATUSに記録する)
+[ ] BUILD_RECORD   : BUILD_SOURCE_SHA等をrelease実行記録へ記載した(36.4)
+[ ] ARTIFACT_CONTENT_SPOT_CHECK: build成果物に対象fixが含まれることを確認した
+                    (36.5。identity verificationの代替ではない補助確認)
+[ ] BUILD_ARTIFACT_IDENTITY: Lambda/Layerごとのbuild artifact identity
+                    (sam deployのアップロードkey)を記録した(36.5)
+[ ] SAMCONFIG_DRIFT: samconfig.tomlの非センシティブ値がexampleと一致する(36.7)
+[ ] BUILD_CONTAINER_RECORD: イメージ・digest・architecture・toolchainを記録した(36.4。
+                    36.3の5によりreleaseのbuildはすべてcontainer build)
+                    (決定4の他の条件は、他のreleaseには36.5.1の整理2のとおり定めない)
+[ ] EXPECTED_ARTIFACT_CHANGE: DependenciesLayerの期待差分(変更要因と、変わるはずのartifact)を
+                    CREATEの前に事前申告した(36.5.1。決定4の場合は条件A〜I)
+[ ] ARTIFACT_HASH_COMPARISON: ConfigLayer / DependenciesLayerのartifact hashを前回Productionと
+                    比較し、想定外の差分が無いことを確認した(36.5.1の3。決定4の場合)
+```
+
+**→ ChangeSet CREATE実行 →**
+
+**POST_CREATE / PRE_EXECUTE GATE**(ChangeSet CREATEの後・EXECUTEより前。36.6)
+
+```
+[ ] CHANGESET_ARTIFACT_IDENTITY: ChangeSetが実際に参照するLambda/Layerごとの
+                    S3 Keyを取得した(36.6)
+[ ] ARTIFACT_IDENTITY_MATCH = YES: 36.5のBUILD_ARTIFACT_IDENTITYと完全一致する
+                    ことを確認した(36.6。1件でもNO・照合不能ならここで停止し
+                    EXECUTEへ進まない)
+[ ] CHANGESET_DIFF_REVIEW: ChangeSetの差分(Add/Modify/Delete/Replacement)を
+                    人間が確認した(既存の運用。本節が新設するものではない)
+[ ] LAYER_VERSION_CHANGE_AS_DECLARED: 両Layerのversion更新が事前申告どおりである(36.6.1。
+                    決定4の場合)
+[ ] LAMBDA_CODE_ARTIFACT_NO_UNEXPECTED_DIFF: 全てのLambda関数のcode artifactに想定外の差分が
+                    ない(36.6.1。決定4の場合)
+```
+
+**→ EXECUTE(USER承認を要する別のHuman Gate。31節参照)**
+
+本ゲート構成は31節(release前validationの責務境界)の「ChangeSet CREATE」
+段階の前後を本節がさらに時系列で細分化したものであり、31節が扱う「AWS
+API側のsemantic制約」とは別の関心事(build/deploy入力側のprovenance)を
+扱う。
+
+### 36.9 Production影響
+
+なし。本節は既存のrelease実行記録・チェックリストへの手順・記録項目の
+追加のみであり、build/deployの実際の挙動(どのartifactが生成され、
+どうdeployされるか)自体は変更しない。新規ツール・スクリプトは追加して
+いない(#649 OD2・#650 4節の方針どおり、自動化は将来のfollow-up候補)。
+
+2026-10-05追記(Issue #796 γ-3): 36.3の5・6は、今後のreleaseのbuildの方式(container build)と入力の検査
+(E1)を定める。手順書のmerge単独では、Productionも既存のartifactも変わらない。ただし、今後のreleaseで
+buildの方式や入力のバイト列が前回と異なる場合、artifactのhashが前回と異なりうる。それは期待差分として、
+36.5.1の事前申告の対象になる。
+
+## 37. #128 の機能の Production 接続 gate(Shadow → Backtest → Human Review → USER Approval。Issue #606、#128 Child 6b、2026-10-11追加)
+
+Expected Return(#601)・RAER(#602)・Portfolio Allocation(#603)・Capital Rotation(#604)・利用者向けの出力(#605)を、
+Production の BUY / SELL / 保有判断・通知へ接続する**前に経る運用手順**である。
+
+**本節は、新しい gate 機構も、新しい有効化経路も作らない。** 既存の Human Gate
+(§28 の「各段が別の Human Gate」・§10.2〜10.4 の Shadow → Active・§5.1 の「自動検出 → 人間レビュー → 人間承認」)を、
+#128 の各機能へ適用するときの**順序と記録**を明確にするだけである。
+運用の恒久規則の制定・変更は `POLICY_AUTHORITY = HUMAN_ONLY`(CLAUDE.md §2。正本は
+docs/user_manager_collaboration_protocol.md §8)であり、本節はそれを変更しない。
+
+```
+規則の正本(本節は複製しない。矛盾したら正本が優先する)
+  USER 決定  #122 issuecomment-6100082651(#128 の各機能と案 Y の必須条件)/ #122 issuecomment-6054586019(Exit 側:
+             shadow -> replay / backtest -> human review -> explicit approval を経ずに Production へ接続しない)
+  設計       #846(Unified Holding / Exit Decision Architecture)/ #128 本文(Shadow / backtest gate)/ #606
+```
+
+### 37.1 対象と、現況の確認方法
+
+| 機能 | 親 Issue | 接続の入口になりうるもの |
+|---|---|---|
+| Expected Return | #601 | 純粋な型と計算。Production の判定・通知からは呼ばれない |
+| RAER と Shadow の器 | #602 | `ExpectedReturnRuntimeConfig` / `ExpectedReturnExecutionPlan`(mode = legacy / shadow / active。`allow_allocation_use` が True になるのは active のときだけ) |
+| Portfolio Allocation | #603 | 購入側 Shadow の枠(`config/allocation_shadow.yaml`。mode は OFF / SHADOW のみ)・購入可能株数の純粋関数 |
+| Capital Rotation | #604 | 実装前 |
+| 利用者向けの出力 | #605 | 表示モデルと renderer(LINE 等の送信経路への接続は UI/UX の USER 判断の後) |
+
+**現況(merge 済みか・どの mode か・何が接続されているか)は、本節に固定しない。** 各 Issue の最新の
+`ISSUE_STATE_SNAPSHOT` と origin/main を fresh に読んで確認する(静的な文書を現況の根拠にしない)。
+Exit 側(#846)の class 単位 flag は本節の範囲外(37.6)。
+
+### 37.2 段(順序を入れ替えない。各段が別の Human Gate)
+
+```
+段 A Shadow
+  入口  実装 PR が merge 済みで、出荷値が OFF / legacy のまま Production に載っていること。その上で、設定を shadow にする
+        (USER の別承認。購入側 Shadow は、AvailableCashTable の GetItem の IAM を先に反映する。IAM の反映前に SHADOW にしない)。
+        設定は Lambda Layer の静的設定のため、変更は config の変更 + 再 deploy(ChangeSet の CREATE と EXECUTE は各別の Human Gate。CLAUDE.md §4)
+  出口  観測期間の終了と、shadow の集計の報告(期間は shadow 運用の後に USER が決める。37.6)
+  記録  AuditLog / DecisionSnapshot の shadow 記録。種類は 2 つで、混ぜない(Q' の契約 6 の改訂 = C-3。
+        USER 承認: #122 issuecomment-6114810773 の【4】。変更は『項目つきの別の記録の追加』に局所化する)
+          枠の記録(allocation_shadow / allocation_shadow_skip): 実行回数・スキップの理由・所要時間・IAM 未反映の有無。
+            件数・理由コード・真偽・短い識別子のみ(scalar)。**Q' の契約 6 のまま変えない**(銘柄・株数・金額・owner の実名は入れない)
+          項目つきの記録(allocation_shadow_items。新規の別の decision_type。実装は PR-F2。サブちゃんの設計レビューの後に実装できる。
+            #122 issuecomment-6137093887):
+            銘柄コード・推奨株数・金額・理由コードなど、配分の入力と出力を、allowlist で固定したキーだけで、検証できる形式で保存する。
+            既存の監査ログ・枠の記録と識別できること。件数に上限を置く。owner の符号は暫定(#925 の方式が決まるまでは
+            現行の log_ref。決まった後に揃える)。
+            保有由来の金額は『集計金額』に限り、検証(記録の入力を配分へ渡し直す)に必要な最小限だけ記録してよい
+            (候補自身の現在の保有評価額・業種ごとと high-risk の保有額・総額。USER 承認: #122 issuecomment-6138622792 の 4)。
+            個別の保有の識別子・取得単価・損益・所有者の実名は記録しない(保有の銘柄別の株数も入れない)。
+            保存範囲は allowlist(キーと値の型)と契約テスト(allowlist 外のキーの拒否・記録しないものの漏出防止・検証可能性)で固定する
+        適用範囲は『Shadow の項目つきの記録だけ』。それ以外の監査ログ・ログ・CloudWatch・公開面への実名・金額・株数の記録は、引き続き禁止
+        shadow は観測専用で、判定・通知・保存される業務結果には接続しない
+  停止条件  shadow が本流(判定・通知・完了処理)に影響した / IAM 未反映の記録が出た / スキップが想定を超えて多い /
+            次のいずれかが混入した -> 直ちに mode を OFF / legacy へ戻す(37.4)
+              ・枠の記録に、scalar の範囲を超える値(銘柄・株数・金額・実名)
+              ・項目つきの記録に、allowlist の外のキー・値(所有者の実名、個別の保有の識別子・取得単価・損益、保有の銘柄別の株数を含む)
+              ・項目つきの記録の外(枠の記録・他の監査ログ・ログ・CloudWatch・公開面)の、実名・金額・株数
+
+段 B Backtest / Replay
+  入口  段 A の集計を USER が確認し、backtest の持ち主と合格基準案を決めたこと(37.6。決まっていなければ段 B は始めない)
+  出口  backtest の結果の報告。入力の範囲と限界を併記する(このシステムは過去の任意時点の財務スナップショットを保存していないため、
+        真の過去時点シミュレーションではない。§10.7)
+  記録  結果・使った入力の範囲・限界を Issue に残す
+  停止条件  入力の限界のため結論できないときは『証拠不足(INSUFFICIENT_EVIDENCE)』とする。推測で合格にしない
+
+段 C Human Review
+  入口  段 B の結果
+  出口  review の結論(PASS / PASS_WITH_CONDITIONS / 証拠不足 / 差し戻し)。PASS_WITH_CONDITIONS は Human Gate の通過を意味しない
+  記録  結論と根拠を Issue に残す。#602 の案 X / 案 Y の再評価の結果を含める(USER の必須条件)
+  停止条件  条件未達・証拠不足 -> 段 B(または段 A)へ戻す
+
+段 D USER Approval
+  入口  段 C の結論
+  出口  USER の明示的な承認。backtest の結果の承認と mode の切替の承認は別々に取得する(§28.2)。承認の記録に、承認の対象
+        (機能・mode・リリース)を明記する(新しい制約ではなく、既存の正本に基づく: コードの deploy と機能の有効化は別 = #122、
+        リリースの特定は §36 の exact-SHA)。承認は、記録された対象に対してのみ有効
+  記録  承認の原文を Issue に転記する。承認後も、設定の変更と deploy は ChangeSet の CREATE と EXECUTE が各別の Human Gate
+  停止条件  承認が無い / 対象が違う -> 切り替えない
+```
+
+### 37.3 やってはいけないこと
+
+```
+・段を飛ばさない・順序を入れ替えない(各段が別の Human Gate)
+・shadow の結果、特に案 Y の暫定 RAER を、投資判断に使わない(案 Y は shadow 評価の実施のためで、投資判断への利用の承認ではない)
+・適用軸の異なる RAER の結果をそのまま比較しない(比較不能は UNAVAILABLE とし、推奨数量を算出しない)
+・IAM の反映前に購入側 Shadow を SHADOW にしない
+・mode を active にできる新しい有効化の経路(書込・CLI・handler・環境変数・template の Parameter)を作らない。契約テスト(37.5)が検知する
+・shadow の出力を、LINE 等の送信経路へ渡さない
+・merge を、Production 有効化の承認と読まない(merge は有効化の承認ではない。有効化は段 D の USER の明示的な承認)
+```
+
+### 37.4 戻し方
+
+```
+mode を OFF / legacy へ戻す(設定の変更 + 再 deploy。ChangeSet の CREATE と EXECUTE は各別の Human Gate)。
+shadow の記録は追記のみで削除しない。表・IAM は、既存の戻し方(§28.4 / §10.4)に倣い削除しない(購入側 Shadow の IAM は残してよい)。
+```
+
+### 37.5 契約テストとの対応
+
+`tests/unit/test_issue_606_production_connection_gate.py` が、次をコード上で固定する(PR のたびに全走査):
+
+```
+・有効化の経路の集合が増えていない: #128 の設定型・実行計画を作る/読む src は定義するモジュールの外に無い / src が読む環境変数の名前
+  (literal・module 定数・dict・helper の引数を解決した全件)と、template の Parameter・Lambda の環境変数の名前が、既知の一覧から増えていない
+  (新しい名前が現れたらテストが落ちて、人が確認する。名前の語には頼らない)/ config に #128 の機能の入口が無い / 出荷 config は SHADOW〔R1。USER の別承認 G0〕/
+  購入側 Shadow の mode に ACTIVE が無い。★名前を解決できない読取や、分類できない `os.environ` の使い方が現れた場合も落ちる★
+・Production(Lambda handler・CLI を根とする import 連鎖の推移閉包)から、Expected Return・RAER・配分・入替・#605 の表示・Exit 統合の module に
+  到達しない(到達できるのは、出荷 SHADOW の購入側 Shadow の枠と、その計算・記録の部品だけ。★ handler の根にだけ、契約テストの
+  『完全一致の免除』10 件を認めた。承認の記録 = #122 issuecomment-6138622792【1】。名前の網〔token・prefix〕は 1 語も消していない。
+  免除に無い名前の module が handler から到達すれば、テストが落ちる。CLI の根には免除を適用しない ★)
+・★ 限定した Shadow 接続を 1 件認めた(#877 PR-2b。承認の記録 = #122 …6182420023 の 1)★: 価格の経路の Shadow の受け手
+  (`services/price_regime_shadow_service.py`)だけが `exit_architecture` へ繋がる。handler の根にだけ、契約テストの
+  『別表(完全一致 7 件)』を認めた(免除 10 件には足していない)。★ 受け手の経由でしか到達できないこと・別表の各行が必要なこと
+  〔1 件外すと offender〕・受け手を import する src の完全一致・CLI の根と利確判定サービスの import の閉包が到達しないこと ★ を固定している。
+  閾値の供給元は常に None(閾値 3 値は USER 判断として保留)のため、本番では何も組み立てず・分類せず・保存・通知しない。
+  信頼性の供給元が決まるまで分類を呼ばない。名前の網〔token・prefix〕は 1 語も消していない
+・★ 限定した接続を 1 件認めた(#604 P-b4 A1。承認の記録 = #604 …6195577714・#122 …6195577047)★: 資金入替の観測 P の新しい handler
+  (`lambda_handlers/rotation_observation_handler.py`)の閉包だけ。handler の根にだけ、契約テストの『別表(完全一致 13 件)』を認めた
+  (免除 10 件・#877 の別表 7 件には足していない)。★ 新しい handler を根から外すと 13 件のどれにも到達しないこと・別表の各行が必要なこと
+  〔1 件外すと offender〕・CLI の根が 1 件も到達しないこと・handler を import する src が 0 件であること ★ を固定している。config 名の網へ
+  `rotation_observation` を足し、`rotation_observation.yaml`(mode。出荷 OFF)だけを完全一致で認めた。P の閉包は LINE・EDINET・秘密・GitHub の
+  module へ到達せず、呼ぶ DynamoDB 操作は GetItem・BatchGetItem・Query・Scan(HoldingsTableV2 の 1 表・200 件 / 3 ページ / 時間の上限)・PutItem
+  (AuditLog への『日の集計』1 件 / 日)だけ。★ 本承認に含まないもの = template・Scheduler・IAM(A2)・本番 deploy・SHA pin・ChangeSet の CREATE /
+  EXECUTE・Scheduler の ENABLED・mode SHADOW・LINE・本番判断への接続(それぞれ別の USER 判断)★。名前の網〔token・prefix〕は 1 語も消していない
+・本節が存在し、各段の入口・出口・記録・停止条件、USER の明示的な承認、戻し方、決めていないことを含み、閾値・期間の数値を書かないこと
+```
+
+接続を許す変更は、契約テストの許可リストの変更を伴い、USER の承認の記録(Issue 番号)を要する。
+
+項目つきの記録(allocation_shadow_items。37.2 段 A)の **allowlist・件数の上限・漏出防止(所有者の実名・個別の保有の識別子・取得単価・損益が出ない)・
+検証可能性(記録の入力を配分へ渡し直すと出力と一致する)の契約テストは、PR-F2 の範囲**であり、**まだ存在しない**。PR-F2 は、サブちゃんの設計レビューの
+後に実装できる(#122 issuecomment-6137093887)。この契約テストは PR-F2 を merge する条件とする。USER の確認・承認を要するのは、外部仕様(LINE・CLI の
+表示など)に関わる変更と、保存範囲を 37.2 段 A の範囲を超えて広げる変更だけである。
+それまで、項目つきの記録は実装されておらず、37.2 段 A の停止条件のうち項目つきの記録に関するものは、実装後に効く。
+
+### 37.6 この節が決めていないこと
+
+```
+・backtest の合格基準・最低期待リターン改善幅・観測期間の数値(shadow 運用の後に USER が決める。#128 本文)
+・backtest を実施する持ち主の Issue(未定。USER の判断)
+・Exit 側(#846)の class 単位 flag を本 gate の範囲に含めるか(#846 の論点。範囲が決まるまで、Exit 側は #846 の gate に従う)
+・項目つきの記録の allowlist の具体的なキーと件数の上限の値(PR-F2 で設計し、契約テストで固定する。サブちゃんの設計レビューが前提)
+・owner の符号の方式(#925 の決定に従う。それまでは現行の log_ref を暫定とする)
+・replay に必要な保有由来の集計金額の具体的なキーと粒度(37.2 段 A が許す範囲 = 候補自身の現在の保有評価額・業種ごとと high-risk の保有額・総額のうち、必要最小限。PR-F2 の設計で allowlist として固定する。範囲を広げる場合は USER の承認)
+・各機能を ACTIVE にする可否・時期(USER の判断)
+・運用の恒久規則の制定・変更(HUMAN_ONLY)
+```
+
+## 38. incident の GitHub Issue 自動起票の抑止機構(Issue #926)の停止・再開・上限値の変更(2026-10-12追加)
+
+incident の GitHub Issue 自動起票(#508)に、3 層の抑止(事前確認・原子的な件数上限・kill switch)を足した(#926)。
+**LINE の通知には一切影響しない**(停止中も、抑止中も、LINE は従来どおり届く)。本節は、その停止(kill switch)と再開、
+上限値の変更の手順である。実装は PR #928。**本節の手順は、その PR が main に入り、Production に反映された後にだけ有効**である。
+
+**本節は、新しい gate 機構も、新しい自動の再開経路も作らない。** 手動の書込の操作は、既存の Human Gate
+(§34.2 の『ChangeSet を経由しない直接の AWS 操作 = 実行ごとに USER の承認』)と同じ性質として扱う。
+運用の恒久規則の制定・変更は `POLICY_AUTHORITY = HUMAN_ONLY`(CLAUDE.md §2。正本は
+docs/user_manager_collaboration_protocol.md §8)であり、本節はそれを変更しない。
+
+### 38.1 先に知っておくこと
+
+```
+1 kill switch が止めるもの   GitHub への書込の全て = 新規 Issue の作成と、OPEN の Issue へのコメント追記。LINE は止まらない
+2 停止中の発生分             コメントは後から追記されない(停止が解けても、止まっていた間の発生分は戻らない)。LINE には届いている
+3 自動停止                   全体の上限を超えた試行がしきい値に達すると自動で停止し、LINE へ 1 回だけ知らせる(文面は固定。件数・識別子を含まない)。
+                             fingerprint 単位の抑止は自動停止の入力にならない
+4 手動停止                   LINE への通知は出ない(実行した人が分かっているため)
+5 再開                       手動のみ。自動では再開しない
+6 制御項目の読取に失敗した    GitHub へ書かない(fail-closed)。LINE は通常どおり
+7 出荷値                     上限値は USER が承認した値(2026-10-15。最小間隔 360 分 / fingerprint あたり 2 件 / 全体 5 件 / 自動停止 10 件)。
+                             ★ ただし新規 Issue は、config/incident_notification.yaml の issue_creation_enabled が true の間だけ作られる(出荷値 false = 作られない。有効化は別の USER 承認)。
+                             上限値が未決定(null・読めない・不正)の間は、flag が true でも新規 Issue は作られない(OPEN の Issue へのコメントは続く)。
+                             この状態は『停止』ではない
+```
+
+★ **手動の停止・再開は DynamoDB への書込(AWS の書込)である。実行のたびに USER の承認が要る**(承認は 1 回の実行ごと。
+前回の承認は次回に及ばない)。AI は、USER の承認なしに実行しない。ChangeSet を経由しない直接の操作である。
+
+### 38.2 状態の保存場所
+
+```
+テーブル        <TablePrefix>-incident_state(IncidentStateTable。既存。TablePrefix はスタックのパラメータ)
+制御項目の key  fingerprint = "__control__:github_issue"(fingerprint の行ではない 1 項目。64 桁の 16 進と衝突しない)
+```
+
+制御項目の主な属性(無ければ『停止していない・数えていない』):
+
+```
+github_issue_kill_switch                       BOOL。true のときだけ停止(文字列 "true" や数値 1 では止まらない)
+kill_switch_reason                             "MANUAL"(手動)または "AUTO_GLOBAL_FLOOD"(自動)
+kill_switch_set_at                             停止にした時刻
+kill_switch_notified_at                        自動停止の LINE 通知を確保した時刻。無ければ未通知(次の signal で通知を再試行する)
+global_window_id / global_created_count        全体の窓(JST の日付)と、その窓で作成した件数
+global_denied_window_id / global_denied_count  全体の窓と、その窓で上限を超えた試行の数(自動停止の入力)
+```
+
+fingerprint の行にも、抑止の記録が残る: `github_issue_last_denied_reason`(LIMITS_UNDECIDED / SAME_OCCURRENCE / MIN_INTERVAL /
+FINGERPRINT_LIMIT / GLOBAL_LIMIT)・`github_issue_last_denied_at`・`github_issue_suppressed_count`・`github_issue_last_created_at`・
+`github_issue_last_created_occurrence`・`github_issue_window_id` / `github_issue_window_created_count`。
+claim の最中(CREATING)の行には、`github_issue_budget_window`(この claim の作成のために予算を消費した窓。stale 復旧が二重に消費しないための印。
+作成・失敗・抑止のいずれかで終わると消える)が付くことがある。
+
+**コメントの件数(参考)**: コメントは既存の OPEN の Issue への追記で、全体の上限は置かない。1 fingerprint あたり、健全時は最大 48 件/日
+(dedup window 30 分ごとに occurrence が 1 進む)、claim が stale になる異常時は 5 分きざみで最大 288 件/日になりうる。
+
+**Scan / Query はしない**(このテーブルに TTL は無く、tracker は全件走査をしない設計)。確認は key を指定した GetItem だけで行う。
+
+### 38.3 実行前の共通確認と、状態の確認(read-only)
+
+**38.3〜38.5 のコマンドは全て、先に次の共通確認(`preflight`)を通してから実行する**(対象の AWS アカウント・プロファイル・
+テーブルの取り違えを防ぐため)。各コマンドは `preflight && aws ...` の形で、確認に失敗したら AWS を呼ばない。
+
+```bash
+# 共通設定。REPLACE_ で始まる値は、実際の値へ置き換える(置き換えずに実行すると preflight が止める)。
+# (Git Bash では MSYS_NO_PATHCONV=1 を付けると、/ で始まる引数の変換を避けられる)
+export AWS_PROFILE=jstock-observer   # 38.4・38.5 の書込は、USER が承認した資格情報のプロファイル名へ置き換える
+export AWS_DEFAULT_REGION=ap-northeast-1
+EXPECTED_ACCOUNT=REPLACE_WITH_ACCOUNT_ID   # 対象の AWS アカウント ID(12 桁の数字)
+TABLE_PREFIX=REPLACE_WITH_TABLE_PREFIX     # スタックのパラメータ TablePrefix の値
+TABLE="${TABLE_PREFIX}-incident_state"
+
+preflight() {
+  case "${EXPECTED_ACCOUNT}${TABLE_PREFIX}" in
+    *REPLACE_*) echo "NG: 置き換えていない値がある" >&2; return 1 ;;
+  esac
+  [[ "$EXPECTED_ACCOUNT" =~ ^[0-9]{12}$ ]] || { echo "NG: EXPECTED_ACCOUNT が 12 桁の数字ではない" >&2; return 1; }
+  [[ "$TABLE_PREFIX" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "NG: TABLE_PREFIX の形が不正" >&2; return 1; }
+  local actual_account
+  actual_account=$(aws sts get-caller-identity --query Account --output text) || return 1
+  [ "$actual_account" = "$EXPECTED_ACCOUNT" ] || { echo "NG: AWS アカウントが期待と違う" >&2; return 1; }
+  echo "OK: profile=$AWS_PROFILE account=$actual_account region=$AWS_DEFAULT_REGION table=$TABLE"
+}
+```
+
+```
+・preflight が確かめるもの: 置き換え忘れが無い / アカウント ID の形 / 呼び出し元の資格情報が属するアカウントが EXPECTED_ACCOUNT と一致 /
+  実行する profile・region・テーブル名の表示(実行する人・USER が目で確認する)
+・preflight が確かめないもの: テーブルの実在と、それが IncidentStateTable であること(最初の GetItem が ResourceNotFoundException
+  で失敗しないこと・スタックの出力と TABLE が一致することを、実行する人が確認する)/ 資格情報の権限(未確認。38.9)
+・38.4・38.5 の書込の前には、さらに『呼び出し元の ARN』を表示して USER が確認する: aws sts get-caller-identity --query Arn --output text
+  (承認した資格情報・実施主体と一致しなければ実行しない)
+・結果のアカウント ID・ARN を、Issue・PR・コメントなど公開面へ貼らない(38.8)
+```
+
+観測用 role(`AWS_PROFILE=jstock-observer`。18節・24節と同じ)で、key を指定して 1 件だけ読む(`GetItem`)。**スキャンはしない**。
+**この観測用 role が `<TablePrefix>-incident_state` を読めるかは未確認**(AWS に接続して確かめていない)。許可されない場合は、
+権限を回避せず、その旨を報告して判断を仰ぐ(23.1 と同じ)。
+
+```bash
+# 制御項目(停止しているか・理由・窓ごとの件数)。読む属性は ProjectionExpression で必要なものだけに限定する。
+preflight && aws dynamodb get-item --table-name "$TABLE" \
+  --key '{"fingerprint": {"S": "__control__:github_issue"}}' --consistent-read \
+  --projection-expression "github_issue_kill_switch,kill_switch_reason,kill_switch_set_at,kill_switch_notified_at,global_window_id,global_created_count,global_denied_window_id,global_denied_count" \
+  --output json
+```
+
+```bash
+# 特定の fingerprint の抑止の記録。FP を対象の fingerprint(64 桁の 16 進)へ置き換える。
+# 読む属性は下のとおりに限定する(ProjectionExpression。許可リスト方式)。
+FP=REPLACE_WITH_FINGERPRINT
+[[ "$FP" =~ ^[0-9a-f]{64}$ ]] && preflight && aws dynamodb get-item --table-name "$TABLE" \
+  --key "{\"fingerprint\": {\"S\": \"$FP\"}}" --consistent-read \
+  --projection-expression "github_issue_create_status,github_issue_last_denied_reason,github_issue_last_denied_at,github_issue_suppressed_count,github_issue_last_created_at,github_issue_last_created_occurrence,github_issue_window_id,github_issue_window_created_count" \
+  --output json
+```
+
+> **PowerShell で実行する場合**: 上のコマンドは bash 用である(`[[ ]]`・関数・`$(...)` を使う)。PowerShell では動かない。
+> **PowerShell での実行は未確認**で、本節は PowerShell 用の手順を持たない(Git Bash か WSL で実行する)。
+
+読み方:
+
+```
+Item が返らない                       制御項目が無い = 停止していない・窓の件数も 0
+github_issue_kill_switch = true       停止中。kill_switch_reason で自動 / 手動を区別する
+kill_switch_notified_at が無い(AUTO)  自動停止の LINE 通知がまだ確保されていない(次の signal で通知される)
+global_denied_count が大きい          全体の上限を超えた試行が多い = 起票の量産(または上限値が低すぎる)の兆候
+global_window_id / global_denied_window_id   今の窓(JST の日付)と同じなら、その件数は今日の分。古い日付なら、窓が替われば 0 から数え直される分
+```
+
+結果にある値(識別子・fingerprint・時刻)を、Issue・PR・コメントなど公開面へそのまま貼らない(DISCLOSURE = PUBLIC_SANITIZED。
+必要なら件数・有無だけを書く)。
+
+### 38.4 手動で停止する(AWS の書込。実行ごとに USER の承認)
+
+停止する理由の例: Issue の量産が疑われるとき、GitHub 側の障害・誤作動で書込を止めたいとき。
+**書込に使う資格情報は、本節では指定しない**(実行する資格情報と実施主体は、実行の前に USER の承認とあわせて決める)。
+実行の前に、38.3 の共通設定で `AWS_PROFILE` を承認された資格情報のプロファイル名へ置き換え、`preflight` が `OK:` を表示することと、
+呼び出し元の ARN(`aws sts get-caller-identity --query Arn --output text`)を USER が確認することを済ませる。
+**書込の直前に、38.3 の制御項目の GetItem を同じ `$TABLE` で実行**し、制御項目の状態が想定どおり(未停止)であることを確認する。
+
+```bash
+NOW_UTC=$(date -u +%Y-%m-%dT%H:%M:%S+00:00)   # 実行時の UTC の時刻
+preflight && aws dynamodb update-item --table-name "$TABLE" \
+  --key '{"fingerprint": {"S": "__control__:github_issue"}}' \
+  --update-expression "SET github_issue_kill_switch = :on, kill_switch_reason = :reason, kill_switch_set_at = :now REMOVE kill_switch_notified_at" \
+  --condition-expression "attribute_not_exists(github_issue_kill_switch) OR github_issue_kill_switch = :off" \
+  --expression-attribute-values "$(printf '{":on": {"BOOL": true}, ":off": {"BOOL": false}, ":reason": {"S": "MANUAL"}, ":now": {"S": "%s"}}' "$NOW_UTC")"
+```
+
+```
+・condition-expression は『まだ停止していないときだけ』成立する(実装と同じ条件)。既に停止中なら ConditionalCheckFailedException になる = 何も変わらない
+・次の signal から効く(制御項目は signal ごとに強い整合性で読む)。実行後は 38.3 で確認する
+・MANUAL は LINE へ通知されない
+・PowerShell では動かない(38.3 の注記)
+```
+
+### 38.5 再開する(AWS の書込。実行ごとに USER の承認)
+
+**先に原因を確認してから再開する**(原因が残っていると、再開してもすぐ再停止する)。実行の前に、38.4 と同じく、承認された資格情報の
+`preflight`・呼び出し元の ARN の確認・書込の直前の制御項目の GetItem(38.3)を済ませる。
+
+```
+1 停止の理由と時刻を 38.3 で確認する(kill_switch_reason / kill_switch_set_at)
+2 AUTO_GLOBAL_FLOOD の場合: 何が全体の上限を超えさせたかを調べる(GitHub の Issue 一覧・LINE の通知・fingerprint ごとの github_issue_suppressed_count)
+3 起票の量産が原因なら、GitHub 側の Issue の整理(close 等)は別の作業として USER が判断する(本手順は GitHub の Issue を操作しない)
+4 AUTO_GLOBAL_FLOOD の場合: global_denied_window_id と global_created_count を 38.3 で読み、今日(JST)の窓の分かを確認する
+```
+
+**再停止のしくみ(実装の事実)**: 全体の窓の予算は、JST の日付が替わると 0 から数え直される(全体の作成件数も、上限を超えた試行の数も、
+窓が替わった最初の更新で自動的に新しい窓へ切り替わる)。停止中は、signal が来ても GitHub への書込・予算の消費・上限超過の記録を
+**しない**(kill switch を最初に確認して終わる)ので、停止中は 2 つの件数とも変わらない。再開した後に、**全体の上限に達している窓の中で**
+新規 Issue を作ろうとする signal が来ると、その試行は上限超過として数えられ、`global_denied_count` がしきい値に達した試行で
+**kill switch が再び自動で入り、LINE の通知がもう一度出る**。
+
+#### 通常の手順(推奨): JST の日付が替わってから再開する
+
+追加の書込は要らない(窓が替われば、件数は自動的に 0 から数え直される)。AUTO_GLOBAL_FLOOD の再開は、**翌 JST 暦日以降**に行うのを原則とする。
+
+```bash
+SET_AT=REPLACE_WITH_KILL_SWITCH_SET_AT   # 38.3 で読んだ kill_switch_set_at の値をそのまま(再開してよい『その停止』を特定する)
+[[ "$SET_AT" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+[+-][0-9]{2}:[0-9]{2}$ ]] && preflight && aws dynamodb update-item --table-name "$TABLE" \
+  --key '{"fingerprint": {"S": "__control__:github_issue"}}' \
+  --update-expression "SET github_issue_kill_switch = :off REMOVE kill_switch_notified_at" \
+  --condition-expression "github_issue_kill_switch = :on AND kill_switch_set_at = :set_at" \
+  --expression-attribute-values "$(printf '{":on": {"BOOL": true}, ":off": {"BOOL": false}, ":set_at": {"S": "%s"}}' "$SET_AT")"
+```
+
+```
+・condition-expression は『確認した、その停止(kill_switch_set_at が同じ)が今も有効なとき』だけ成立する。確認の後に別の停止に置き換わっていれば
+  ConditionalCheckFailedException になる = 何も変わらない(確認していない停止を解除しない)
+・項目を DELETE しない(窓ごとの件数・上限を超えた試行の数が消え、記録も失われる。false へ戻すだけにする)
+・false へ戻した項目は、次の停止(手動・自動)でそのまま使える
+・MANUAL の停止の再開も同じコマンド(カウンタは関係しない)
+```
+
+#### 例外操作: 同じ JST 暦日のうちに再開する(別の承認。再停止を前提に判断する)
+
+**同じ日のうちに再開しても、その窓の全体の作成件数は上限のままである**(戻さない = 上限の意味を変えない)。したがって、全体の上限そのもの
+を引き上げない限り(38.7。配信が要る)、再開後の新規 Issue はその日は作られず、上限を超えた試行が数えられ続ける。
+`global_denied_count` を 0 に戻す操作は、**再停止までの猶予(しきい値の回数ぶんの上限超過の試行)を得るだけ**で、起票を再開させるものではない。
+このため、同日中の再開は例外であり、実行ごとに USER の承認(通常の再開とは別)を要する。選択肢は次のとおり:
+
+```
+A  JST の日付が替わるまで再開しない        追加の書込が要らない。通常はこれ
+B  上限値を引き上げる(38.7。配信が要る)     同日中に新規 Issue を再び作らせたいなら、この方が本筋(カウンタだけ戻しても、作成件数が上限のままなので作られない)
+C  上限を超えた試行の数を 0 に戻してから再開する(下。追加の AWS 書込。別の承認)
+```
+
+**C を行う場合の順序は『カウンタの初期化 → kill switch の解除』に固定する**(逆にしない):
+
+```
+・解除を先にすると: 解除の直後に来た signal が上限超過として数えられ、global_denied_count はすでにしきい値以上なので、その試行で
+  即座に再停止する(LINE の通知がもう一度出る)。初期化が間に合わない
+・初期化を先にすると: kill switch が入っている間は件数が変わらないので、初期化はどの signal とも競合しない。解除の後は 0 から数え直される
+  (再停止は、しきい値の回数ぶん上限超過の試行が来てから)
+・初期化と解除の間に別の停止に置き換わった(手動の停止・別の自動停止)場合は、どちらの条件も kill_switch_set_at が一致しないので成立しない
+```
+
+```bash
+# 例外操作 C の 1 つ目: 上限を超えた試行の数の初期化(kill switch がまだ入っている間に行う)。
+# SET_AT は上の再開のコマンドと同じ値(38.3 で読んだ kill_switch_set_at)。
+WINDOW=$(TZ=JST-9 date +%F)   # 今日(JST)の窓の id。TZ=Asia/Tokyo へ置き換えない(UTC へ落ちて時刻が 9 時間ずれる)
+[[ "$SET_AT" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+[+-][0-9]{2}:[0-9]{2}$ ]] && [[ "$WINDOW" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] && preflight && aws dynamodb update-item --table-name "$TABLE" \
+  --key '{"fingerprint": {"S": "__control__:github_issue"}}' \
+  --update-expression "SET global_denied_count = :zero" \
+  --condition-expression "github_issue_kill_switch = :on AND kill_switch_reason = :auto AND kill_switch_set_at = :set_at AND global_denied_window_id = :w" \
+  --expression-attribute-values "$(printf '{":on": {"BOOL": true}, ":auto": {"S": "AUTO_GLOBAL_FLOOD"}, ":set_at": {"S": "%s"}, ":w": {"S": "%s"}, ":zero": {"N": "0"}}' "$SET_AT" "$WINDOW")"
+```
+
+```
+・condition-expression が確かめるもの: 停止中である(github_issue_kill_switch = true)/ 停止の理由が自動(AUTO_GLOBAL_FLOOD)/ 確認した、その停止である
+  (kill_switch_set_at が一致)/ 数えている窓が今日(JST)の窓である(global_denied_window_id = WINDOW)。どれかが違えば
+  ConditionalCheckFailedException になる = 何も変わらない(停止していない・手動の停止・窓が古い・別の停止のときに、件数を書き換えない)
+・WINDOW は JST の日付(TZ=JST-9 の date)。★ TZ=JST-9 を TZ=Asia/Tokyo へ置き換えない ★(この環境の Git Bash では Asia/Tokyo が認識されず、静かに UTC へ落ちて時刻が 9 時間ずれ、JST 午前 0 時〜9 時前には日付が前日になる場合がある。前日の窓を指すと、窓が一致せず条件が成立しない)。日付が替わる直前・直後に実行すると窓が一致せず成立しない(その場合は通常の手順で再開する)
+・全体の作成件数 global_created_count は戻さない(上限の意味を変えない)
+・項目は DELETE しない。global_denied_window_id も変えない
+・成立した後、続けて上の『通常の手順』の解除のコマンド(同じ SET_AT)を実行する(2 つ目)
+```
+
+#### 再開後の確認(再開後に必ず新規 Issue が作られるとは限らない)
+
+再開したことは、新規 Issue が作られたかではなく、
+次の順で確認する。
+
+```
+1 38.3 で github_issue_kill_switch = false(または項目に kill_switch の属性が無い)ことを確認する(再開の成否はこれだけで決まる)
+2 再開の直後に incident の signal が来ていない場合は、何も起きない(正常)。新規 Issue も、抑止の記録も、変わらない
+3 signal が来た場合の、正常な抑止の状態(いずれも『再開が失敗した』ではない):
+   上限値が未決定(null・読めない・不正な設定。出荷値は決定済み。38.7)   新規 Issue は作られない(OPEN の Issue へのコメントは続く)。fingerprint の行に LIMITS_UNDECIDED が残る
+   fingerprint 単位の抑止                        同じ発生 = SAME_OCCURRENCE / 最小間隔の内 = MIN_INTERVAL / その窓の fingerprint あたりの上限 = FINGERPRINT_LIMIT。
+                                                 この抑止は kill switch の再停止の入力にならない
+   全体の上限(同日中の再開)                     GLOBAL_LIMIT。上限を超えた試行として数えられ、しきい値に達すれば再び自動停止する(上記)
+   既存の OPEN の Issue がある                   新規ではなくコメントが追記される(新規 Issue は作られない)
+4 確認は fingerprint の行の github_issue_last_denied_reason / github_issue_last_denied_at / github_issue_suppressed_count と、
+  github_issue_last_created_at(38.3)で行う。起票の量産が再発していないか(新規 Issue の数・LINE の自動停止の通知)も見る
+5 異常: kill switch が再び true になった(kill_switch_set_at が新しい)/ global_denied_count が短時間で増え続ける。この場合は再開の前提
+  (上限値・窓・原因)が残っていた = 38.5 の先頭から原因を確認し直す
+```
+
+### 38.6 自動停止の通知が届かない場合
+
+```
+・LINE への通知は『確保 -> push -> 失敗なら解放』で 1 回だけ。push に失敗した場合は kill_switch_notified_at が消え、次の signal で再試行される
+・incident の signal が当面来ない場合は、通知も当面来ない(停止自体は有効)。定期的に 38.3 で確認できる
+・手動停止(MANUAL)は通知しない。通知が届かなかったのではない
+```
+
+### 38.7 上限値を変更する(配信が要る。AWS への直接の書込ではない)
+
+上限値は `config/incident_issue_limits.yaml`(ConfigLayer)にある。**実行中の Lambda の値は、新しい ConfigLayer の version を
+配信するまで変わらない**(即時には変えられない)。
+
+```
+項目                              意味
+new_issue_min_interval_minutes    同じ fingerprint で、前回の作成からこの分数が経つまで新規を作らない
+new_issue_limit_per_fingerprint   fingerprint あたり、1 窓(JST の日付)に作れる新規の最大件数
+new_issue_limit_global            全体で、1 窓に作れる新規の最大件数
+auto_stop_denied_threshold        全体の上限を超えた試行がこの回数に達したら自動停止
+```
+
+```
+1 値を決める(USER の決定。AI は値を決めない)
+2 config/incident_issue_limits.yaml を、null から正の整数へ変更する PR(コード / config の PR。独立 review・CI。merge の合図は管理者)
+3 反映前に手元で検証する(読取のみ。AWS に接続しない):
+
+   python -c "from jstock_advisor.domain.notification.incident_issue_limits import load_incident_issue_limits as l; print(l().missing())"
+
+   -> () が出れば、4 項目が全て決定済み。未決定の項目名が出れば、まだ新規 Issue は作られない
+4 新しい ConfigLayer の version の配信(ChangeSet の CREATE / EXECUTE は各別の USER の承認。34.1 と同じ)
+5 反映後に 38.3 で挙動を確認する
+```
+
+```
+・4 項目は全て正の整数。1 つでも 0 以下・小数・真偽値・文字列・未知のキーがあれば、ファイル全体が『未決定』に縮退する(安全側 = 新規 Issue を作らない)。
+  縮退は WARNING として CloudWatch Logs に残る(型だけ。値は出ない)
+・null のままの項目が 1 つでもあれば、その間は新規 Issue を作らない(OPEN の Issue へのコメントは続く)
+・窓は JST の日付。窓が替わると、件数は 0 から数え直す
+```
+
+### 38.8 してはいけないこと
+
+```
+・制御項目 __control__:github_issue を DELETE する(記録が失われる。false へ戻す)
+・IncidentStateTable を Scan する・TTL を設定する(制御項目が消える・全件走査になる)
+・USER の承認なしに、停止・再開・カウンタの書込を実行する
+・preflight を通さずに(対象の AWS アカウント・プロファイル・テーブルを確認せずに)コマンドを実行する
+・同日中の再開で、kill switch の解除をカウンタの初期化より先にする(解除の直後に再停止する)/ 停止状態・停止理由・
+  停止の特定・窓の条件を外してカウンタを書き換える
+・停止の理由が MANUAL・窓が古い・停止していないときにカウンタを初期化する(条件で成立しない設計。条件を外さない)
+・結果の識別子・fingerprint・時刻を公開面(Issue・PR・コメント)へそのまま貼る
+```
+
+### 38.9 この節が確認していないこと(未確認)
+
+```
+・観測用 role(jstock-observer)が <TablePrefix>-incident_state の GetItem を許可されているか(AWS に接続していない)
+・書込に使う資格情報と実施主体(本節は指定しない。実行の前に USER の承認とあわせて決める)
+・PowerShell での実行(本節のコマンドは bash 用。PowerShell 用の手順は持たない。未実行)
+・本節のコマンドの AWS に対する実行結果(いずれも AWS へは実行していない。PR #928 の反映前は、制御項目はまだ存在しない)
+・ローカルで検証したこと: bash の構文(bash -n)/ 引数の展開とクォート(aws を差し替えて、渡る引数を検査)/ AWS CLI の引数の検証
+  (到達しないエンドポイントへ向けて実行し、パラメータの検証は通って接続で失敗することを確認。AWS へは何も送っていない)。
+  検証していないこと: 条件式の成否・予約語の衝突・権限(DynamoDB が評価する。AWS への実行が要る)
+・preflight が確かめないこと(38.3): テーブルが IncidentStateTable であること・資格情報の権限
+・上限値の具体的な数値(USER の決定。本節は数値を決めない)
+```
+
+### 38.10 参考
+
+```
+・設計・実装: Issue #926 / PR #928。USER 判断 #122 issuecomment-6114810773 の【1】
+・直接の AWS 操作 = Human Gate の先例: 34.2
+・異常を知ったときの手順: 27節
+```
+
+## 39. owner の符号の鍵(Secret)の運用(Issue #925。#128 R1 の kv1。2026-10-14追加)
+
+### 39.1 対象
+
+```
+対象    owner の符号(owner_ref)を HMAC で作る鍵の Secret `AllocationShadowOwnerRefKeyV1`(infra/template.yaml)
+        と、その観測(MetricFilter 2 本・Alarm 2 本)
+作られ方 ChangeSet の EXECUTE で作られる(merge では何も作られない)。値は GenerateSecretString が作り、人は見ない
+読む者  BuyCandidatesFunction / BuyCandidateWorkerFunction の実行 role(GetSecretValue をこの Secret 1 つにだけ付与)
+影響    鍵が取れない日は、その日の Shadow の記録が『日単位の skip』になるだけ。買い判定・通知・本番の配分には影響しない
+```
+
+### 39.2 やってはいけないこと
+
+```
+1 論理 ID `AllocationShadowOwnerRefKeyV1` と Name(<stack 名>/allocation-shadow-owner-ref-key-v1)を変えない
+    → 変えると『置換』になり、新しい鍵が静かに作られる。過去の符号と結べなくなる(実質的な鍵の紛失)
+2 stack を削除・再作成しない(Secret は Retain で残るため、同名の再作成は失敗する)
+3 Secret の値を手で書き換えない(PutSecretValue / コンソールでの編集)。書き換えると過去の符号と結べなくなる
+4 Secret を手で削除しない(削除予約でも、取り戻すまで Shadow の記録は skip になる)
+5 鍵の版を上げたいとき(回転・紛失)は、新しい論理 ID `...V2` を別に追加する。V1 は残す(R1 では実装しない)
+```
+
+### 39.3 ChangeSet(CREATE)で確認する点
+
+```
+・Add = Secret 1 / MetricFilter 2 / Alarm 2。ResourcePolicy は Condition=false の間は作られない
+・Modify = BuyCandidatesFunction・BuyCandidateWorkerFunction(環境変数 1 つ追加)と、その実行 role(Statement 1 つ追加)
+・Remove と Replacement=True が 1 件も無い(1 件でもあれば EXECUTE しない)
+・実行 role のインライン policy が 10,240 バイトの上限に収まる(超えると ChangeSet の EXECUTE が失敗する)
+・Secret の Name が <stack 名>/allocation-shadow-owner-ref-key-v1 である
+```
+
+### 39.4 観測(Alarm)と、BuyCandidateWorkerFunction の log group
+
+```
+設定の不備(1 時間に 1 件以上)  = 鍵の取得が未設定・権限なし・Secret なしで失敗した(デプロイ・権限・資源の不備)
+異常(1 日に 3 件以上)          = タイムアウト・形式不正・その他(一時的な障害・値の不正)
+理由コード → 系統の対応は、実装(殻)が持つ。template は固定の印(ALLOCATION_SHADOW_KEY_UNAVAILABLE_CONFIG /
+..._ANOMALY)を数えるだけ
+
+★ MetricFilter は BuyCandidatesFunction の log group だけに付けてある ★。BuyCandidateWorkerFunction の log group は、
+fan-out(BuyCandidateSqsDispatchEnabled=true)が無効の間は一度も動かないため存在せず、MetricFilter を付けると
+ChangeSet の EXECUTE が失敗する(2026-10-14 に describe-log-groups で確認)。
+fan-out を有効にする前に、Worker の log group へ同じ MetricFilter 2 本を足す変更を、別の PR・ChangeSet で入れること
+(足さないと、fan-out の有効化後は Worker 側で鍵が取れなかった日を Alarm が検知しない)
+```
+
+### 39.5 リソースポリシー(第二の防壁)
+
+```
+Condition `SecretResourcePolicyIsEnabled`(= SecretResourcePolicyEnabled=true)に相乗りする。既定では作られない。
+有効化は 35 節の前提(AdminPrincipalArn / DeployPrincipalArn の実値・事前確認)と、別の USER 承認を要する。
+許可する principal = Admin / Deploy / 上記の実行 role 2 本。観測用 profile・CLI・開発者の role は入らない
+```
+
+### 39.6 鍵が取れなかった日の理由コードと対処
+
+```
+ログの印(1 回の失敗につき 1 行。値・ARN は出ない): `ALLOCATION_SHADOW_KEY_UNAVAILABLE_CONFIG reason=<コード>` / `..._ANOMALY reason=<コード>`
+Shadow の記録 = その日は『日単位の skip』になるだけ。買い判定・通知・本番の配分には影響しない
+★ 1 回の失敗で、その日の Shadow は記録 0 件になる ★(再試行をせず、最初の失敗で打ち切るため。翌日は正常に戻り得る)。
+  Alarm が 1 件鳴っても『継続障害』とは限らない。続くかは翌日の記録の有無で見る
+
+設定の不備(Alarm = 1 時間に 1 件以上)
+  NOT_CONFIGURED  環境変数の ARN が未設定・空・形が不正(template の不備。template は Secret の ARN を必ず渡す)
+                  -> 反映した template の環境変数を確認する(Secret の ARN の形か)
+  ACCESS_DENIED   実行 role に GetSecretValue が無い・復号できない・資格情報がない
+                  -> 実行 role の Statement `OwnerRefKeyReadOnly` が反映されているか。リソースポリシーを有効にした場合は許可 principal の一覧
+  NOT_FOUND       Secret が無い・削除予約
+                  -> Secret を手で消していないか。削除予約なら復元する(論理 ID・Name は変えない)
+異常(Alarm = 1 日に 3 件以上)
+  TIMEOUT         Secrets Manager への接続・読取が 2 秒 / 3 秒を超えた(再試行はしない。翌日以降の実行で再取得)
+  MALFORMED       値が仕様に合わない(ちょうど {key_version, key}・版 1〜999・英数字 64 文字以上)
+                  -> ★ Secret の値を手で書き換えていないか ★(39.2 の 3)。別の Secret を指していないか
+                  手で入れ替える場合の条件: キーはちょうど 2 つ({"key_version": 整数, "key": 文字列})・
+                  key は英数字だけで 64 文字以上(記号を混ぜると MALFORMED になる = 意図した fail-closed)
+  ERROR           上記以外(throttling・接続不能・想定外)。件数が続くときだけ調査する
+```
+
+### 39.7 この節が決めていないこと
+
+```
+・鍵の回転・紛失時の運用(R1 では実装しない。V2 を別の論理 ID で足す方針のみ)
+・Alarm の通知先の変更(既存の IncidentNotificationTopic。通知の経路は 27 節)
+・Shadow の記録の読み方(CLI の節)
+```
+
+## 40. 資金配分 Shadow の結果を見る CLI(`jstock allocation today`)の使い方(Issue #605、2026-10-14追加)
+
+資金配分 Shadow(試験計算。出荷設定は有効〔SHADOW。R1〕。本番へ届くのはリリースの後)の記録を、**読むだけ**で表示するコマンド。本節の手順は、
+Shadow が有効化され(別の USER 承認)、記録が書かれた後にだけ意味を持つ。**投資判断には使わない。LINE へは送られない。**
+
+### 40.1 実行前に知っておくこと
+
+```
+・読取専用: GetItem だけ(索引 1 + 日単位の skip 1 + 索引が載せた所有者ごとに 1。最大 18 回)。書込・Scan・通知・再計算をしない
+・--backend は必須(既定なし)。環境変数からは選ばない。local = 開発・試験用 / dynamodb = 本番
+・--backend dynamodb は --aws-region と --confirm-table(AuditLog の表名。既定は jstock-audit_log。完全一致)が揃わなければ 1 件も読まない
+・★ 本番の記録を実際に読む実行は、USER の許可と読取計画(呼び出し = GetItem のみ・回数・中止条件)が先に要る ★(AWS の読取)。資格情報は観測用の読取専用 profile で足りる(--aws-profile)
+・Windows では Git Bash か WSL で実行する(PowerShell での実行は未確認)
+```
+
+### 40.2 コマンド
+
+```bash
+# 開発・試験(ローカルの記録)
+jstock allocation today --backend local --date 2026-10-14
+
+# 本番(読取専用 profile。USER の許可の後)。REPLACE_ の値は実際の値へ置き換える
+jstock allocation today --backend dynamodb --aws-region ap-northeast-1 \
+  --confirm-table jstock-audit_log --aws-profile REPLACE_WITH_OBSERVER_PROFILE --date 2026-10-14
+
+# JSON(共有に向く。既定では表示名を含めない)
+jstock allocation today --backend dynamodb --aws-region ap-northeast-1 \
+  --confirm-table jstock-audit_log --format json
+```
+
+```
+--date を省略すると、直近の営業日(JST。今日が営業日なら今日)。記録は『バッチの完了後』に書かれるので、今日の記録がまだ無ければ『索引がありません』と表示する(前日へ黙って遡らない)
+終了コード   0 = すべて揃っている / 1 = 読取の失敗(固定の文言。値・表名を出さない)/ 2 = 指定の誤り / 3 = 読めたが不完全(下の状態)
+             ★ 1 には『client の生成の失敗』も含む(存在しない・壊れた `--aws-profile`、設定ファイルの不正。Issue #958)。文言は同じ固定の 1 行で、原因の文面・profile 名・パスは出さない。原因を確かめるには、指定した profile 名が `aws configure list-profiles` に在ること、設定ファイルが読めることを確かめる ★
+```
+
+### 40.3 画面の『状況』の読み方(黙って 0 件にしない)
+
+```
+すべての所有者の記録があります                      正常(終了コード 0)。★ 索引の件数が互いに整合し〔試行 = 記録 + 未記録、記録 = 載せた符号の数〕、すべての記録が読めた場合だけ ★。件数が矛盾する索引・記録が欠けた符号・解釈できない値がある日は、この見出しを出さない(終了コード 3)
+記録できなかった所有者があります                    予算切れ・書込の失敗など。理由別の件数が出る。再実行で後から追加された記録は先着の索引に載らない(既知の限界)
+Shadow は動きましたが、記録は 0 件です              索引はあるが記録が 0 件。理由別の件数を見る
+Shadow は動きましたが、その日は記録できませんでした   索引なし + 日単位の skip あり。『日単位の skip』の行の理由を見る: KEY_UNAVAILABLE = 鍵の取得に失敗(続けて鍵の理由 NOT_CONFIGURED / ACCESS_DENIED / NOT_FOUND / TIMEOUT / MALFORMED / ERROR と記録できなかった所有者の数。鍵の Secret・IAM・環境変数を運用で確認する。kv1 の殻の手順)/ HOLDINGS_READ_FAILED・RECOMMENDATIONS_READ_FAILED = 入力の読取の失敗 / INPUT_LIMIT_EXCEEDED = 入力の件数の超過 / COEFFICIENTS_UNAVAILABLE = RAER の係数が読めない / TIME_LIMIT = 入力の読取の途中で期限が切れた / COMPUTATION_FAILED = 入力の準備で想定外の例外(入力の失敗の日は、所有者が分からないので件数を持たない)
+その日の索引がありません                           Shadow が未実行、または記録の途中で止まった可能性。記録がある可能性を否定できない。待つか、原因を調べる
+対応していない記録の版、または読めない索引です       schema_version を表示する。CLI の更新が要る可能性
+```
+
+### 40.3a 読めない 10 進数の欄(買付余力・評価額・配分額・不足額・RAER 値。Issue #989)
+
+```
+扱い      金額・RAER 値の欄に『10 進数として読めない値』が入っていた場合、その値は画面へ出さず『不明』と表示し、解釈できなかった項目として数える(従来は、読めない文字列と NaN / Infinity をそのまま出していた)
+          読めない値 = 10 進数として読めない文字列 / NaN・Infinity の文字列 / nan・inf の数値 / 文字列でも数値でもない値(辞書・配列・真偽値)
+内訳      その所有者の下に『読めない 10 進数の欄 N 件(場所・種別のみ。値は出しません)』と、場所(例: cash.available_cash / candidates[0].allocation.amount)・種別・文字列の長さを出す(10 件まで。残りは JSON)
+          --format json は、該当があるときだけ owner の下に `unreadable`(場所・種別・長さの配列)を付ける(無い日の出力は従来と同じ)
+影響      解釈できなかった項目が 1 件でもある日は『揃っている』とは扱わず(終了コード 3)、allocation summary では『数えない日』(理由 = 解釈できない項目)になる。★ 書き手の不具合で 1 欄でも読めない値が入ると、R1 の営業日の数えが進まなくなる。そのときは内訳の場所で原因の欄が分かる ★
+範囲外    整数の欄(件数・順位・株数。読めない値は省略される)は対象外(別 Issue の候補)
+```
+
+### 40.4 所有者の表示名(ローカルのラベル)
+
+```
+画面の所有者は『owner-』+ 符号の先頭 6 桁。見分けたいときは、利用者の端末にだけ表示名を持てる:
+  jstock allocation label set --ref <符号の先頭 6〜24 桁、または kv1.N:… の符号> --name <表示名(40 文字まで)>
+  jstock allocation label list / jstock allocation label remove --ref …
+ファイル   home 配下の .jstock/allocation_owner_labels.json(リポジトリ配下は拒否。Git 管理外)。AWS・鍵・記録に触れない
+★ これは『符号と実名の対応表』= 機密 ★: 共有しない。表の画面には表示名が含まれる(末尾に注意が出る)ので、共有するなら --format json(既定は表示名を含めない)を使う
+Windows のファイルの権限(ACL)は確認が難しいため、利用者のアカウントの home 配下に置くことを前提とする
+```
+
+### 40.5 してはいけないこと
+
+```
+・--backend dynamodb で、USER の許可と読取計画なしに本番の記録を読む
+・結果(符号・金額・所有者の表示名)を、Issue・PR・コメントなど公開面へそのまま貼る(DISCLOSURE = PUBLIC_SANITIZED。必要なら件数・状態だけを書く)
+・表示名のファイルを共有・コミットする
+・本コマンドの出力を投資判断・LINE の通知に使う(試験運用)
+```
+
+### 40.6 この節が確認していないこと(未確認)
+
+```
+・本番の AuditLog に、観測用の読取専用 profile が GetItem を許可されているか(AWS に接続していない)
+・実際の記録に対する表示(本番にはまだ記録が無い。実装・試験は moto と合成データだけ)
+・PowerShell での実行 / Windows の ACL
+```
+
+・設計・実装: Issue #605(設計 rev2〜rev2d)/ #925(符号 kv1・索引)/ #603(記録の形)/ #606(接続 gate)
+
+### 40.7 観測の集計(`jstock allocation summary`。Issue #934 BT-A PR-2、2026-10-15追加)
+
+期間(営業日)の記録をまとめて読み、**10 営業日の観測結果**を表示する読取専用の副コマンド。`today` と同じ入口の作法(40.1)で、
+**本番の記録を実際に読む実行は、USER の許可と読取計画が先に要る**(呼び出し = GetItem のみ・回数・中止条件・件数のみの出力。#188 へ記録する)。
+
+```
+jstock allocation summary --backend local --from 2026-10-15 --to 2026-10-28 [--target-days 10] [--format table|json] [--by-owner]
+jstock allocation summary --backend dynamodb --aws-region ap-northeast-1 --confirm-table jstock-audit_log   --aws-profile REPLACE_WITH_OBSERVER_PROFILE --from 2026-10-15 --to 2026-10-28
+```
+
+```
+読むのは期間の営業日だけ(BusinessCalendar。休日・週末は読まない)。上限は営業日 60 日(超えたら 1 件も読まずに拒否)。GetItem は 1 日あたり約 3〜5 回(索引 1 + skip 1 + 所有者ごとに 1)
+終了コード  0 = 目標の日数に達した / 1 = 読取の失敗が 1 日以上(失敗した日は『数えない日』に理由つきで出る。他の日は読む)/ 2 = 指定の誤り / 3 = 読めたが目標に未達。★ 0 は『目標に達した』であり『記録が揃っている』ではない ★
+             ★ 1 には『client の生成の失敗』も含む(Issue #958。存在しない・壊れた `--aws-profile`、設定ファイルの不正)。この場合は **1 日も読まず、レポートを作らない**ため、『数えない日』の理由は出ない。見分け方: `backend=` の行の後に、固定の 1 行〔`読取に失敗しました: …`〕だけが出て、集計の表が出ない。確かめること: 指定した profile 名が `aws configure list-profiles` に在るか、設定ファイルが読めるか(40.2 と同じ)★
+数える日    利用者が承認した暫定ルール(#128 …6165459615 の 2 節。レポートに出所を 1 行出す)。計算できた所有者が 1 人以上 / PARTIAL は欠落件数と母数を必ず出す / 数えない日は理由別に出す
+母数        各指標の隣に母数を出す。母数が 0 は『測れない』(0% とは書かない)。『10 営業日で判断可能』の基準は USER 未承認 = 判定は付けず、件数と母数だけを出す
+版          モデル・方針・契約・モードが変わった日で期間を分け、期間ごとに指標を出す(版をまたいで合算しない)
+--by-owner  所有者別の表(短い表示名のみ)。★ 手元で読むだけ。Issue・PR・コメントへ貼らない(公開面)★。既定では出さない
+測れないもの  構成要素の寄与度 / 閾値の近傍(config の突合が要る = 別 PR)/ 記録の再計算の一致率(gate が到達を禁じている)/ 閾値・係数の妥当性 / 事後の値動き(USER 判断)。理由つきで一覧に出る
+```
+
+★ 本コマンドの出力は、投資判断・LINE の通知に使わない。結果を公開面へ書くときは、件数・状態・日付だけ(DISCLOSURE = PUBLIC_SANITIZED)。
+・設計・実装: Issue #934(設計 rev2・rev3・PR-2 差分 = …6169731888)/ PR-1 = #961
+
+### 40.8 候補ごとの詳細(`jstock allocation detail`。Issue #605 追加 CLI、2026-10-15追加)
+
+`today` と同じ記録(索引・日単位の skip・所有者ごとの項目つきの記録)を**同じ読取(GetItem のみ・最大 18 回)**で読み、候補ごとの内訳を表示する。
+入口の作法は 40.1 と同じ(backend は明示・dynamodb は region と表名の完全一致・**本番の記録を実際に読む実行は USER の許可と読取計画が先に要る**)。
+
+```
+jstock allocation detail --backend local --date 2026-10-15 [--owner 先頭6〜24桁] [--stock 銘柄コード] [--decision all|allocated|not-allocated] [--reason 理由コード] [--format table|json] [--with-labels]
+jstock allocation detail --backend dynamodb --aws-region ap-northeast-1 --confirm-table jstock-audit_log --aws-profile REPLACE_WITH_OBSERVER_PROFILE --date 2026-10-15
+```
+
+```
+出すもの    候補ごとの 属性(価格帯・適正価格の確信度・質の帯・業種・high-risk)/ 価格(現在値・価格日・鮮度の判定)/ RAER の入力 13 項目 / RAER の出力(適用・未適用の軸・リスクフラグ・理由コード)/ 寄与度(記録のまま)/ 配分の判断
+            値は記録のまま。計算し直し・補完・丸め・合計の作成をしない。★ 解釈できなかった値は表示せず『不明』と数える(未知のキー・形の合わない値・自由な文章は出ない)★
+絞り込み    --owner / --stock / --decision / --reason は表示だけ(読取の回数・順序は変わらない)。--reason は閉じた理由コードの表の語だけ。未知の語は終了コード 2(使える語の一覧を出す)
+            該当なしは『該当する候補がありません(絞り込み: …)』(『0 件』とは書かない)
+--date      省略 = 直近の営業日。★ 営業日でない日を指定すると、読まずに終了コード 2(GetItem 0 回)★(today は読んで『索引なし』を出す)
+終了コード  today と同じ(0 = 揃っている / 1 = 読取の失敗 / 2 = 指定の誤り / 3 = 読めたが不完全)
+追加の項目  保有評価額・方針の値(記録の policy の節の値だけ。config は読まない)・経過時間と読取の状態も出す(USER の回答 #605 …6190430543)。訂正されたら定数 1 つで切り替える
+```
+
+★ 出力は利用者の端末だけで確認する(Issue・PR・コメントなどの公開面へ貼らない。銘柄・金額・所有者の表示名を含みうる)。Shadow の試験結果であり実際の投資判断ではない(表の末尾と JSON の `notices` の両方に 2 つの注意を出す)。投資判断・LINE の通知に使わない。
+★ 記録の値だけを表示する(USER の指示 #122 …6195577047): `today` の導出値 2 つ(残余資金の目安・配分しなかった候補の必要資金)は詳細では出さない。
+・設計・実装: Issue #605(追加 CLI 設計 rev1〜rev3)/ 閉包: 記録の module(allocation_shadow_record・shadow_compute)・方針の config(allocation_policy_config)を import しない(#606 の CLI の根に免除は無い)
+
+
+## 41. 購入側 Shadow(資金配分の試験計算)の本番バッチへの配線(Issue #603 PR-F2-2b、2026-10-14追加)
+
+買い候補バッチの finalize が完了した後に、資金配分の試験計算(Shadow)を実行して記録を残す配線。**出荷設定は有効(SHADOW。R1 = Issue #128。USER の別承認 G0)**で、
+この節の手順は、その設定が本番へ反映された(ChangeSet の CREATE・EXECUTE は各別の USER 承認)後に意味を持つ。**投資判断・通知には使わない。LINE へは送らない。**
+
+### 41.1 何が書かれるか(AuditLog。いずれも先着の条件付き書込)
+
+```
+日単位の索引        allocation_shadow_index:{業務日}        実際に記録が存在する所有者の符号(最大 16)と、書けなかった所有者の件数・理由別の件数
+所有者ごとの記録    allocation_shadow_items:{業務日}:{符号}  計算した結果(候補・RAER・配分・理由)。符号は鍵つき(kv1)だけ。実名・保有 ID は記録しない
+所有者ごとの枠      allocation_shadow:{batch}:{符号} / allocation_shadow_skip:{batch}:{符号}
+日単位の skip       allocation_shadow_day_skip:{業務日}      所有者の記録を 1 件も書けない日。理由コードだけ(下)
+読み方              jstock allocation today(40 節)。索引が無い日・skip の日・一部未記録の日を、『0 件』と言わずに区別して表示する
+```
+
+### 41.2 日単位の skip の理由(所有者の記録が 1 件も書けない日)
+
+```
+KEY_UNAVAILABLE               鍵が取れない(続けて鍵の理由 6 種 + 記録できなかった所有者の数)。★ 鍵が取れなければ、符号を作らず記録しない(固定の符号へ倒さない)★
+HOLDINGS_READ_FAILED          保有の読取に失敗
+RECOMMENDATIONS_READ_FAILED   推奨の一括取得に失敗
+INPUT_LIMIT_EXCEEDED          候補 ∪ 保有の銘柄数が上限を超えた(読まない)
+COEFFICIENTS_UNAVAILABLE      RAER の係数が読めない
+TIME_LIMIT                    入力の読取の途中で期限が切れた
+COMPUTATION_FAILED            入力の準備で想定外の例外
+TIME_BUDGET                   Lambda の残り時間が足りない・不明
+```
+
+### 41.3 買い判定・通知への影響
+
+```
+・Shadow の失敗(鍵・読取・計算・書込・索引のどれも)は、買い判定・通知・完了処理へ伝播しない(例外・無限待ち・AccessDenied を含む)
+・鍵の取得失敗は、Shadow だけの『記録しない』として扱い、ログに理由コードだけを出す(値・ARN を出さない)。再試行しない(その日の記録は 0 件)。翌日は正常に戻り得る
+・Shadow の出力(記録・戻り値)は、買い判定・通知の入力に入らない(契約テストで固定)
+・設定が OFF のとき、repository・鍵の provider は生成も呼び出しもされない
+```
+
+### 41.4 Shadow を ON にする前に(USER の承認事項。この節は承認ではない)
+
+```
+・リリース SHA の固定・ChangeSet の CREATE と EXECUTE(別の承認)・Secrets の作成・IAM の追加・Shadow の有効化 = USER が実際のリリース時に確認して承認する
+・LINE への接続は禁止のまま
+・有効化の後の確認: 39 節の鍵の運用、40 節の CLI で、当日の索引または日単位の skip が存在すること(どちらも無い日は、Shadow が動いていない可能性)
+```
+
+### 41.5 この節が確認していないこと(未確認)
+
+```
+・本番の AuditLog・Secrets Manager・IAM での実際の動作(AWS に接続していない。実装・試験は moto と合成データだけ)
+・再実行(同じ日の 2 回目)で追加された所有者の記録は、先着の索引に載らない(既知の限界。CLI は未記録として数える)
+```
+
+・設計・実装: Issue #603(設計 rev5・rev6。設計レビュー PASS)/ #925(符号 kv1)/ #605(CLI)/ #606(接続 gate)
+
+
+## 42. 資金入替の観測 P(Issue #604 P-b4。#128 R2。2026-10-16追加)
+
+### 42.1 これは何か・出荷の状態
+
+資金入替の観測 P は、保有バッチ(営業日 08:00 JST)の完了後に、各保有が『入替元になれるか』を数え、AuditLog へ
+**日の集計を 1 件 / 日**残す Lambda である。読取専用の観測で、判定・通知・売却・購入・表示・LINE のどこにも接続しない。
+記録は件数と状態だけ(所有者・保有 ID・銘柄コード・数量・金額・Recommendation ID を持たない)。
+
+★ **出荷は『何も動かない』状態**(USER 決定 #604 …6195577714): ①Scheduler の State = `DISABLED`(Parameter
+`RotationObservationScheduleState` の既定)②mode = `OFF`(`config/rotation_observation.yaml`。引用符つきの `"OFF"`)。
+どちらも 1 つだけでは動かない(二重の gate)。有効化は 42.4。
+
+### 42.2 追加される資源と権限(template。契約テスト `test_infra_issue_604_rotation_observation.py` が完全一致で固定)
+
+```
+Function 1     RotationObservationFunction(Timeout 60 秒・メモリ 512 MB・同時実行 1・非同期の再試行 0・DLQ なし・P 固有の環境変数 0 件)
+Schedule 2     平日 JST 08:15・08:30・08:45 と 09:00(祝日は runner が何もしない)。最後の回 09:00 は BatchRuns の TTL の上限 13:00 JST の内側
+IAM Role 1     RotationObservationSchedulerRole(★ この stack で初めての明示の RoleArn ★。信頼 = scheduler.amazonaws.com だけ・権限 = P の関数 1 つへの Invoke だけ)
+               + 関数の実行 Role(SAM が生成。下の 5 つの権限だけ)
+Alarm 1        RotationObservationFunctionErrorsAlarm(Errors・Sum・900 秒・閾値 1・TreatMissingData = notBreaching・既存の通知 Topic)
+Parameter 1    RotationObservationScheduleState(既定 DISABLED・ENABLED / DISABLED だけ)
+```
+
+関数の権限(これだけ。UpdateItem・DeleteItem・BatchWriteItem・TransactWriteItems・SQS・他の Lambda の Invoke・Secrets Manager・LINE・
+他の表・ワイルドカードの Resource は付けない): BatchRuns への GetItem / Recommendations への BatchGetItem / HoldingEvaluationRecords の
+GSI(holding_id-index)だけへの Query / ★ HoldingsTableV2 の 1 表だけへの Scan(恒久。条件 = 200 件 / 3 ページ / 時間の上限・部分結果で判断しない)★ /
+AuditLog への PutItem(条件付き・先勝ち)。
+
+### 42.3 ChangeSet の想定差分(CREATE の想定。EXECUTE しない限り反映されない)
+
+```
+追加   Function 1(P)・IAM Role(P の関数の実行用 + 起動用)2・Schedule 2(★ State = DISABLED ★)・Errors Alarm 1・Parameter 1
+       ・ConfigLayer の新しい LayerVersion 1(P の mode の設定ファイルを含むため)
+変更   ★ 既存 15 関数の Modify = 想定内。理由は Layers(ConfigLayer の LayerVersion の差し替え)。src の変更を含むリリースでは Code(共有 artifact の key)も ★(15 行)
+       ★ リリース①との違い: リリース①の 15 行の Modify の理由は Code だけ。本件は Layers(+ src の変更があれば Code)★(2 つの ChangeSet を並べて読むときに取り違えない)
+       間接の Modify(GetAtt の再評価。リリース①と同形): Scheduler の Role 11・Schedule 11・SNS Subscription 1・API Gateway 1
+IAM    Role 26 → 28(増分は P の Role だけ)。HoldingsTableV2 の 1 表に限定した Scan(P の Role のみ)。既存の BUY / SELL の Role への権限の追加 = 0・他の表への Scan = 0
+削除   旧い ConfigLayer の LayerVersion(RetentionPolicy が Delete のため 1 件。ChangeSet で確認)
+```
+
+★ **差分の原因の切り分け**(2 つの PR の差分が 1 つの ChangeSet に重なる。原因を取り違えない)★:
+・P の資源の追加(Function・Role 2・Schedule 2・Alarm・Parameter)= **A2(infra/template.yaml)の差分**。既存の resource の定義は書き換えていない(追加のみ)
+・既存 15 関数の Layers の Modify・ConfigLayer の LayerVersion の差し替え = A2 の template の変更ではなく、**A1 が `config/rotation_observation.yaml` を足したこと**による
+  (ConfigLayer は `config/` のディレクトリ全体を ContentUri に取るため、設定ファイルを 1 つ足すだけで LayerVersion が置き換わり、全関数の Layers が変わる)
+・既存 15 関数の Code の Modify(src を含むリリースのとき)= F5・A1 ほか、そのリリースに含まれる src の変更による(共有 artifact の key が変わる)
+
+★ **想定外(1 件でもあれば EXECUTE しない)**:
+・既存 Function の Layers・Code 以外のプロパティの変更(Environment・Role・Policy・Handler・Timeout・MemorySize・Events 等)
+・Table の Delete・Replacement / Topic policy の変更 / 既存 Role・Policy の変更
+・P の Schedule が ENABLED で作られる / P 以外の Scheduler の State の変更
+・P の関数に環境変数が付く(P 固有の環境変数は 0 件)/ P の Role に上の 5 つの権限以外が付く
+
+読み方: 既存関数の Modify の行は 15 行出る。変更の理由が Layers(と、src を含むリリースでは Code)だけであることを 1 行ずつ確認する(件数 15 を突き合わせる)。Add の Function は 1 件・Schedule は 2 件で、
+どちらの State も DISABLED のこと。EXECUTE 後も Schedule は DISABLED のまま(何も起動しない)。
+★ ChangeSet の CREATE 後・EXECUTE 前に、予約同時実行の合計を確認する ★: P は ReservedConcurrentExecutions = 1 を持つ。既存の関数の予約値(Parameter の
+`*ReservedConcurrentExecutions`・既存の固定値)の合計 + 1 が、アカウントの『予約に使えない最小値(未予約の下限)』を割らないこと。割ると CREATE / EXECUTE が失敗しうる
+(失敗しても CloudFormation が自動 rollback するが、事前に気づく)。確認は AWS 読取を伴うため、実行は `DEVELOPER_WITH_DEPLOY` の手順の中で行う(#188 の手順外の AWS 読取はしない)。
+CREATE と EXECUTE は別の Human Gate で、承認は exact ChangeSet ARN に対してだけ有効(各回 SHA 固定 → CREATE → 差分確認 → EXECUTE)。
+**本節は deploy の承認ではない**(deploy の実作業は `DEVELOPER_WITH_DEPLOY`。担当の確認は CLAUDE.md §4)。
+
+### 42.4 有効化(★ 別の ChangeSet・別の USER 承認。本節の A2 には含まれない ★)
+
+有効化(P-b4 の B)は、次の 2 つを**別々の Human Gate**として行う: ①mode を `"SHADOW"` にした設定を含む ChangeSet(R1 の購入側 Shadow の観測の
+邪魔をしない営業日の境界で開始)②Parameter `RotationObservationScheduleState` を `ENABLED` にする ChangeSet。どちらか片方だけでは動かない。
+有効化の前に、P の資源が DISABLED / OFF のまま存在し、既存の BUY / SELL・保有バッチ(08:00)が不変であることを本番確認する(本節の範囲外)。
+
+### 42.5 止め方・戻し方
+
+・止める: Parameter を `DISABLED` に戻す(Scheduler が起動しない)/ mode を `"OFF"` に戻して再 deploy(起動しても何もしない)
+・戻す: P の資源を削除する ChangeSet(BUY / SELL・保有のバッチ・データには影響しない。書いた記録は読まれないだけで害は無い。1 日 1 件・約 0.5〜1 KB)
+・失敗の見え方: runner が記録に失敗すると Lambda が失敗し、Errors Alarm が既存の通知 Topic へ届く。一時的な状態(保有バッチが未完了)は次の回が再評価し、
+  最後の回(09:00)でも読めなければ gap の記録が 1 件残る(観測が黙って消えない)
+・★ 通知の本文での名称(Issue #1003。USER 確定 #122 …6214116489)★: Errors Alarm が鳴ると、LINE の異常通知は「対象: 資金入替の観測」、GitHub の異常 Issue は題名「…資金入替の観測で異常を検知しました」・本文「対象: 資金入替の観測」と出る(以前は汎用の「その他の処理」)。Alarm の発火条件・重要度・通知先は変わらない
+
+### 42.6 この節が確認していないこと(未確認)
+
+・SAM の transform 結果(ローカルにも CI にも template の検証は無い。ScheduleV2 の `RoleArn`・`State` が受理されることは SAM の公式仕様だが、実際の受理は ChangeSet の CREATE で確認する)
+・Timeout 60 秒の妥当性(総予算 50 秒 ≦ 54 秒は契約テストで固定済み。実測は稼働後に再確認する)
+・本番の AWS 上の実際の動作・月額コスト(概算は月 1 ドル未満の桁。実測は稼働後)
+・設計・実装: Issue #604(P-b4 統合文書 …6188895158・USER 決定 …6195577714)/ #606(接続 gate の記録 = 37.5)
+
+## 43. replay の集計コマンド `jstock replay`(Issue #880 R1b PR-1。2026-10-19追加)
+
+### 43.1 これは何か
+
+・過去の売却判断を OLD(現行)と NEW(新しい判断)で見比べる**集計の表**を、手元のファイルだけから作る(`jstock replay run`)。事前登録の本体と引用が一致するかだけを調べる `jstock replay check-prereg` もある
+・★ ローカル専用 ★: AWS・ネットワーク・時計に触れない。`AWS_LAMBDA_FUNCTION_NAME` が空でない値で設定されていたら、どちらのコマンドも終了コード 2 で拒否する(#923 と同じ型。ファイルを読む前)
+・★ 判断(OLD / NEW)は再計算しない ★: 入力のファイルの判断を集計する。値(窓・起点・最小セル数・税と手数料・一致率・症例の指定・入力の上限・丸めの桁)は事前登録の本体だけから読む(引数・環境変数では渡せない)
+・Production の AWS・DynamoDB・Lambda・通知・保存には何も加えない(src の変更は `cli/replay.py`・`services/replay_*.py` の新設と `cli/main.py` の登録 2 行。deploy で配られる Lambda には入らない)
+
+### 43.2 使い方と終了コード
+
+```
+jstock replay run --prereg P.json --cite C.json --observations O.jsonl --pairs R.jsonl --prices X.jsonl [--out FILE]
+jstock replay check-prereg --prereg P.json --cite C.json
+```
+
+・出力は画面の表。`--out` は**存在しない path のみ**(既に在れば上書きせず終了コード 1)。JSON は出さない。画面とファイルの両方の末尾に、注意書き 2 文を付ける
+・表は 9 つの節。識別子・個別の価格・数量は出さない。最小セル数未満のセルは件数のみ
+・終了コード: 0 = 出力した / 1 = ファイルの読取・書込の失敗 / 2 = 指定の誤り(Lambda の拒否を含む)/ 3 = 事前登録の照合が不一致(第 1〜8 節は出さず、第 9 節の照合の結果だけを出す。データのファイルは読まない)/ 4 = 入力のファイルの形が契約に反する(値は出さず、固定の文言だけを出す)
+・手元の入力は公開面へ貼らない(表の注意書きにも同じ旨がある)
+
+### 43.3 この節が確認していないこと(未確認)
+
+・AWS の実データの読取・R2 の実行・本番の投資判断への接続(いずれも USER の別の承認。本節の対象外)
+・読取の facade(`infrastructure/aws/replay_source_reader.py`。PR-2)は ★ 未配線 ★(どこからも import されず、boto3 を import せず、client を作らない)。実データの読取・R2・client の生成と配線は別の承認(R2-prep)。`ReplayReadFailure` を広く捕まえて続行してはならない(捕まえる場合は種別を人へ伝えて停止する)
+・設計・実装: Issue #880(R1b の表示の確定 = #122 …6258191583)

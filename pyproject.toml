@@ -1,0 +1,129 @@
+[project]
+name = "jstock-advisor"
+version = "0.1.0"
+description = "日本株 長期・高配当・株主優待重視の売買支援システム"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    # 運用ハードニング8節: 検証済みバージョン範囲に上限を設定する(2026-08時点の
+    # .venv実測値を基準)。実際のLambda成果物を決めるのは`infra/layer/requirements.txt`
+    # (deploy時はそちらを参照)。ここは開発時のインストール範囲。
+    "pydantic>=2.13,<3.0",
+    "pyyaml>=6.0,<7.0",
+    "typer>=0.27,<1.0",
+    "python-dateutil>=2.9,<3.0",
+    "jpholiday>=1.0,<2.0",
+    "python-dotenv>=1.2,<2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "ruff>=0.6",
+    "mypy>=1.10",
+    "types-PyYAML",
+    "types-python-dateutil",
+    "freezegun>=1.5",
+]
+aws = [
+    "boto3>=1.43,<2.0",
+    # 振り返り機能改修: GitHub App JWT認証(週次改善レビューのGitHub Issue連携)に使用。
+    "PyJWT>=2.10,<3.0",
+]
+aws-dev = [
+    "boto3-stubs[dynamodb]>=1.43,<2.0",
+    "moto[dynamodb]>=5.0,<6.0",
+]
+realdata = [
+    # 非公式ライブラリのため最も破壊的変更が起きやすい。範囲を最も狭くする(運用ハードニング8節)。
+    "yfinance>=1.5.2,<1.6.0",
+    # 候補ユニバース本格対応(2026-08): JPX上場銘柄一覧(.xls、旧形式Excelバイナリ)の
+    # パースに使う。**xlrdは.xlsx を読めない**ため、.xlsx側はopenpyxlが担当する
+    # (下記。pandasは既存依存に含めない方針のため使わない)。
+    "xlrd>=2.0,<3.0",
+    # Issue #223 PR-2(2026-09): JPXが2026-09-03にdata_j.xls -> data_j.xlsxへ
+    # 差し替えたため.xlsx側の読み出しに必要。xlrdは残して両対応にする
+    # (どちらで開くかは拡張子ではなく先頭バイトで判別する)。
+    "openpyxl>=3.1,<4.0",
+]
+
+[project.scripts]
+jstock = "jstock_advisor.cli.main:app"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+# Issue #277: cohort marker。cohort は tests/support/time_semantics_registry.py の
+# _REGISTRY が正本であり、ここは pytest へ登録するだけである。
+# 付与は tests/conftest.py が registry から自動で行う(手で書く場所を作らない)。
+# ここと registry の食い違いは tests/unit/test_issue_277_cohort_markers.py が検出する。
+markers = [
+  "cohort_holding_decision_runtime_config: holding_decision_runtime_config_service の module-global state を共有する cohort(Issue #148 / #145)",
+  "cohort_market_holiday_gate: 東証休場日gate(_market_holiday)の既定中和fixtureを共有するcohort(Issue #440 / #145)",
+  "cohort_market_session: 市場セッションの日付 semantics と mock provider の系列を共有する cohort(Issue #52 / #143)",
+  "cohort_solo_recommendation_evaluation_v2_cutover: 営業日ホライズンday-zero(v1/v2)切替のsolo cohort(Issue #389 / #145)",
+  "cohort_solo_calibration_dataset_v2_cutover: calibration datasetのv1/v2切替のsolo cohort(Issue #389 / #145)",
+  "cohort_solo_stock_snapshot_jst_price_window: build_stock_snapshotの価格窓UTC/JST暦日切替のsolo cohort(Issue #475 / #145)",
+  "cohort_solo_stock_snapshot_non_business_now: build_stock_snapshotを非営業日のnowで通すend-to-end検証のsolo cohort(Issue #690 / #145)",
+  "cohort_solo_jpx_staleness_jst_basis: JpxCandidateUniverseProviderのstaleness判定基準日UTC/JST切替のsolo cohort(Issue #578 / #145)",
+  "cohort_solo_jpx_universe_staleness_observability: JPX候補ユニバースのstaleness上限・観測値検証のsolo cohort(Issue #223 / #578 / #145)",
+  "cohort_solo_jpx_vintage_gap_cache_age_jst_basis: JPX vintage gap記録のcache_age_days UTC/JST切替のsolo cohort(Issue #69 / #612 / #145)",
+  "cohort_solo_watchlist_screening_cli_universe_age: 手動CLI(watchlist-screening run)の候補一覧データ経過日数のJST暦日境界のsolo cohort(Issue #373 / #145)",
+  "cohort_solo_hd_renotification_wiring_characterization: 保有判断の再送判断の配線(固定clockの定義元)のsolo cohort(Issue #890 / #145)",
+  "cohort_solo_hd_renotification_wiring: 保有判断の再送判断の配線(経過日数N-1/N/N+1)のsolo cohort(Issue #890 / #145)",
+  "cohort_solo_allocation_shadow_service: 購入側Shadow(Q')の入口(残り時間120秒・総予算30秒の境界)のsolo cohort(Issue #603 / #145)",
+  "cohort_solo_allocation_shadow_wiring: 購入側Shadow(Q')のhandler配線(残り時間の受け渡しとスキップ記録)のsolo cohort(Issue #603 / #145)",
+  "cohort_solo_incident_issue_guard: incident の GitHub Issue 起票の抑止の純粋な判定(最小間隔の境界・JST の日付の窓)のsolo cohort(Issue #926 / #145)",
+  "cohort_solo_incident_state_tracker_guard: 起票の抑止の予算・停止・通知の確保(窓の切替・返却)のsolo cohort(Issue #926 / #145)",
+  "cohort_solo_incident_github_issue_guard_service: 起票の抑止の層1〜3の契約(固定clockでの間隔・窓・stale復旧)のsolo cohort(Issue #926 / #145)",
+  "cohort_solo_incident_notifier_handler_guard: 自動停止のLINE通知(1回だけ)の配線のsolo cohort(Issue #926 / #145)",
+  "cohort_solo_allocation_inputs: 購入側Shadowの入力の組み立て(最終棚卸しの経過日数 = JSTの暦日の差の境界)のsolo cohort(Issue #603 / #145)",
+  "real_market_calendar: 市場休場日gate(_market_holiday)を実カレンダーで検証するテスト。既定は営業日扱い(Issue #440)",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "N"]
+ignore = []
+
+[tool.ruff.lint.isort]
+known-first-party = ["jstock_advisor"]
+
+[tool.ruff.lint.per-file-ignores]
+# typerのOption/Argumentは関数デフォルト引数として呼び出すのが公式の使い方のため許容する
+"src/jstock_advisor/cli/*.py" = ["B008"]
+
+[tool.mypy]
+python_version = "3.12"
+mypy_path = "src"
+explicit_package_bases = true
+strict = true
+warn_unused_ignores = true
+disallow_untyped_defs = true
+
+[[tool.mypy.overrides]]
+module = "yfinance.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "xlrd.*"
+ignore_missing_imports = true
+
+# Issue #223 PR-2(2026-09): openpyxlはpy.typedを同梱しておらず、型情報は
+# 別配布のtypes-openpyxlにしかない。dev依存を1つ増やすより、同じ用途の
+# xlrdと同じ扱い(上記)に揃える。
+[[tool.mypy.overrides]]
+module = "openpyxl.*"
+ignore_missing_imports = true

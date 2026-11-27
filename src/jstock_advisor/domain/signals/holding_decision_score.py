@@ -1,0 +1,163 @@
+"""保有判断スコアのbase/final合成・判定区分・coverage/confidence・通知判定
+(実装プラン1節・1.5節・5節・6節・7節・8節)。
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from decimal import ROUND_HALF_UP, Decimal
+
+from jstock_advisor.config.models import HoldingDecisionRulesConfig
+from jstock_advisor.domain.entities.enums import (
+    HoldingDecisionCategory,
+    HoldingDecisionConfidenceLevel,
+)
+from jstock_advisor.domain.entities.holding_decision import (
+    CompanyQualityScore,
+    ComponentCoverage,
+    HoldingDecisionHardGate,
+    InvestmentThesisScore,
+    RiskDeductionScore,
+)
+
+
+def _clip(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
+@dataclass(frozen=True)
+class HoldingDecisionOutcome:
+    base_score: float
+    final_score: float
+    display_value: int
+    hard_gate: HoldingDecisionHardGate
+    category: HoldingDecisionCategory
+    coverage: ComponentCoverage
+    confidence: HoldingDecisionConfidenceLevel
+    score_threshold_met: bool
+    coverage_satisfied: bool
+    coverage_gate_passed: bool
+    should_notify: bool
+
+
+def _category_for_score(
+    score: float, t: HoldingDecisionRulesConfig
+) -> HoldingDecisionCategory:
+    thresholds = t.judgment_category_thresholds
+    if score >= thresholds.strong_hold_min:
+        return HoldingDecisionCategory.STRONG_HOLD
+    if score >= thresholds.hold_min:
+        return HoldingDecisionCategory.HOLD
+    if score >= thresholds.caution_min:
+        return HoldingDecisionCategory.CAUTION
+    if score >= thresholds.partial_sell_consideration_min:
+        return HoldingDecisionCategory.PARTIAL_SELL_CONSIDERATION
+    if score >= thresholds.sell_watch_min:
+        return HoldingDecisionCategory.SELL_WATCH
+    if score > thresholds.sell_consideration_min:
+        return HoldingDecisionCategory.SELL_CONSIDERATION
+    return HoldingDecisionCategory.STRONG_SELL_CONSIDERATION
+
+
+def _confidence_for_overall_coverage(
+    overall_coverage: float, rules: HoldingDecisionRulesConfig
+) -> HoldingDecisionConfidenceLevel:
+    thresholds = rules.confidence_thresholds
+    if overall_coverage < thresholds.low_minimum:
+        return HoldingDecisionConfidenceLevel.INSUFFICIENT_EVIDENCE
+    if overall_coverage < thresholds.medium_minimum:
+        return HoldingDecisionConfidenceLevel.LOW
+    if overall_coverage < thresholds.high_minimum:
+        return HoldingDecisionConfidenceLevel.MEDIUM
+    return HoldingDecisionConfidenceLevel.HIGH
+
+
+def combine_holding_decision(
+    company_quality: CompanyQualityScore,
+    investment_thesis: InvestmentThesisScore,
+    risk_deduction: RiskDeductionScore,
+    hard_gate: HoldingDecisionHardGate,
+    rules: HoldingDecisionRulesConfig,
+    *,
+    financial_stale: bool = False,
+) -> HoldingDecisionOutcome:
+    """3スコアを合成し、判定区分・coverage・confidence・通知判定を返す。
+
+    financial_stale(Issue #468 / U17 = OPTION_B_CONFIDENCE_CAP): 判定に使った財務データが
+    報告サイクル上の最新でない(STALE)場合のみTrue。既定Falseは従来と完全に同じ結果を返す。
+    Trueのとき、confidenceは**HIGHを許可しない**(上限MEDIUM)。MEDIUM以下はそのまま。
+    score・component score・coverage・coverage gate・通知判定は一切変更しない
+    (STALEをcoverage不足・不評価へ変換しない。それを行うとOPTION_Cになる)。
+    """
+    base_score = _clip(
+        company_quality.score + investment_thesis.score - risk_deduction.score, -100.0, 100.0
+    )
+
+    if hard_gate.triggered:
+        score_cap = rules.hard_gate.score_cap
+        final_score = min(base_score, score_cap)
+        hard_gate = hard_gate.model_copy(
+            update={"score_cap": score_cap, "adjustment_applied": base_score > score_cap}
+        )
+    else:
+        final_score = base_score
+
+    # Issue #68(F-H2): 組み込みround()はfloatの.5をbanker's rounding
+    # (ROUND_HALF_EVEN)で処理するため、house標準のROUND_HALF_UPと
+    # 不一致になりうる(-2.5 -> 組み込みround()は-2、house標準は-3)。
+    # 家の慣習(float設定値はDecimal(str(x))経由で扱う)に揃える。
+    display_value = int(Decimal(str(final_score)).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+    category = _category_for_score(final_score, rules)
+
+    overall_coverage = (
+        company_quality.coverage_ratio * 50.0
+        + investment_thesis.coverage_ratio * 50.0
+        + risk_deduction.coverage_ratio * 100.0
+    ) / 200.0
+    coverage = ComponentCoverage(
+        overall=overall_coverage,
+        company_quality=company_quality.coverage_ratio,
+        investment_thesis=investment_thesis.coverage_ratio,
+        risk_deduction=risk_deduction.coverage_ratio,
+    )
+
+    confidence = _confidence_for_overall_coverage(overall_coverage, rules)
+    # risk_deductionのcoverageがconfidence_minimum未満(block_minimum以上)の場合、
+    # 通知はブロックしないがconfidenceをMEDIUM以下へ制限する(5節)。
+    if (
+        confidence == HoldingDecisionConfidenceLevel.HIGH
+        and coverage.risk_deduction < rules.coverage_thresholds.risk_deduction_confidence_minimum
+    ):
+        confidence = HoldingDecisionConfidenceLevel.MEDIUM
+    # Issue #468: 既存のcoverage由来の上限の**後**に適用する最終の上限。STALEなら
+    # HIGHを許可しない(HIGH→MEDIUMのみ。MEDIUM・LOW・INSUFFICIENT_EVIDENCEは不変)。
+    # confidenceはscore・coverage・通知判定のいずれの入力にもならないため、ここで
+    # 下げても下流へ波及しない。
+    if financial_stale and confidence == HoldingDecisionConfidenceLevel.HIGH:
+        confidence = HoldingDecisionConfidenceLevel.MEDIUM
+
+    coverage_satisfied = (
+        coverage.overall >= rules.coverage_thresholds.overall_minimum
+        and coverage.company_quality >= rules.coverage_thresholds.company_quality_minimum
+        and coverage.investment_thesis >= rules.coverage_thresholds.investment_thesis_minimum
+        and coverage.risk_deduction >= rules.coverage_thresholds.risk_deduction_block_minimum
+    )
+    confirmed_hard_gate = hard_gate.triggered
+    coverage_gate_passed = coverage_satisfied or confirmed_hard_gate
+
+    score_threshold_met = final_score < rules.notify_below_score
+    should_notify = score_threshold_met and coverage_gate_passed
+
+    return HoldingDecisionOutcome(
+        base_score=base_score,
+        final_score=final_score,
+        display_value=display_value,
+        hard_gate=hard_gate,
+        category=category,
+        coverage=coverage,
+        confidence=confidence,
+        score_threshold_met=score_threshold_met,
+        coverage_satisfied=coverage_satisfied,
+        coverage_gate_passed=coverage_gate_passed,
+        should_notify=should_notify,
+    )

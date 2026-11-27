@@ -1,0 +1,69 @@
+name: CI branch
+
+# Issue #971 D1(USER 確定 #122 …6258191583): branch への push と PR の二重実行のうち、
+# 「PR がある branch への push」の全体 pytest を省く。
+#
+# - 起動は issue-** への push だけ。PR・main の push・手動は ci.yml が従来どおり担う。
+#   ci.yml の push の対象は [main] だけになった(必須チェック 8 件の出どころは ci.yml の PR の実行のまま)。
+# - job は 1 つ(full pytest のみ)。★ job 名は required checks と別(branch-full-pytest)★。
+#   required の名前(lint / test / typecheck / secret-scan / dependency-audit / pii-scan /
+#   layer-lock-drift / pii-scan-commit-messages)をここで使わない(同名の check run を同じ SHA に
+#   併存させない。Ruleset の評価が曖昧になる〔早期 green の恐れ〕のを避ける)。
+# - 最初に「この branch に open の PR があるか」を GitHub API で調べる(scripts/ci_branch_open_pr.py)。
+#     ある      → 重い step を省く(PR の実行が全体 pytest を行う)
+#     無い      → 全体 pytest を実行する(Issue #230: PR を作る前にも全体回帰を見られる)
+#     確認失敗  → 全体 pytest を実行する(fail-safe。`!= 'true'` の条件なので、判定 step が失敗・
+#                 出力なしでも省略にならない)
+#   ★ この job は必須チェックではない ★ ので、API が止まっても merge は止まらない。
+#   (pii-scan-commit-messages の「GitHub API を使わないので API 障害で PR が止まる経路を作らない」
+#   と同じ方針。必須の job に API への依存を持ち込まない。)
+# - Markdown だけの変更(Issue #866)は ci.yml と同じ判定 script で subset だけにする。
+# - concurrency の group に github.workflow を含める ★ ci.yml の PR の group と別になる ★
+#   (Issue #230: branch への push が、同じ branch の PR の実行〔必須チェックの出どころ〕を取り消さない)。
+#   同じ branch へ続けて push したときは、古い実行を取り消す。
+# - permissions: contents: read は必須(permissions を書くと列挙しない scope は none になる)。
+#   pull-requests: read は PR の有無の確認用(governance.yml と同じ形)。
+
+on:
+  push:
+    branches: ["issue-**"]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  branch-full-pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # open PR の有無。失敗しても job を赤くしない(continue-on-error)。output が無ければ下の条件は
+      # `!= 'true'` となり重い step が走る(fail-safe)。script は常に exit 0。
+      - id: open-pr
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python scripts/ci_branch_open_pr.py
+      - if: steps.open-pr.outputs.open_pr == 'true'
+        run: echo "An open pull request exists for this branch - the full pytest runs in the pull request CI, so it is skipped here (see issue 971)"
+      - id: classify
+        if: steps.open-pr.outputs.open_pr != 'true'
+        continue-on-error: true
+        run: python scripts/ci_markdown_only.py
+      - if: steps.open-pr.outputs.open_pr != 'true'
+        run: pip install -r requirements-lock.txt
+      - if: steps.open-pr.outputs.open_pr != 'true' && steps.classify.outputs.markdown_only != 'true'
+        run: python -m pytest tests -q --durations=50
+      - if: steps.open-pr.outputs.open_pr != 'true' && steps.classify.outputs.markdown_only == 'true'
+        run: echo "Markdown-only change - full pytest skipped (running the Markdown-reading subset only)"
+      - if: steps.open-pr.outputs.open_pr != 'true' && steps.classify.outputs.markdown_only == 'true'
+        run: python -m pytest -q $(grep -v -E '^\s*(#|$)' tests/ci_markdown_subset.txt | tr -d '\015')

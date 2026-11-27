@@ -1,0 +1,2465 @@
+"""BuySignalServiceのサービス層直接テスト(2026-07 BUYパイプライン再設計)。
+
+既存のtest_buy_candidates_handler.pyはBuySignalServiceをモックして扱うため、
+実際に22ステップのパイプラインを通した`Recommendation`の値を直接検証する
+テストが存在しなかった(カバレッジの穴)。ここではbuild_stock_snapshot()を
+モックしてStockSnapshotを直接構築し、BuySignalService.analyze()をエンドツー
+エンドで実行する。
+
+§21の5銘柄回帰テストは、本番相当の評価で実際に報告された現在値・予想配当
+(dividend_yield_pct_at_recommendationから逆算した実配当額)をそのまま使い、
+適正価格の1手法(PER相当)には旧システムが報告した「最終適正価格」をそのまま
+採用する。これにより、少なくとも用いた入力データは実データに基づいたものと
+なる。ただし適正価格の集計方法自体は新設計(手法間バラつき・信頼度・
+安全余裕率)に置き換わっているため、算出される購入判断基準価格・買付価格は
+旧システムの値と一致しない(これは仕様どおりの挙動であり、バグではない)。
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from decimal import Decimal
+
+import pytest
+
+from jstock_advisor.config.loader import load_config
+from jstock_advisor.domain.business_calendar import BusinessCalendar
+from jstock_advisor.domain.classification.buy_industry import (
+    CYCLICAL_SECTORS,
+    classify_buy_industry_sector,
+)
+from jstock_advisor.domain.classification.canonical_industry import JpxLookupStatus
+from jstock_advisor.domain.entities.classification import StockTypeClassification
+from jstock_advisor.domain.entities.common import DataSourceReference
+from jstock_advisor.domain.entities.earnings_surprise import EarningsSurpriseResult
+from jstock_advisor.domain.entities.earnings_trend import EarningsTrendResult
+from jstock_advisor.domain.entities.entry_price_range import EntryPriceRangeResult
+from jstock_advisor.domain.entities.enums import (
+    BUY_FAMILY_ACTIONS,
+    BuyAction,
+    BuyIndustrySector,
+    ConfidenceLevel,
+    EarningsDateStatus,
+    EarningsSurpriseEvaluationState,
+    EarningsTrendEvaluationState,
+    EnvironmentEvaluationState,
+    HistoricalValuationEvaluationState,
+    IndustryClassification,
+    MarketEnvironmentEvaluationState,
+    PriceRangeEvaluationState,
+    ProfitTakingIndustrySector,
+    RecentPeriodsSource,
+    RecommendationType,
+    SectorEnvironmentEvaluationState,
+    StockType,
+    TimingScoreEvaluationState,
+    TrendClassification,
+)
+from jstock_advisor.domain.entities.environment import EnvironmentResult
+from jstock_advisor.domain.entities.historical_valuation import HistoricalValuationResult
+from jstock_advisor.domain.entities.market_environment import MarketEnvironmentResult
+from jstock_advisor.domain.entities.momentum import MomentumSnapshot
+from jstock_advisor.domain.entities.sector_environment import SectorEnvironmentResult
+from jstock_advisor.domain.entities.timing_score import TimingScoreResult
+from jstock_advisor.domain.entities.valuation import FairValueRange
+from jstock_advisor.domain.market_session import (
+    expected_latest_completed_trading_session,
+)
+from jstock_advisor.interfaces.disclosure import (
+    DisclosureAvailability,
+    DisclosureUnavailableReason,
+)
+from jstock_advisor.interfaces.types import (
+    Disclosure,
+    DividendInfo,
+    FinancialSummary,
+    HistoricalValuation,
+    QuarterlyFinancials,
+)
+from jstock_advisor.services import buy_signal_service as service_module
+from jstock_advisor.services.buy_signal_service import BuySignalService
+from jstock_advisor.services.jpx_industry_source import (
+    JpxIndustryEntry,
+    JpxIndustryLookup,
+    JpxIndustrySource,
+)
+from jstock_advisor.services.provider_bundle import ProviderBundle
+from jstock_advisor.services.stock_snapshot_service import StockSnapshot
+
+_CONFIG = load_config()
+_CALENDAR = BusinessCalendar.from_config(_CONFIG.holiday_calendar)
+_SOURCE = DataSourceReference(
+    provider="test-fixture", fetched_at=dt.datetime(2026, 7, 30, tzinfo=dt.UTC)
+)
+
+# 決算3営業日以内ルールを確実に発火させるための基準日時(2026-08-04火曜日、
+# 4516の次回決算予定日2026-08-06木曜日まで営業日2日)。
+_NOW = dt.datetime(2026, 8, 4, 7, 0, tzinfo=dt.UTC)
+
+
+def _financial(
+    *,
+    stock_code: str,
+    industry: str,
+    sector: str,
+    forecast_eps: Decimal,
+    forecast_bps: Decimal | None = None,
+    equity_ratio_pct: float = 70.0,
+    payout_ratio_pct: float = 20.0,
+) -> FinancialSummary:
+    return FinancialSummary(
+        stock_code=stock_code,
+        stock_name=None,
+        fiscal_period_end=dt.date(2026, 3, 31),
+        fiscal_year_end_month=3,
+        industry=industry,
+        sector=sector,
+        equity_ratio_pct=equity_ratio_pct,
+        payout_ratio_pct=payout_ratio_pct,
+        forecast_eps=forecast_eps,
+        forecast_bps=forecast_bps,
+        operating_cashflow=None,
+        capital_expenditure=None,
+        shares_outstanding=None,
+        source=_SOURCE,
+    )
+
+
+def _dividend(
+    stock_code: str, forecast_dividend: Decimal, *, progressive: bool = True, years: int = 5
+) -> DividendInfo:
+    return DividendInfo(
+        stock_code=stock_code,
+        fiscal_year="2026",
+        forecast_annual_dividend_per_share=forecast_dividend,
+        is_progressive_or_doe_policy=progressive,
+        consecutive_dividend_increase_years=years,
+        source=_SOURCE,
+    )
+
+
+def _historical_per_only(
+    per_median: Decimal, pbr_median: Decimal | None = None, count: int = 3
+) -> list[HistoricalValuation]:
+    """per/pbr中央値が指定値になるよう、eps=Noneのレコードのみを用意する
+    (EPSの平準化が過去黒字年度データ不足でforecast_epsへフォールバックするようにする)。
+    """
+    return [
+        HistoricalValuation(
+            stock_code="0000",
+            date=dt.date(2026 - i, 3, 31),
+            eps=None,
+            bps=None,
+            per=per_median,
+            pbr=pbr_median,
+            available_at=_SOURCE.fetched_at,
+            source=_SOURCE,
+        )
+        for i in range(1, count + 1)
+    ]
+
+
+def _stock_type(stock_code: str, types: list[StockType]) -> StockTypeClassification:
+    return StockTypeClassification(
+        stock_code=stock_code,
+        classified_at=_NOW,
+        types=types,
+        primary_type=types[0] if types else None,
+        confidence=ConfidenceLevel.MEDIUM,
+        classification_basis=["test fixture"],
+        data_sources=[_SOURCE],
+    )
+
+
+_EMPTY_FAIR_VALUE_RANGE = FairValueRange(
+    bear=None,
+    neutral=None,
+    bull=None,
+    overall_confidence=ConfidenceLevel.LOW,
+    methods_used=[],
+    methods_excluded=[],
+    usable_for_trading_judgment=False,
+    unusable_reason="unused by BUY pipeline (fixture placeholder)",
+)
+
+_MOMENTUM_PLACEHOLDER = MomentumSnapshot(
+    trend_classification=TrendClassification.NEUTRAL,
+    trend_evaluable=False,
+    price_history_aligned=True,
+    price_history_has_future_bars=False,
+    confidence=ConfidenceLevel.LOW,
+)
+
+_HISTORICAL_VALUATION_PLACEHOLDER = HistoricalValuationResult(
+    state=HistoricalValuationEvaluationState.NOT_EVALUATED,
+    evaluated_at=_NOW,
+    model_version="test-fixture",
+)
+
+_TIMING_PLACEHOLDER = TimingScoreResult(
+    state=TimingScoreEvaluationState.NOT_EVALUATED,
+    evaluated_at=_NOW,
+    model_version="test-fixture",
+)
+
+_EARNINGS_SURPRISE_PLACEHOLDER = EarningsSurpriseResult(
+    state=EarningsSurpriseEvaluationState.NOT_EVALUATED,
+    evaluated_at=_NOW,
+    model_version="test-fixture",
+)
+
+_EARNINGS_TREND_PLACEHOLDER = EarningsTrendResult(
+    state=EarningsTrendEvaluationState.NOT_EVALUATED,
+    evaluated_at=_NOW,
+    model_version="test-fixture",
+)
+
+_ENTRY_PRICE_RANGE_PLACEHOLDER = EntryPriceRangeResult(
+    state=PriceRangeEvaluationState.NOT_EVALUATED,
+    current_price=Decimal("1000"),
+    evaluated_at=_NOW,
+    model_version="test-fixture",
+)
+
+_MARKET_ENVIRONMENT_PLACEHOLDER = MarketEnvironmentResult(
+    state=MarketEnvironmentEvaluationState.NOT_EVALUATED,
+    evaluated_at=_NOW,
+    model_version="test-fixture",
+)
+
+_SECTOR_ENVIRONMENT_PLACEHOLDER = SectorEnvironmentResult(
+    state=SectorEnvironmentEvaluationState.NOT_APPLICABLE,
+    evaluated_at=_NOW,
+    model_version="test-fixture",
+)
+
+_ENVIRONMENT_PLACEHOLDER = EnvironmentResult(
+    state=EnvironmentEvaluationState.NOT_EVALUATED,
+    evaluated_at=_NOW,
+    model_version="test-fixture",
+)
+
+
+@dataclass(frozen=True)
+class _StockFixture:
+    stock_code: str
+    stock_name: str
+    current_price: Decimal
+    industry: str
+    sector: str
+    forecast_dividend: Decimal
+    forecast_eps: Decimal
+    per_median: Decimal
+    forecast_bps: Decimal | None = None
+    pbr_median: Decimal | None = None
+    stock_types: list[StockType] = field(default_factory=list)
+    next_earnings_date: dt.date | None = None
+
+
+def _build_snapshot(
+    fx: _StockFixture,
+    disclosure_availability: DisclosureAvailability = DisclosureAvailability.AVAILABLE,
+    disclosure_unavailable_reason: DisclosureUnavailableReason | None = None,
+    disclosures: list[Disclosure] | None = None,
+    disclosure_risk_keywords_found: list[str] | None = None,
+    price_as_of_date: dt.date | None = None,
+) -> StockSnapshot:
+    financial = _financial(
+        stock_code=fx.stock_code,
+        industry=fx.industry,
+        sector=fx.sector,
+        forecast_eps=fx.forecast_eps,
+        forecast_bps=fx.forecast_bps,
+    )
+    dividend = _dividend(fx.stock_code, fx.forecast_dividend)
+    dividend_yield_pct = float(fx.forecast_dividend / fx.current_price * 100)
+    # build_stock_snapshot()と同じ決算日検証ロジック(コードレビュー対応)。この
+    # フィクスチャはbuild_stock_snapshot()自体をモックしてStockSnapshotを直接
+    # 構築するため、検証済みのnext_earnings_date/earnings_date_status/
+    # earnings_date_rawを自前で整合させる必要がある。
+    earnings_date_raw = fx.next_earnings_date
+    if earnings_date_raw is None:
+        earnings_date_status = EarningsDateStatus.UNAVAILABLE
+        resolved_next_earnings_date = None
+    elif earnings_date_raw < _NOW.date():
+        earnings_date_status = EarningsDateStatus.STALE_PAST_DATE
+        resolved_next_earnings_date = None
+    else:
+        earnings_date_status = EarningsDateStatus.CONFIRMED
+        resolved_next_earnings_date = earnings_date_raw
+    business_days_to_earnings = (
+        _CALENDAR.business_days_between(_NOW.date(), resolved_next_earnings_date)
+        if resolved_next_earnings_date is not None
+        else None
+    )
+    return StockSnapshot(
+        stock_code=fx.stock_code,
+        current_price=fx.current_price,
+        # Issue #52 Phase B2: 価格の基準日。既定では鮮度が正常な状態を表す。
+        #
+        # 本モジュールのテストは価格鮮度**以外**の判定(BUYスコア・screening・
+        # cooldown・shadow observation 等)を対象としており、`now` は
+        # テストごとに異なる(_NOW 以外に 2026-08-20 23:30 UTC 等を使う)。
+        #
+        # review 対応: 以前は「未来日ならmissed=0になる」性質を利用していたが、
+        # **未来日は正常な値ではない**(policy層でtimestamp異常として弾かれる)。
+        # 異常値を使って正常系fixtureを作らない。
+        # `now` ごとの期待セッションを導出して渡す。
+        #
+        # 鮮度そのものを検証するテストは
+        # tests/unit/test_issue_52_phase_b2_price_freshness_gate.py にある。
+        price_as_of_date=price_as_of_date
+        or expected_latest_completed_trading_session(_NOW, _CALENDAR),
+        financial=financial,
+        dividend=dividend,
+        benefit=None,
+        bars=[],
+        # Issue #698 PR-A: 価格履歴が「期間内に分割は無い」と報告した状態(基準整合はMATCH)。
+        # 基準整合を検証するテストは tests/unit/test_issue_698_pr_a_basis_consistency.py。
+        price_history_splits=[],
+        price_history_start=dt.date(2023, 8, 4),
+        historical_valuations=_historical_per_only(fx.per_median, fx.pbr_median),
+        avg_trading_value=Decimal("100000000"),
+        disclosures=disclosures or [],
+        disclosure_availability=disclosure_availability,
+        disclosure_unavailable_reason=disclosure_unavailable_reason,
+        next_earnings_date=resolved_next_earnings_date,
+        earnings_date_status=earnings_date_status,
+        earnings_date_raw=earnings_date_raw,
+        business_days_to_earnings=business_days_to_earnings,
+        dividend_yield_pct=dividend_yield_pct,
+        benefit_yield_pct=None,
+        annual_benefit_value=None,
+        total_yield_pct=dividend_yield_pct,
+        fair_value=None,
+        fair_value_methods_used_count=0,
+        data_sources=[_SOURCE],
+        data_fetched_at=_NOW,
+        quarterly_operating_incomes=[
+            Decimal("100"),
+            Decimal("105"),
+            Decimal("110"),
+            Decimal("115"),
+        ],
+        quarterly_operating_cashflows=[],
+        quarterly_operating_income_periods=[],
+        quarterly_operating_cashflow_periods=[],
+        severe_earnings_decline=False,
+        disclosure_risk_keywords_found=disclosure_risk_keywords_found or [],
+        material_event_keywords_found=[],
+        cashflow_decomposition=None,
+        stock_type_classification=_stock_type(fx.stock_code, fx.stock_types),
+        fair_value_range=_EMPTY_FAIR_VALUE_RANGE,
+        momentum=_MOMENTUM_PLACEHOLDER,
+        historical_valuation=_HISTORICAL_VALUATION_PLACEHOLDER,
+        timing=_TIMING_PLACEHOLDER,
+        earnings_surprise=_EARNINGS_SURPRISE_PLACEHOLDER,
+        earnings_trend=_EARNINGS_TREND_PLACEHOLDER,
+        entry_price_range=_ENTRY_PRICE_RANGE_PLACEHOLDER,
+        market_environment=_MARKET_ENVIRONMENT_PLACEHOLDER,
+        sector_environment=_SECTOR_ENVIRONMENT_PLACEHOLDER,
+        environment=_ENVIRONMENT_PLACEHOLDER,
+    )
+
+
+# --- 5銘柄の実データ(本番相当の評価で報告された現在値・配当利回りから逆算) -------
+
+_NIHON_SHINYAKU = _StockFixture(
+    stock_code="4516",
+    stock_name="日本新薬",
+    current_price=Decimal("3495"),
+    industry="医薬品",
+    sector="Healthcare",
+    forecast_dividend=Decimal("124"),  # 3.5479...% * 3495 = 124
+    # PER法・PBR法をともに6,100円付近に設定する(配当利回り法単独(3,100円)
+    # では手法間バラつきに埋もれて安全余裕率控除後に現在値を下回ってしまうため、
+    # 独立した2手法が同程度の高値を示す状態を用意し、価格条件テストの意図
+    # (現在値が打診買い価格以下)を安定して再現する)。
+    forecast_eps=Decimal("305"),  # per_median(20) * eps = 6100
+    per_median=Decimal("20"),
+    forecast_bps=Decimal("1220"),  # pbr_median(5) * bps = 6100
+    pbr_median=Decimal("5"),
+    stock_types=[],
+    next_earnings_date=dt.date(2026, 8, 6),  # _NOWから営業日2日後 -> 決算直前ルール発火
+)
+
+_TACHI_S = _StockFixture(
+    stock_code="7239",
+    stock_name="タチエス",
+    current_price=Decimal("2277"),
+    industry="輸送用機器",
+    sector="Auto Parts",
+    forecast_dividend=Decimal("115"),  # 5.0505...% * 2277 = 115
+    forecast_eps=Decimal("126.87"),  # 15 * eps = 1903(旧適正価格)
+    per_median=Decimal("15"),
+)
+
+_DAIKYO_NISHIKAWA = _StockFixture(
+    stock_code="4246",
+    stock_name="DaikyoNishikawa",
+    current_price=Decimal("1027"),
+    industry="輸送用機器",
+    sector="Auto Parts",
+    forecast_dividend=Decimal("58"),  # 5.6475...% * 1027 = 58
+    forecast_eps=Decimal("47.73"),  # 15 * eps = 716(旧適正価格)
+    per_median=Decimal("15"),
+)
+
+_HOKURYO = _StockFixture(
+    stock_code="1384",
+    stock_name="ホクリヨウ",
+    current_price=Decimal("2035"),
+    industry="水産・農林業",
+    sector="Food",
+    forecast_dividend=Decimal("80"),  # 3.9312...% * 2035 = 80
+    forecast_eps=Decimal("107.47"),  # 15 * eps = 1612(旧適正価格)
+    per_median=Decimal("15"),
+)
+
+_AICHI_TOKEI = _StockFixture(
+    stock_code="7723",
+    stock_name="愛知時計電機",
+    current_price=Decimal("3025"),
+    industry="機械",
+    sector="Industrial",
+    forecast_dividend=Decimal("120"),  # 3.9669...% * 3025 = 120
+    forecast_eps=Decimal("130.73"),  # 15 * eps = 1961(旧適正価格)
+    per_median=Decimal("15"),
+)
+
+# レビュー対応(2026-08、commit f546473再レビュー、VALUATION_OUTLIER_EXCLUDED
+# 実データ検証用): target_yield法(配当基準価格=1円÷4.0%=25円)が現在値1000円の
+# 10%(=100円)を大きく下回るよう設計し、apply_outlier_filters()の
+# EXTREME_LOW_RELATIVE_TO_CURRENT_PRICE検知を実際に発火させる。per法・pbr法は
+# いずれも1500円で一致させ、外れ値除外後も_MIN_REMAINING_METHODS_AFTER_FILTER
+# (2件)を満たし、除外結果がそのまま採用されるようにする。
+_OUTLIER_EXCLUSION_STOCK = _StockFixture(
+    stock_code="1111",
+    stock_name="テスト外れ値銘柄",
+    current_price=Decimal("1000"),
+    industry="医薬品",
+    sector="Healthcare",
+    forecast_dividend=Decimal("1"),  # target_yield価格 = 1 / 0.04 = 25円(現在値の2.5%)
+    forecast_eps=Decimal("100"),  # per価格 = 15 * 100 = 1500円
+    per_median=Decimal("15"),
+    forecast_bps=Decimal("500"),  # pbr価格 = 3 * 500 = 1500円
+    pbr_median=Decimal("3"),
+)
+
+# レビュー対応(2026-08、NO_VALUATION_ANCHOR表示不備の是正、必須テスト1・2):
+# target_yield(1000円)・per(1300円)・pbr(2200円)の3方式がいずれも個別には
+# 有効(outlier filterでも除外されない、いずれの方式も他方式中央値の40%〜250%の
+# 範囲内・現在値の10%以上)だが、方式間の乖離(2200/1000=2.2倍)が
+# dispersion.auto_buy_block(2.00倍)を超えるよう設計し、determine_valuation_
+# confidence()のVALUATION_DISPERSION_TOO_HIGH分岐(valuation_confidence.py)を
+# 実際に発火させる。DCF・価格レンジ法は本フィクスチャ共通の仕様上
+# (operating_cashflow=None・bars=[])常に算出不可のため対象外(3方式のみ)。
+_DISPERSION_STOCK = _StockFixture(
+    stock_code="2222",
+    stock_name="テスト乖離銘柄",
+    current_price=Decimal("1000"),
+    industry="小売業",
+    sector="Retail",
+    forecast_dividend=Decimal("40"),  # target_yield価格 = 40 / 0.04 = 1000円
+    forecast_eps=Decimal("100"),  # per価格 = 13 * 100 = 1300円
+    per_median=Decimal("13"),
+    forecast_bps=Decimal("200"),  # pbr価格 = 11 * 200 = 2200円
+    pbr_median=Decimal("11"),
+)
+
+# Issue #186: dispersionがanchor_block(50.00倍)を超え、valuation_anchor自体を
+# 算出しないケース。有効方式が3件未満だと外れ値検知が走らない(=互いを外れ値と
+# みなし合って全滅しない)ことを利用し、target_yield(1000円)とper(60000円)の
+# 2方式だけを有効にして60倍の乖離を作る。forecast_bpsをNoneにしてpbrを算出不可に
+# している(DCF・価格レンジ法は本フィクスチャ共通の仕様上もともと算出不可)。
+_EXTREME_DISPERSION_STOCK = _StockFixture(
+    stock_code="3333",
+    stock_name="テスト極端乖離銘柄",
+    current_price=Decimal("1000"),
+    industry="小売業",
+    sector="Retail",
+    forecast_dividend=Decimal("40"),  # target_yield価格 = 40 / 0.04 = 1000円
+    forecast_eps=Decimal("100"),  # per価格 = 600 * 100 = 60000円
+    per_median=Decimal("600"),
+    forecast_bps=None,
+    pbr_median=None,
+)
+
+
+def _providers() -> ProviderBundle:
+    # build_stock_snapshotをmonkeypatchで置き換えるため、providersの中身は
+    # 一切参照されない(型を満たすだけのダミー)。
+    return object()  # type: ignore[return-value]
+
+
+def _analyze(
+    monkeypatch: pytest.MonkeyPatch, fx: _StockFixture
+) -> service_module.BuyAnalysisOutcome:
+    snapshot = _build_snapshot(fx)
+    monkeypatch.setattr(service_module, "build_stock_snapshot", lambda *a, **kw: (snapshot, None))
+    service = BuySignalService(providers=_providers(), config=_CONFIG, business_calendar=_CALENDAR)
+    return service.analyze(fx.stock_code, _NOW, RecommendationType.BUY)
+
+
+def test_nihon_shinyaku_4516_forced_to_watch_before_earnings_by_earnings_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """4516: 現在値(3,495円)は適正価格を下回るが、次回決算(2026-08-06)まで
+    営業日2日のため、価格条件・スコアにかかわらずWATCH_BEFORE_EARNINGSとなる
+    (要求仕様16節: 決算直前は例外なく新規購入を待つ)。§21が許容する結果
+    (BUY/SMALL_ENTRY/WATCH_BEFORE_EARNINGSのいずれか)に含まれる。
+    """
+    outcome = _analyze(monkeypatch, _NIHON_SHINYAKU)
+    assert outcome.recommendation is not None
+    assert outcome.buy_action == BuyAction.WATCH_BEFORE_EARNINGS
+    assert outcome.buy_action not in BUY_FAMILY_ACTIONS
+    assert outcome.ranking_group == "watch_price"
+    # 業種別モデル未実装(医薬品)のため、信頼度はHIGHにならない(要求仕様12節)。
+    assert outcome.recommendation.confidence != ConfidenceLevel.HIGH
+    assert outcome.recommendation.buy_industry_sector is not None
+    assert outcome.recommendation.buy_industry_sector.value == "PHARMACEUTICAL"
+
+
+def test_tachi_s_7239_watch_for_price_excluded_from_buy_ranking(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """7239: 現在値(2,277円)が適正価格(1,903円)を約19.7%上回っているため、
+    企業魅力度スコアにかかわらずBUY系判定にならず、購入候補ランキングから
+    除外される(要求仕様4節・21節)。
+    """
+    outcome = _analyze(monkeypatch, _TACHI_S)
+    assert outcome.recommendation is not None
+    assert outcome.buy_action == BuyAction.WATCH_FOR_PRICE
+    assert outcome.buy_action not in BUY_FAMILY_ACTIONS
+    assert outcome.ranking_group != "buy_candidate"
+    assert outcome.recommendation.buy_industry_sector.value == "AUTOMOTIVE_PARTS"
+
+
+def test_daikyo_nishikawa_4246_excluded_from_buy_ranking_when_far_above_fair_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """4246: 現在値(1,027円)が適正価格(716円)を約43.4%上回っている。
+    価格条件を満たさないため、BUY系判定は禁止される。
+    """
+    outcome = _analyze(monkeypatch, _DAIKYO_NISHIKAWA)
+    assert outcome.recommendation is not None
+    assert outcome.buy_action not in BUY_FAMILY_ACTIONS
+    assert outcome.buy_action in {BuyAction.WATCH_FOR_PRICE, BuyAction.NOT_ATTRACTIVE}
+    assert outcome.ranking_group != "buy_candidate"
+
+
+def test_hokuryo_1384_watch_for_price_with_normalized_eps_considered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """1384: 現在値(2,035円)が適正価格(1,612円)を約26.2%上回っている。
+    鶏卵価格上昇等の市況要因を考慮する食品/市況influenced業種(FOOD)に
+    分類され、平準化EPSの検討対象となる(要求仕様13節)。
+    """
+    outcome = _analyze(monkeypatch, _HOKURYO)
+    assert outcome.recommendation is not None
+    assert outcome.buy_action not in BUY_FAMILY_ACTIONS
+    assert outcome.ranking_group != "buy_candidate"
+    assert outcome.recommendation.buy_industry_sector.value == "FOOD"
+    # FOODは市況影響業種としてEPS平準化の検討対象(要求仕様13節)。
+    assert outcome.recommendation.eps_normalization_method is not None
+
+
+def test_aichi_tokei_7723_excluded_from_buy_ranking_when_far_above_fair_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """7723: 現在値(3,025円)が適正価格(1,961円)を約54.3%上回っている、
+    5銘柄中もっとも乖離が大きいケース。BUY系判定は明確に禁止される。
+    """
+    outcome = _analyze(monkeypatch, _AICHI_TOKEI)
+    assert outcome.recommendation is not None
+    assert outcome.buy_action not in BUY_FAMILY_ACTIONS
+    assert outcome.buy_action in {BuyAction.WATCH_FOR_PRICE, BuyAction.NOT_ATTRACTIVE}
+    assert outcome.ranking_group != "buy_candidate"
+    assert outcome.recommendation.buy_industry_sector.value == "GENERAL_MANUFACTURING"
+
+
+def test_only_nihon_shinyaku_is_not_excluded_for_price_reasons(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """5銘柄のうち、価格条件(現在値 vs 適正価格)を満たすのは4516のみである
+    ことを確認する回帰テスト(今回の修正の核心)。4516はWATCH_BEFORE_EARNINGSに
+    なるが、これは決算直前ルールによるものであり価格条件不足が理由ではない。
+    """
+    results = {
+        fx.stock_code: _analyze(monkeypatch, fx)
+        for fx in (
+            _NIHON_SHINYAKU,
+            _TACHI_S,
+            _DAIKYO_NISHIKAWA,
+            _HOKURYO,
+            _AICHI_TOKEI,
+        )
+    }
+    # 現在値が打診買い価格を上回っている4銘柄は、購入候補ランキングへ含まれない。
+    for code in ("7239", "4246", "1384", "7723"):
+        assert results[code].ranking_group != "buy_candidate", code
+
+    # 4516だけが「価格条件は問題ない」状態であることを確認する。raw_buy_action
+    # (決算直前調整より前の、価格条件+スコアのみによる仮判定)がBUY系であれば、
+    # 最終的にWATCH_BEFORE_EARNINGSへ格下げされたのは決算直前ルールが理由であり、
+    # 価格条件の不足が理由ではないことがわかる。
+    nihon_shinyaku_rec = results["4516"].recommendation
+    assert nihon_shinyaku_rec is not None
+    assert nihon_shinyaku_rec.raw_buy_action in BUY_FAMILY_ACTIONS
+    nihon_shinyaku_reasons = [r.code for r in nihon_shinyaku_rec.buy_decision_reasons]
+    assert "EARNINGS_WINDOW" in nihon_shinyaku_reasons
+
+
+def test_issue_582_valuation_confidence_shadow_inputs_match_the_actual_judgment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #582: shadow入力スナップショットのactual_*が、実際の判定結果と一致する。
+
+    v1の判定(recommendation/buy_action/価格)は本Issueで変更していない(golden
+    invariant)。shadow入力は既存の実際の結果を束ねているだけであることを固定する。
+    """
+    outcome = _analyze(monkeypatch, _NIHON_SHINYAKU)
+    rec = outcome.recommendation
+    assert rec is not None
+    shadow_inputs = outcome.valuation_confidence_shadow_inputs
+    assert shadow_inputs is not None
+    assert shadow_inputs.actual_buy_action == outcome.buy_action
+    assert shadow_inputs.actual_raw_buy_action == rec.raw_buy_action
+    assert shadow_inputs.actual_entry_price == rec.entry_buy_price
+    assert shadow_inputs.actual_standard_price == rec.standard_buy_price
+    assert shadow_inputs.actual_strong_price == rec.strong_buy_price
+    assert shadow_inputs.current_price == _NIHON_SHINYAKU.current_price
+    assert shadow_inputs.industry_model_applied is False  # #208: 本番で恒久的にFalse
+
+
+@pytest.mark.parametrize(
+    "fx",
+    [_NIHON_SHINYAKU, _DAIKYO_NISHIKAWA],
+    ids=["eps_none", "eps_medium_cyclical"],
+)
+def test_issue_582_valuation_confidence_shadow_inputs_match_production_call_arguments(
+    monkeypatch: pytest.MonkeyPatch, fx: _StockFixture
+) -> None:
+    """サブちゃんレビュー対応(PR #704 F3/SHOULD1、再レビューSHOULD): shadow入力
+    スナップショットのuses_simplified_dcf/normalized_eps_confidence/
+    industry_model_applied/adjustment_codesが、production側の実際の呼び出し
+    引数と一致することを固定する。
+
+    valuation_confidence_shadow_service.py側のテストはshadow serviceへ渡された
+    inputsのpass-throughのみを固定しており、buy_signal_service.py::analyze()が
+    実際にdetermine_valuation_confidence()/compute_margin_of_safety()へ渡した
+    引数とスナップショットが一致する保証は無かった(サブちゃん実測: N13/N14/N15
+    SURVIVED)。production側の実呼び出しをspyし、実際に渡された引数と
+    スナップショットの値を直接比較する。
+
+    再レビュー対応: `_NIHON_SHINYAKU`単独ではnormalized_eps_confidenceが
+    恒常的にNone(非cyclical industryのため)であり、N14(この値を取り違える
+    変異)がNone==Noneとして常に無検出(vacuous)になっていた。eps非None
+    (is_cyclical_industry=True、normalized_eps_confidence=MEDIUM)の
+    `_DAIKYO_NISHIKAWA`を追加のparametrize caseとして使う。
+    """
+    captured: dict[str, object] = {}
+    real_determine = service_module.determine_valuation_confidence
+    real_margin = service_module.compute_margin_of_safety
+
+    def _spy_determine(**kwargs: object) -> object:
+        captured["industry_model_applied"] = kwargs["industry_model_applied"]
+        captured["uses_simplified_dcf"] = kwargs["uses_simplified_dcf"]
+        captured["normalized_eps_confidence"] = kwargs["normalized_eps_confidence"]
+        return real_determine(**kwargs)  # type: ignore[arg-type]
+
+    def _spy_margin(confidence: object, adjustment_codes: object, config: object) -> object:
+        captured["adjustment_codes"] = list(adjustment_codes)  # type: ignore[call-overload]
+        return real_margin(confidence, adjustment_codes, config)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(service_module, "determine_valuation_confidence", _spy_determine)
+    monkeypatch.setattr(service_module, "compute_margin_of_safety", _spy_margin)
+
+    outcome = _analyze(monkeypatch, fx)
+
+    shadow_inputs = outcome.valuation_confidence_shadow_inputs
+    assert shadow_inputs is not None
+    assert captured  # spyが実際に呼ばれたことの確認(呼ばれなければ以下は無意味)
+    assert shadow_inputs.industry_model_applied == captured["industry_model_applied"]
+    assert shadow_inputs.uses_simplified_dcf == captured["uses_simplified_dcf"]
+    assert shadow_inputs.normalized_eps_confidence == captured["normalized_eps_confidence"]
+    assert shadow_inputs.adjustment_codes == tuple(captured["adjustment_codes"])  # type: ignore[arg-type]
+
+    # サブちゃん最終確認での軽微な観測への対応: fixtureの前提
+    # (test_issue_582_eps_medium_cyclical_fixture_is_not_vacuous_for_n14)は
+    # is_cyclical_industryの分類条件のみを固定しており、normalized_eps_
+    # confidenceが実際にNoneでないこと(EPS正規化側の別の前提)までは見ていな
+    # かった。ここで直接assertし、N14が無検出になる条件をこのテスト自身にも
+    # 明示的に残す("eps_none"は意図的にNone、"eps_medium_cyclical"は非None
+    # であることの両方を固定する)。
+    if fx is _DAIKYO_NISHIKAWA:
+        assert captured["normalized_eps_confidence"] is not None
+    else:
+        assert captured["normalized_eps_confidence"] is None
+
+
+def test_issue_582_eps_medium_cyclical_fixture_is_not_vacuous_for_n14() -> None:
+    """サブちゃんレビュー対応(再レビューSHOULD、N14 vacuous対策の裏付け)。
+
+    上記parametrizeの"eps_medium_cyclical"ケースが実際にNone以外の値を
+    経由すること自体をここで固定する(fixtureの前提〔_DAIKYO_NISHIKAWAが
+    is_cyclical_industry=True〕が将来の実装変更で崩れた場合、このテスト自身が
+    真っ先に落ちて気づけるようにする)。
+    """
+    sector = classify_buy_industry_sector(
+        _DAIKYO_NISHIKAWA.industry, _DAIKYO_NISHIKAWA.sector, False
+    )
+    assert sector in CYCLICAL_SECTORS
+
+
+def test_buy_score_input_facts_includes_forecast_eps_and_bps_for_audit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """レビュー対応(2026-08、修正条件2): current_per/current_pbrは判定時点の
+    forecast_eps/forecast_bpsから算出された導出値であり、算出そのものを事後に
+    監査・再現するには元のforecast_eps/forecast_bps自体も判定時点入力として
+    保存されている必要がある。「表示に必要か」ではなく「判定時点の計算を
+    監査可能か」を基準に、buy_score_input_factsへ両者が保存されることを確認
+    する(current_per/current_pbrの値自体もforecast_eps/forecast_bpsと現在値
+    から算出した値と整合すること、すなわちforecast_eps/forecast_bpsが捏造値
+    ではなく実際にcurrent_per/current_pbr算出へ使われた入力そのものであること
+    も合わせて検証する)。
+    """
+    outcome = _analyze(monkeypatch, _NIHON_SHINYAKU)
+    rec = outcome.recommendation
+    assert rec is not None
+    facts = rec.buy_score_input_facts
+    assert facts is not None
+    assert facts["forecast_eps"] == str(_NIHON_SHINYAKU.forecast_eps)
+    assert facts["forecast_bps"] == str(_NIHON_SHINYAKU.forecast_bps)
+    # current_per = current_price / forecast_eps であることの整合性確認
+    # (forecast_epsが実際にcurrent_per算出へ使われた値と一致することの検証)。
+    expected_current_per = _NIHON_SHINYAKU.current_price / _NIHON_SHINYAKU.forecast_eps
+    assert facts["current_per"] == str(expected_current_per)
+    expected_current_pbr = _NIHON_SHINYAKU.current_price / _NIHON_SHINYAKU.forecast_bps
+    assert facts["current_pbr"] == str(expected_current_pbr)
+
+
+def test_buy_price_reliability_facts_and_config_snapshot_are_stored(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """レビュー対応(2026-08、BUY_PRICE_RELIABILITY_LOW具体的理由表示、必須
+    テストA/B): determine_buy_price_reliability()の判定に実際に使用した
+    入力事実(concerns自体含む)がbuy_score_input_facts、config閾値の判定
+    時点スナップショットがconfig_values_usedへ、それぞれ実際の判定時点値
+    で保存されることを確認する(LOW/OKいずれの判定結果でも、facts自体は
+    常に保存される)。
+    """
+    outcome = _analyze(monkeypatch, _NIHON_SHINYAKU)
+    rec = outcome.recommendation
+    assert rec is not None
+    facts = rec.buy_score_input_facts
+    assert facts is not None
+
+    # A: buy_score_input_facts(concerns自体と、他のどこにも判定時点値が
+    # 残らない入力事実)。
+    assert isinstance(facts["buy_price_reliability_concerns"], list)
+    assert facts["data_age_business_days"] == 0
+    assert "entry_margin_before_cap" in facts
+    assert "outlier_filter_blocking_reason" in facts
+    assert "valuation_methods_used_count" in facts
+    assert "valuation_excluded_outlier_count" in facts
+
+    # B: config_values_used(determine_buy_price_reliability()が参照する
+    # config由来の値の判定時点スナップショット)。
+    config_snapshot = rec.config_values_used
+    assert config_snapshot is not None
+    assert config_snapshot["maximum_entry_margin"] == pytest.approx(
+        _CONFIG.buy_decision.margin_of_safety.maximum_margin.entry
+    )
+    assert config_snapshot["valuation_dispersion_medium_max"] == pytest.approx(
+        _CONFIG.buy_decision.valuation_dispersion.medium_max
+    )
+
+
+def test_valuation_outlier_exclusions_captures_actual_outlier_filtered_method(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """レビュー対応(2026-08、commit f546473再レビュー、必須テスト1): 実際に
+    BuySignalServiceを通し、外れ値フィルタ(apply_outlier_filters())が1方式
+    (target_yield)を実際に除外するケースで、その方式・除外理由(exclusion_
+    detail相当)がbuy_score_input_facts["valuation_outlier_exclusions"]へ
+    正しく保存されることを確認する。Recommendation.valuation_methods自体は
+    外れ値フィルタ適用前のオブジェクトのため、この方式のexclusion_reasonは
+    Noneのままであること(=valuation_methodsからは復元できないこと)も
+    あわせて確認する。
+    """
+    outcome = _analyze(monkeypatch, _OUTLIER_EXCLUSION_STOCK)
+    rec = outcome.recommendation
+    assert rec is not None
+    facts = rec.buy_score_input_facts
+    assert facts is not None
+
+    exclusions = facts["valuation_outlier_exclusions"]
+    assert isinstance(exclusions, list)
+    assert len(exclusions) == 1
+    assert exclusions[0]["method"] == "target_yield"
+    assert "外れ値" in exclusions[0]["message"]
+    assert exclusions[0]["actual_value"] is not None
+    assert exclusions[0]["reference_value"] is not None
+
+    # Recommendation.valuation_methods(外れ値フィルタ適用前)では、この方式の
+    # exclusion_reasonがNoneのままであることを確認する(=このフィールドからは
+    # 外れ値除外の事実を復元できないことの実証)。
+    target_yield_method = next(m for m in rec.valuation_methods if m.method == "target_yield")
+    assert target_yield_method.exclusion_reason is None
+
+
+def test_dispersion_above_auto_buy_block_still_produces_anchor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #186: 方式間の乖離がauto_buy_block(2.00)を超えても、
+    valuation_anchorと買付価格は生成される。
+
+    従来はここでvaluation_confidenceをLOWにしてanchorをNoneにしていたが、
+    「ばらつきが大きいので自動で買わない」判断はdecide_buy_action()が同じ2.00で
+    既に持っており重複していた。重複の副作用として、方式値を上げるとanchorが
+    有 -> 無 -> 有 と非単調に反転していた(#186)。
+
+    安全機能(自動購入の禁止)は落ちていないことを、BuyActionと
+    VALUATION_DISPERSION_TOO_HIGHのBuyDecisionReasonで確認する。
+    """
+    outcome = _analyze(monkeypatch, _DISPERSION_STOCK)
+    rec = outcome.recommendation
+    assert rec is not None
+
+    # anchorと3価格が生成される(従来はいずれもNoneだった)。
+    assert rec.valuation_anchor is not None
+    assert rec.buy_prices is not None
+    assert rec.buy_prices.entry is not None
+    assert not any(r.code == "NO_VALUATION_ANCHOR" for r in rec.buy_decision_reasons)
+
+    facts = rec.buy_score_input_facts
+    assert facts is not None
+    assert facts["no_valuation_anchor_reason"] is None
+
+    # dispersionはauto_buy_blockを超えている(前提の確認)。
+    assert rec.valuation_dispersion_ratio is not None
+    assert rec.valuation_dispersion_ratio > 2.0
+
+    # 安全側: 価格が出てもBUY系にはならない。
+    # 本フィクスチャでは現在値(1000円)が打診買い価格を上回るため
+    # 価格条件の時点でWATCH_FOR_PRICEとなり、L4のMANUAL_REVIEW格下げには
+    # 到達しない(L4はBUY系に対してのみ作用する降格ゲートであるため)。
+    # L4そのものの回帰は
+    # tests/unit/test_valuation_dispersion_anchor_availability.py の
+    # test_l4_still_forces_manual_review_above_auto_buy_block で固定している。
+    assert rec.buy_action not in BUY_FAMILY_ACTIONS
+    assert rec.buy_action == BuyAction.WATCH_FOR_PRICE
+
+    # Issue #186: 判定時点のanchor_blockがconfig_values_usedへ残る。
+    assert rec.config_values_used["valuation_dispersion_anchor_block"] == 50.0
+
+
+def test_no_valuation_anchor_reason_captures_valuation_dispersion_too_high(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """必須テスト1・2(Issue #186で基準値をanchor_blockへ変更): 実際に
+    BuySignalServiceを通し、方式間の乖離がanchor_blockを超えて
+    valuation_anchorがNoneになる(=BuyDecisionReason.code="NO_VALUATION_ANCHOR"が
+    発火する)ケースで、buy_score_input_facts["no_valuation_anchor_reason"]へ
+    直接原因(VALUATION_DISPERSION_TOO_HIGH)が、判定時点の実測値
+    (dispersion_ratio)・実際に使用した基準値(anchor_block)ごと構造化して
+    保存されることを確認する。
+
+    reason codeは従来と同じものを再利用する。threshold_valueが判定時点の基準を
+    保持するため、旧レコード(2.0)と新レコード(50.0)は保存値だけで区別できる。
+    """
+    outcome = _analyze(monkeypatch, _EXTREME_DISPERSION_STOCK)
+    rec = outcome.recommendation
+    assert rec is not None
+    assert any(r.code == "NO_VALUATION_ANCHOR" for r in rec.buy_decision_reasons)
+    assert rec.valuation_anchor is None
+
+    facts = rec.buy_score_input_facts
+    assert facts is not None
+    reason = facts["no_valuation_anchor_reason"]
+    assert isinstance(reason, dict)
+    assert reason["code"] == "VALUATION_DISPERSION_TOO_HIGH"
+    assert reason["actual_value"] is not None
+    assert float(reason["actual_value"]) > 50.0
+    assert reason["threshold_value"] == "50.0"
+
+
+# ===== 再々コードレビュー対応(2026-08、JST暦日境界修正・指摘4):
+# in_trade_cooldown判定(cooldown_until_date比較)とWatchStateService.
+# evaluate_and_update()への「当日」がJST暦日基準になっていることの回帰。
+# evaluate_and_update()自体の呼び出し有無はbuy_actionの値に関わらず
+# in_trade_cooldown(cooldown_until_dateとの比較)だけで決まるため、
+# WatchStateService.evaluate_and_update()をspyし呼び出し有無で検証する
+# (実際にNEAR BUY監視が開始されるかどうかの判定条件には依存しない)。
+
+
+def _analyze_with_cooldown_entry(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+    fx: _StockFixture,
+    now: dt.datetime,
+    cooldown_until_date: dt.date,
+) -> list[dt.date]:
+    import dataclasses
+
+    from jstock_advisor.domain.entities.holdings_snapshot import HoldingsSnapshotEntry
+    from jstock_advisor.domain.entities.owner import DEFAULT_OWNER, build_holding_id
+    from jstock_advisor.infrastructure.local_repository.holdings_snapshot_repository import (
+        HoldingsSnapshotRepository,
+    )
+    from jstock_advisor.services.watch_state_service import WatchStateService
+
+    # data_fetched_atをnowに揃える(このテストの関心事(cooldown判定のJST基準日)とは
+    # 無関係なデータ鮮度ゲートが、_NOWから離れたnowにより誤って発火しないようにする)。
+    # Issue #52 Phase B2: price_as_of_date も now に揃える。
+    # 本テストの関心事はcooldown判定のJST基準日であり、価格鮮度ではない。
+    # 未来日を使って回避しない(未来日はtimestamp異常として弾かれる)。
+    snapshot = dataclasses.replace(
+        _build_snapshot(fx),
+        data_fetched_at=now,
+        price_as_of_date=expected_latest_completed_trading_session(now, _CALENDAR),
+    )
+    monkeypatch.setattr(service_module, "build_stock_snapshot", lambda *a, **kw: (snapshot, None))
+
+    calls: list[dt.date] = []
+    original_evaluate_and_update = WatchStateService.evaluate_and_update
+
+    def _spy_evaluate_and_update(self, *args, **kwargs):
+        calls.append(kwargs["today"])
+        return original_evaluate_and_update(self, *args, **kwargs)
+
+    monkeypatch.setattr(WatchStateService, "evaluate_and_update", _spy_evaluate_and_update)
+
+    holdings_snapshot_repo = HoldingsSnapshotRepository(store_dir=tmp_path)
+    holdings_snapshot_repo.upsert(
+        HoldingsSnapshotEntry(
+            owner=DEFAULT_OWNER,
+            holding_id=build_holding_id(DEFAULT_OWNER, fx.stock_code),
+            stock_code=fx.stock_code,
+            shares=100,
+            average_purchase_price=Decimal("1000"),
+            recorded_at=cooldown_until_date - dt.timedelta(days=10),
+            cooldown_until_date=cooldown_until_date,
+            active_holding=True,
+        )
+    )
+    service = BuySignalService(
+        providers=_providers(),
+        config=_CONFIG,
+        business_calendar=_CALENDAR,
+        holdings_snapshot_repository=holdings_snapshot_repo,
+    )
+    service.analyze(fx.stock_code, now, RecommendationType.BUY)
+    return calls
+
+
+def test_in_trade_cooldown_uses_jst_business_date_not_utc(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """指摘4回帰: cooldown_until_date=2026-08-20の銘柄について、
+    2026-08-20 23:30 UTC(=2026-08-21 08:30 JST)時点の評価では、
+    JST暦日(2026-08-21)がcooldown_until_dateを超えているため、既に解除済みと
+    判定されWatchStateService.evaluate_and_update()が呼ばれること(UTC暦日
+    (2026-08-20)のままであれば誤ってまだクールダウン中と判定され、呼ばれない)。
+    """
+    now = dt.datetime(2026, 8, 20, 23, 30, tzinfo=dt.UTC)
+    calls = _analyze_with_cooldown_entry(monkeypatch, tmp_path, _TACHI_S, now, dt.date(2026, 8, 20))
+    assert calls == [dt.date(2026, 8, 21)]
+
+
+def test_in_trade_cooldown_still_blocks_watch_state_within_jst_business_date(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """指摘4回帰(対照ケース): cooldown_until_date=2026-08-21の銘柄について、
+    同じく2026-08-20 23:30 UTC(=2026-08-21 08:30 JST)時点では、JST暦日
+    (2026-08-21)がまだcooldown_until_date以下のため、引き続きクールダウン中と
+    判定されWatchStateService.evaluate_and_update()が呼ばれないこと。"""
+    now = dt.datetime(2026, 8, 20, 23, 30, tzinfo=dt.UTC)
+    calls = _analyze_with_cooldown_entry(monkeypatch, tmp_path, _TACHI_S, now, dt.date(2026, 8, 21))
+    assert calls == []
+
+
+# --- Issue #22 Phase 3.5(2026-08-28): 観測用snapshotの保存 -------------------
+
+
+def test_phase35_observation_snapshot_stored_with_schema_version(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Phase 3.5の観測用snapshotが正式schema version付きで、判定時点値
+    のまま保存されることを確認する。このキーを持たない既存レコードは
+    LEGACY_UNVERSIONEDとして扱う(キー数から世代を推測しない)。
+
+    Issue #22 Phase B2(2026-09-13)でv2 shadowのforward replay用の判定時点
+    入力を追加したため、期待値は"v1"から"v2"へ変わる。観測キーの追加自体が
+    互換性を壊さないという方針(下記のadditiveテスト)は変えていない。B2の
+    設計がschema versionの引き上げを要求しているため上げたものである。
+    """
+    outcome = _analyze(monkeypatch, _NIHON_SHINYAKU)
+    rec = outcome.recommendation
+    assert rec is not None
+    facts = rec.buy_score_input_facts
+    assert facts is not None
+
+    assert facts["buy_score_input_facts_schema_version"] == "v2"
+    # Common Quality候補の本来値(fixtureではいずれも未設定=判定時点の事実)
+    assert facts["net_income"] is None
+    assert facts["is_deficit"] is False
+    assert facts["is_debt_excess"] is False
+    assert facts["latest_operating_cashflow"] is None
+    assert facts["trailing_eps"] is None
+    # 時系列(fixtureは空系列。空でもキー自体は必ず保存される)
+    assert facts["operating_income_periods"] == []
+    assert facts["operating_cashflow_periods"] == []
+    assert facts["operating_cf_positive_streak"] == {
+        "streak": 0,
+        "periods_available": 0,
+        "latest_period_type": None,
+        "recent_periods_source": "UNAVAILABLE",
+    }
+    # EPS系列: source/coverage_limitationがデータ自体に明示される
+    eps_payload = facts["historical_valuation_eps_periods"]
+    assert eps_payload["source"] == "historical_valuations"
+    assert eps_payload["coverage_limitation"] == "VALUATION_DATA_DEPENDENT"
+    assert eps_payload["periods"] == []  # fixtureのhistorical_valuationsはeps=None
+    # 割安度4カテゴリ明細と7component状況
+    assert len(facts["undervaluation_categories"]) == 4
+    assert set(facts["component_states"].keys()) == {
+        "total_yield_attractiveness",
+        "dividend_sustainability",
+        "financial_health",
+        "undervaluation",
+        "shareholder_benefit_value",
+        "earnings_stability",
+        "price_stability",
+    }
+    # config_values_used: 割安度カテゴリ上限点とモジュール定数閾値のスナップショット
+    caps_snapshot = rec.config_values_used["undervaluation_category_caps"]
+    assert caps_snapshot == {
+        "valuation_multiple": _CONFIG.buy_decision.undervaluation_category_caps.valuation_multiple,
+        "yield": _CONFIG.buy_decision.undervaluation_category_caps.yield_,
+        "fair_value": _CONFIG.buy_decision.undervaluation_category_caps.fair_value,
+        "market_price_action": (
+            _CONFIG.buy_decision.undervaluation_category_caps.market_price_action
+        ),
+    }
+    thresholds_snapshot = rec.config_values_used["undervaluation_signal_thresholds"]
+    assert thresholds_snapshot["drawdown_from_high_threshold_pct"] == -15.0
+    assert thresholds_snapshot["price_down_despite_stable_earnings_threshold_pct"] == -10.0
+    assert thresholds_snapshot["earnings_severe_decline_threshold_pct"] == -30.0
+
+
+def test_phase35_recommendation_carries_default_score_model_version(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Phase 3.5ではcompany_quality_score_model_versionのread/write互換のみを
+    先行導入し、書き込み値は"v1"のまま("v2"の書き込みはPhase 4以降)。"""
+    outcome = _analyze(monkeypatch, _NIHON_SHINYAKU)
+    rec = outcome.recommendation
+    assert rec is not None
+    assert rec.company_quality_score_model_version == "v1"
+
+
+def test_phase35_period_series_capped_at_max_periods(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """時系列snapshotは直近_FACTS_SERIES_MAX_PERIODS(8)期のみ保存される
+    (providerが取得期間を拡大してもpayloadが無制限に増加しないための上限)。
+    streakとperiod_type/recent_periods_sourceの併存保存も確認する。"""
+    import dataclasses
+
+    from jstock_advisor.domain.entities.enums import PeriodType, RecentPeriodsSource
+    from jstock_advisor.domain.financial_series import FinancialPeriodValue
+
+    cf_periods = [
+        FinancialPeriodValue(
+            value=Decimal("50") if i != 9 else Decimal("-10"),  # 最古期のみ赤字
+            period_end=dt.date(2026 - i, 3, 31),
+            period_type=PeriodType.ANNUAL,
+        )
+        for i in range(10)  # 10期分(上限8を超える)を用意
+    ]
+    snapshot = _build_snapshot(_NIHON_SHINYAKU)
+    snapshot = dataclasses.replace(
+        snapshot,
+        quarterly_operating_cashflow_periods=cf_periods,
+        # FinancialSummaryはPydanticモデル(ImmutableSnapshot)のためmodel_copyを使う
+        financial=snapshot.financial.model_copy(
+            update={"recent_periods_source": RecentPeriodsSource.ANNUAL_FALLBACK}
+        ),
+    )
+    monkeypatch.setattr(service_module, "build_stock_snapshot", lambda *a, **kw: (snapshot, None))
+    service = BuySignalService(providers=_providers(), config=_CONFIG, business_calendar=_CALENDAR)
+    outcome = service.analyze(_NIHON_SHINYAKU.stock_code, _NOW, RecommendationType.BUY)
+    rec = outcome.recommendation
+    assert rec is not None
+    facts = rec.buy_score_input_facts
+    assert facts is not None
+
+    series = facts["operating_cashflow_periods"]
+    assert len(series) == 8  # 10期 -> 直近8期のみ
+    assert series[0]["period_end"] == "2019-03-31"  # 最古2期(2017/2018)は切り捨て
+    assert series[-1]["period_end"] == "2026-03-31"
+    assert all(entry["period_type"] == "ANNUAL" for entry in series)
+
+    streak_payload = facts["operating_cf_positive_streak"]
+    # 最古期(2017-03-31)のみ赤字 -> 直近から9期連続黒字(streak自体は全期間で計算)
+    assert streak_payload["streak"] == 9
+    assert streak_payload["periods_available"] == 10
+    assert streak_payload["latest_period_type"] == "ANNUAL"
+    assert streak_payload["recent_periods_source"] == "ANNUAL_FALLBACK"
+
+
+def test_phase35_suppression_is_reason_code_not_state() -> None:
+    """抑止(severe_earnings_decline)はstateではなくreason_codeとして保存される
+    (stateの語彙はEVALUATED/NOT_EVALUATED/NOT_APPLICABLEの3種に統一)。
+
+    正式な観測仕様として、抑止は以下の2形式を区別する(v1の
+    compute_undervaluation_signals()の実際の挙動と一致した定義。
+    コードレビューPASS_WITH_CONDITIONS対応):
+      形式1: value=False + SUPPRESSED_*
+        入力から本来のbool評価が可能だったが、上位ルールによりFalseへ
+        強制された(drawdown_from_52w_high / below_fair_value)
+      形式2: value=None + SUPPRESSED_*
+        必要入力自体は揃っていたが、上位ルールによりシグナル評価そのものを
+        実施しなかった(price_down_despite_stable_earnings)
+    reason_codeが無いvalue=Noneは「必要入力の不足による判定不能」であり、
+    上記2形式(抑止)とは区別される。"""
+    from jstock_advisor.domain.scoring.score import UndervaluationSignals
+    from jstock_advisor.domain.scoring.undervaluation_categories import (
+        build_undervaluation_category_details,
+    )
+    from jstock_advisor.services.buy_signal_service import (
+        _serialize_undervaluation_categories,
+    )
+
+    # severe_earnings_decline時のcompute_undervaluation_signals()出力を再現:
+    # below_fair_valueは一度bool評価された後にFalseへ強制(形式1)、
+    # price_down_despite_stable_earningsは評価式自体へ入らずNoneのまま(形式2)
+    signals = UndervaluationSignals(
+        per_below_median=True,
+        below_fair_value=False,
+        price_down_despite_stable_earnings=None,
+    )
+    details = build_undervaluation_category_details(
+        signals, _CONFIG.buy_decision.undervaluation_category_caps
+    )
+    payload = _serialize_undervaluation_categories(
+        details,
+        suppressed_signal_reasons={
+            "below_fair_value": "SUPPRESSED_BY_SEVERE_EARNINGS_DECLINE",
+            "price_down_despite_stable_earnings": "SUPPRESSED_BY_SEVERE_EARNINGS_DECLINE",
+        },
+    )
+    by_category = {entry["category"]: entry for entry in payload}
+
+    fair_value = by_category["fair_value"]
+    # 【形式1】value=False + SUPPRESSED_*: bool評価が可能だったがFalseへ強制。
+    # 抑止されてもstateはEVALUATED(値Falseとして評価に使われた事実)のまま
+    assert fair_value["state"] == "EVALUATED"
+    assert "SUPPRESSED_BY_SEVERE_EARNINGS_DECLINE" in fair_value["reason_codes"]
+    assert fair_value["signal_results"]["below_fair_value"] == {
+        "value": False,
+        "reason_code": "SUPPRESSED_BY_SEVERE_EARNINGS_DECLINE",
+    }
+
+    market = by_category["market_price_action"]
+    # 【形式2】value=None + SUPPRESSED_*: 必要入力は揃っていたが、上位ルール
+    # によりシグナル評価そのものを実施しなかった(Falseへの強制ではない)
+    assert market["signal_results"]["price_down_despite_stable_earnings"] == {
+        "value": None,
+        "reason_code": "SUPPRESSED_BY_SEVERE_EARNINGS_DECLINE",
+    }
+    # 【抑止ではないNone】必要入力の不足による判定不能 -> reason_codeなし。
+    # 形式2(value=None+SUPPRESSED_*)とはreason_codeの有無で区別される
+    assert market["signal_results"]["drawdown_from_52w_high"] == {
+        "value": None,
+        "reason_code": None,
+    }
+
+    # 抑止と無関係なカテゴリにはSUPPRESSEDが付かない
+    vm = by_category["valuation_multiple"]
+    assert vm["state"] == "EVALUATED"
+    assert "SUPPRESSED_BY_SEVERE_EARNINGS_DECLINE" not in vm["reason_codes"]
+    # 全カテゴリでstateは3値語彙のみ
+    assert all(
+        entry["state"] in {"EVALUATED", "NOT_EVALUATED", "NOT_APPLICABLE"} for entry in payload
+    )
+
+
+def test_phase35_v1_score_and_actions_unchanged_by_observation_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """観測用フィールドの追加がv1の判定結果へ一切影響しないことの回帰。
+    既存テスト(§21の5銘柄回帰等)が判定結果自体を固定しているため、ここでは
+    「観測フィールドを除いた既存facts/score構造がそのまま維持されている」
+    ことを確認する。"""
+    outcome = _analyze(monkeypatch, _NIHON_SHINYAKU)
+    rec = outcome.recommendation
+    assert rec is not None
+    # 既存キーが従来どおりの形式で残っている(観測キー追加による破壊なし)
+    facts = rec.buy_score_input_facts
+    assert facts is not None
+    assert facts["forecast_eps"] == str(_NIHON_SHINYAKU.forecast_eps)
+    assert isinstance(facts["quarterly_operating_incomes"], list)
+    assert all(isinstance(v, str) for v in facts["quarterly_operating_incomes"])
+    # score_breakdownの7component構造・合計は不変
+    assert rec.score_breakdown is not None
+    assert rec.company_quality_score == rec.score_breakdown.total
+
+
+def test_phase35_no_suppression_reason_codes_in_normal_case() -> None:
+    """severe declineでない通常ケースでは、いかなるsignal_resultsにも
+    SUPPRESSED_*が付かず、reason_codeはすべてNoneのまま(保存内容不変)。
+    value=Noneは「必要入力の不足による判定不能」のみを意味する。"""
+    from jstock_advisor.domain.scoring.score import UndervaluationSignals
+    from jstock_advisor.domain.scoring.undervaluation_categories import (
+        build_undervaluation_category_details,
+    )
+    from jstock_advisor.services.buy_signal_service import (
+        _serialize_undervaluation_categories,
+    )
+
+    signals = UndervaluationSignals(
+        per_below_median=True,
+        below_fair_value=False,  # 通常の評価結果としてのFalse(強制ではない)
+        drawdown_from_52w_high=None,  # 入力不足による判定不能
+    )
+    details = build_undervaluation_category_details(
+        signals, _CONFIG.buy_decision.undervaluation_category_caps
+    )
+    payload = _serialize_undervaluation_categories(details, suppressed_signal_reasons={})
+
+    for entry in payload:
+        assert "SUPPRESSED_BY_SEVERE_EARNINGS_DECLINE" not in entry["reason_codes"]
+        for signal in entry["signal_results"].values():
+            assert signal["reason_code"] is None
+    by_category = {entry["category"]: entry for entry in payload}
+    # 通常の評価結果としてのFalseにはreason_codeが付かない(形式1と区別される)
+    assert by_category["fair_value"]["signal_results"]["below_fair_value"] == {
+        "value": False,
+        "reason_code": None,
+    }
+
+
+def test_issue23_data_age_business_days_uses_jst_calendar_dates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #23: buy_signal_service側のデータ鮮度計算(data_age_business_days)も
+    JPX営業日計算の両端をJST暦日で行う。fetched=JST月曜23:00(UTC月曜14:00)、
+    now=JST火曜08:30(UTC月曜23:30)ならJST基準で1営業日(修正前はUTC暦日同士で
+    0営業日と数えていた)。Phase 3.5の観測snapshotには判定に実際に使用した値が
+    そのまま保存される。"""
+    import dataclasses
+
+    fetched = dt.datetime(2026, 8, 3, 14, 0, tzinfo=dt.UTC)  # JST 08-03(月)23:00
+    now = dt.datetime(2026, 8, 3, 23, 30, tzinfo=dt.UTC)  # JST 08-04(火)08:30
+    snapshot = _build_snapshot(_TACHI_S)
+    # Issue #52 Phase B2: 本テストの関心事は data_age のJST暦日計算であり、
+    # 価格鮮度ではない。now(JST 08-04 08:30 = 寄付前)時点の期待セッションへ揃える
+    # (既定は _NOW = 08-04 大引け後 基準のため、この now では未来日になる)。
+    snapshot = dataclasses.replace(
+        snapshot,
+        data_fetched_at=fetched,
+        price_as_of_date=expected_latest_completed_trading_session(now, _CALENDAR),
+    )
+    monkeypatch.setattr(service_module, "build_stock_snapshot", lambda *a, **kw: (snapshot, None))
+    service = BuySignalService(providers=_providers(), config=_CONFIG, business_calendar=_CALENDAR)
+    outcome = service.analyze(_TACHI_S.stock_code, now, RecommendationType.BUY)
+    rec = outcome.recommendation
+    assert rec is not None
+    facts = rec.buy_score_input_facts
+    assert facts is not None
+    assert facts["data_age_business_days"] == 1
+
+
+# --- Issue #53 Phase B2: 開示情報の取得可否によるBUY判定ポリシー ---------------
+# 「開示リスクを検出した」と「開示情報を調査できなかった」を混同しないこと。
+
+
+def _analyze_with_disclosure(
+    monkeypatch: pytest.MonkeyPatch,
+    fx: _StockFixture,
+    availability: DisclosureAvailability,
+    unavailable_reason: DisclosureUnavailableReason | None = None,
+    disclosure_risk_keywords_found: list[str] | None = None,
+) -> service_module.BuyAnalysisOutcome:
+    snapshot = _build_snapshot(
+        fx,
+        disclosure_availability=availability,
+        disclosure_unavailable_reason=unavailable_reason,
+        disclosure_risk_keywords_found=disclosure_risk_keywords_found,
+    )
+    monkeypatch.setattr(service_module, "build_stock_snapshot", lambda *a, **kw: (snapshot, None))
+    service = BuySignalService(providers=_providers(), config=_CONFIG, business_calendar=_CALENDAR)
+    return service.analyze(fx.stock_code, _NOW, RecommendationType.BUY)
+
+
+def test_buy_available_empty_disclosure_is_not_excluded_for_disclosure_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AVAILABLE + 開示0件は「開示リスクなし」。開示を理由に除外されない。"""
+    outcome = _analyze_with_disclosure(
+        monkeypatch, _NIHON_SHINYAKU, DisclosureAvailability.AVAILABLE
+    )
+
+    assert outcome.buy_action is not BuyAction.DATA_INSUFFICIENT
+    assert not any("開示" in reason for reason in outcome.exclusion_reasons)
+
+
+def test_buy_available_risky_disclosure_is_excluded_as_disclosure_risk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AVAILABLE + リスクキーワード検出は従来どおり開示リスクで除外される。"""
+    outcome = _analyze_with_disclosure(
+        monkeypatch,
+        _NIHON_SHINYAKU,
+        DisclosureAvailability.AVAILABLE,
+        disclosure_risk_keywords_found=["上場廃止"],
+    )
+
+    assert outcome.buy_action == BuyAction.EXCLUDED
+    assert any("リスクキーワード" in reason for reason in outcome.exclusion_reasons)
+    # 「調査できなかった」ではなく「検出した」ため、評価不能にはしない
+    assert outcome.buy_action is not BuyAction.DATA_INSUFFICIENT
+
+
+def test_buy_unavailable_disclosure_is_data_insufficient_not_disclosure_risk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """UNAVAILABLEは評価不能(DATA_INSUFFICIENT)。開示リスク検出とは別物。"""
+    outcome = _analyze_with_disclosure(
+        monkeypatch,
+        _NIHON_SHINYAKU,
+        DisclosureAvailability.UNAVAILABLE,
+        unavailable_reason=DisclosureUnavailableReason.TEMPORARY_FAILURE,
+    )
+
+    assert outcome.buy_action == BuyAction.DATA_INSUFFICIENT
+    assert outcome.buy_action not in BUY_FAMILY_ACTIONS
+    assert outcome.recommendation is None
+    assert outcome.ranking_group is None
+    # 「リスクキーワードを検出した」という表現にはならない
+    assert not any("リスクキーワード" in reason for reason in outcome.exclusion_reasons)
+    assert outcome.data_error is not None
+    assert "取得できなかった" in outcome.data_error
+    # Issue #582: 早期returnの経路(推奨が生成されない)ではshadow入力も設定しない
+    assert outcome.valuation_confidence_shadow_inputs is None
+
+
+def test_buy_unavailable_disclosure_does_not_pass_as_clean(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """UNAVAILABLEを「問題開示なし」として通過させない。"""
+    outcome = _analyze_with_disclosure(
+        monkeypatch,
+        _NIHON_SHINYAKU,
+        DisclosureAvailability.UNAVAILABLE,
+        unavailable_reason=DisclosureUnavailableReason.NOT_CONFIGURED,
+    )
+
+    assert outcome.buy_action not in BUY_FAMILY_ACTIONS
+    assert outcome.recommendation is None
+
+
+# --- Issue #54 Phase B-1(2026-08-29): 業種分類canonical観測(shadow) -----------
+#
+# 本節のテストが固定する最重要契約は「**観測はBUY判定を一切変えない**」ことである。
+# CYCLICAL/DEFENSIVEやREIT除外といった死んだ判定の復活は Phase B-2 の範囲であり、
+# B-1では観測のみを行う(適正価格と対象母集団が変わるため、観測結果を確認せずに
+# 復活させない)。
+
+
+def _jpx_source(entries: dict[str, JpxIndustryEntry]) -> JpxIndustrySource:
+    """一覧を読み込み済みのJpxIndustrySource(キャッシュ読み取りを行わない)。
+
+    空dictを渡した場合は「一覧は読めたが当該銘柄が無い」= `NOT_FOUND` になる。
+    「一覧そのものを読めない」= `SOURCE_UNAVAILABLE` は `_UnavailableJpxSource` を使う。
+    """
+    source = JpxIndustrySource()
+    source._map = entries  # noqa: SLF001 - テスト用に読み込み済み状態を直接構成する
+    return source
+
+
+class _UnavailableJpxSource(JpxIndustrySource):
+    """JPXキャッシュを読めない状態のソース(例外は送出しない)。"""
+
+    def lookup(self, stock_code: str) -> JpxIndustryLookup:
+        return JpxIndustryLookup(status=JpxLookupStatus.SOURCE_UNAVAILABLE)
+
+
+def _analyze_with_jpx(
+    monkeypatch: pytest.MonkeyPatch,
+    fx: _StockFixture,
+    jpx_industry_source: JpxIndustrySource | None,
+) -> service_module.BuyAnalysisOutcome:
+    snapshot = _build_snapshot(fx)
+    monkeypatch.setattr(service_module, "build_stock_snapshot", lambda *a, **kw: (snapshot, None))
+    service = BuySignalService(
+        providers=_providers(),
+        config=_CONFIG,
+        business_calendar=_CALENDAR,
+        jpx_industry_source=jpx_industry_source,
+    )
+    return service.analyze(fx.stock_code, _NOW, RecommendationType.BUY)
+
+
+_JPX_ENTRY = JpxIndustryEntry(
+    industry_33_code="3050",
+    industry_33_name="医薬品",
+    market_segment="プライム（内国株式）",
+)
+
+
+def test_canonical_industry_observation_records_jpx_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """JPXで解決できた場合、33業種コードと証券種別が観測として保存される。"""
+    outcome = _analyze_with_jpx(
+        monkeypatch,
+        _NIHON_SHINYAKU,
+        _jpx_source({_NIHON_SHINYAKU.stock_code: _JPX_ENTRY}),
+    )
+    rec = outcome.recommendation
+    assert rec is not None
+    facts = rec.buy_score_input_facts
+    assert facts is not None
+
+    observation = facts["canonical_industry_observation"]
+    assert observation["canonical_industry_33_code"] == "3050"
+    assert observation["canonical_industry_33_name"] == "医薬品"
+    assert observation["canonical_security_type"] == "COMMON_STOCK"
+    assert observation["canonical_source"] == "JPX_TSE33"
+    assert observation["jpx_lookup_status"] == "RESOLVED"
+
+
+def test_canonical_industry_observation_records_unresolved_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """JPXで解決できない銘柄はUNKNOWNのまま記録し、provider値で埋めない。
+
+    Phase B-2の判断材料は「JPX解決率」であるため、解決できなかったことを
+    yfinanceの値で塗りつぶしてはならない。
+    """
+    outcome = _analyze_with_jpx(monkeypatch, _NIHON_SHINYAKU, _jpx_source({}))
+    rec = outcome.recommendation
+    assert rec is not None
+    facts = rec.buy_score_input_facts
+    assert facts is not None
+
+    observation = facts["canonical_industry_observation"]
+    assert observation["canonical_industry_33_code"] is None
+    assert observation["canonical_security_type"] == "UNKNOWN"
+    assert observation["canonical_source"] == "YFINANCE_FALLBACK"
+    # 「一覧は読めたが当該銘柄が無い」ことを、読めなかった場合と区別して記録する。
+    assert observation["jpx_lookup_status"] == "NOT_FOUND"
+    # 観測のために見た値はそのまま残す(canonicalへは昇格させない)。
+    assert observation["provider_sector"] == _NIHON_SHINYAKU.sector
+    assert observation["provider_industry"] == _NIHON_SHINYAKU.industry
+
+
+def test_canonical_industry_observation_records_existing_classifier_outputs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """既存4分類器が同一入力に対して実際に返した値を、是正せず並記する。
+
+    yfinanceは市場区分を提供せず(`market_segment=None`)、`security_type`も
+    既定値"STOCK"のままであるため、REIT除外が到達不能である現状もここに記録される。
+    """
+    outcome = _analyze_with_jpx(
+        monkeypatch,
+        _NIHON_SHINYAKU,
+        _jpx_source({_NIHON_SHINYAKU.stock_code: _JPX_ENTRY}),
+    )
+    rec = outcome.recommendation
+    assert rec is not None
+    facts = rec.buy_score_input_facts
+    assert facts is not None
+
+    observation = facts["canonical_industry_observation"]
+    assert observation["financial_industry_classification"] in {
+        classification.value for classification in IndustryClassification
+    }
+    assert observation["buy_industry_sector"] in {sector.value for sector in BuyIndustrySector}
+    assert observation["profit_taking_industry_sector"] in {
+        sector.value for sector in ProfitTakingIndustrySector
+    }
+    assert observation["stock_type_cyclical_or_defensive"] == []
+    assert observation["provider_security_type"] == "STOCK"
+    assert observation["provider_market_segment"] is None
+
+
+def test_canonical_industry_observation_does_not_change_buy_decision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """**shadow性の証明**: JPXで解決できてもできなくても判定結果が変わらない。
+
+    B-1で判定が動いてしまうと、Phase B-2で「観測結果を見てから復活させる」という
+    段階分けが成立しない。
+    """
+    resolved = _analyze_with_jpx(
+        monkeypatch,
+        _NIHON_SHINYAKU,
+        _jpx_source({_NIHON_SHINYAKU.stock_code: _JPX_ENTRY}),
+    )
+    unresolved = _analyze_with_jpx(monkeypatch, _NIHON_SHINYAKU, _jpx_source({}))
+
+    assert resolved.buy_action == unresolved.buy_action
+    assert resolved.ranking_group == unresolved.ranking_group
+    assert resolved.exclusion_reasons == unresolved.exclusion_reasons
+    assert resolved.recommendation is not None
+    assert unresolved.recommendation is not None
+    assert resolved.recommendation.total_score == unresolved.recommendation.total_score
+    assert (
+        resolved.recommendation.fair_value_at_recommendation
+        == unresolved.recommendation.fair_value_at_recommendation
+    )
+    assert resolved.recommendation.buy_prices == unresolved.recommendation.buy_prices
+    assert resolved.recommendation.score_breakdown == unresolved.recommendation.score_breakdown
+    assert resolved.recommendation.reasons == unresolved.recommendation.reasons
+
+
+def test_reit_security_type_does_not_change_buy_decision_in_phase_b1(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """REITと観測されてもB-1では除外しない(除外の復活はPhase B-2)。"""
+    reit_entry = JpxIndustryEntry(
+        industry_33_code="8050",
+        industry_33_name="不動産業",
+        market_segment="REIT・ベンチャーファンド・カントリーファンド・インフラファンド",
+    )
+    reit = _analyze_with_jpx(
+        monkeypatch, _NIHON_SHINYAKU, _jpx_source({_NIHON_SHINYAKU.stock_code: reit_entry})
+    )
+    baseline = _analyze_with_jpx(monkeypatch, _NIHON_SHINYAKU, _jpx_source({}))
+
+    assert reit.recommendation is not None
+    observation = reit.recommendation.buy_score_input_facts["canonical_industry_observation"]
+    assert observation["canonical_security_type"] == "REIT"
+    # 観測はREITだが、判定は従来どおり。
+    assert reit.buy_action == baseline.buy_action
+    assert reit.exclusion_reasons == baseline.exclusion_reasons
+
+
+def test_jpx_source_failure_does_not_break_analysis(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """**JPXキャッシュを読めなくてもBUY判定は一切変わらない**。
+
+    B-1はshadow observationであり、観測のためにBUYパイプラインを止めてはならない
+    (#59 の provider failure contract は外部provider取得に対する契約であり、
+    ローカルcacheを読む観測専用sourceの失敗をBUY失敗へ昇格させる必要はない)。
+    """
+    failing = _analyze_with_jpx(monkeypatch, _NIHON_SHINYAKU, _UnavailableJpxSource())
+    baseline = _analyze_with_jpx(monkeypatch, _NIHON_SHINYAKU, _jpx_source({}))
+
+    assert failing.buy_action == baseline.buy_action
+    assert failing.ranking_group == baseline.ranking_group
+    assert failing.exclusion_reasons == baseline.exclusion_reasons
+    assert failing.data_error == baseline.data_error
+    assert failing.recommendation is not None
+    assert baseline.recommendation is not None
+    assert failing.recommendation.total_score == baseline.recommendation.total_score
+    assert (
+        failing.recommendation.fair_value_at_recommendation
+        == baseline.recommendation.fair_value_at_recommendation
+    )
+    assert failing.recommendation.buy_prices == baseline.recommendation.buy_prices
+
+
+def test_source_unavailable_is_recorded_distinctly_from_not_found(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """**観測データ上で「一覧に無い」と「一覧を読めない」が別値になること**。
+
+    ここが潰れると、JPX解決率の低さが銘柄側の事情なのかキャッシュ障害なのかを
+    区別できず、Phase B-2 の実施可否を判断できない。
+    """
+    unavailable = _analyze_with_jpx(monkeypatch, _NIHON_SHINYAKU, _UnavailableJpxSource())
+    not_found = _analyze_with_jpx(monkeypatch, _NIHON_SHINYAKU, _jpx_source({}))
+
+    assert unavailable.recommendation is not None
+    assert not_found.recommendation is not None
+    unavailable_obs = unavailable.recommendation.buy_score_input_facts[
+        "canonical_industry_observation"
+    ]
+    not_found_obs = not_found.recommendation.buy_score_input_facts["canonical_industry_observation"]
+
+    assert unavailable_obs["jpx_lookup_status"] == "SOURCE_UNAVAILABLE"
+    assert not_found_obs["jpx_lookup_status"] == "NOT_FOUND"
+    # canonical_sourceは同値であり、これだけでは区別できない。
+    assert unavailable_obs["canonical_source"] == not_found_obs["canonical_source"]
+
+
+def test_all_jpx_lookup_states_yield_identical_buy_decision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #116: 3つのshadow状態すべてでBUY判定が完全に一致することを固定する。
+
+    #116 は infra 配線を直して `jpx_lookup_status` を
+    `SOURCE_UNAVAILABLE` 一色から実際の分布へ変える修正であり、
+    **観測精度だけを変え、判定は変えない**。本テストはその不変条件を
+    `RESOLVED` / `NOT_FOUND` / `SOURCE_UNAVAILABLE` の3値で同時に固定する
+    (既存テストは2値ずつの比較であり、3値同時かつ `screening_passed` を含む
+    形では固定されていなかった)。
+    """
+    outcomes = {
+        "RESOLVED": _analyze_with_jpx(
+            monkeypatch,
+            _NIHON_SHINYAKU,
+            _jpx_source({_NIHON_SHINYAKU.stock_code: _JPX_ENTRY}),
+        ),
+        "NOT_FOUND": _analyze_with_jpx(monkeypatch, _NIHON_SHINYAKU, _jpx_source({})),
+        "SOURCE_UNAVAILABLE": _analyze_with_jpx(
+            monkeypatch, _NIHON_SHINYAKU, _UnavailableJpxSource()
+        ),
+    }
+
+    # 観測値としては3状態が区別されている(潰れていない)ことを先に確認する。
+    statuses = {
+        name: outcome.recommendation.buy_score_input_facts["canonical_industry_observation"][
+            "jpx_lookup_status"
+        ]
+        for name, outcome in outcomes.items()
+        if outcome.recommendation is not None
+    }
+    assert statuses == {
+        "RESOLVED": "RESOLVED",
+        "NOT_FOUND": "NOT_FOUND",
+        "SOURCE_UNAVAILABLE": "SOURCE_UNAVAILABLE",
+    }
+
+    baseline = outcomes["RESOLVED"]
+    assert baseline.recommendation is not None
+    for name, outcome in outcomes.items():
+        assert outcome.recommendation is not None, name
+        assert outcome.screening_passed == baseline.screening_passed, name
+        assert outcome.buy_action == baseline.buy_action, name
+        assert outcome.ranking_group == baseline.ranking_group, name
+        assert outcome.exclusion_reasons == baseline.exclusion_reasons, name
+        assert outcome.data_error == baseline.data_error, name
+        assert outcome.recommendation.total_score == baseline.recommendation.total_score, name
+        assert outcome.recommendation.buy_prices == baseline.recommendation.buy_prices, name
+        assert (
+            outcome.recommendation.fair_value_at_recommendation
+            == baseline.recommendation.fair_value_at_recommendation
+        ), name
+        assert outcome.recommendation.score_breakdown == baseline.recommendation.score_breakdown, (
+            name
+        )
+
+
+def test_observation_key_is_additive_and_keeps_other_keys_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """観測キーの追加はoptional key追加であり、既存レコードとの互換性を壊さない。
+
+    `buy_score_input_facts` は判定に使わない観測用snapshotであり、消費者
+    (calibration dataset等)は必要なキーを個別に取り出す。したがって
+    観測キーの追加それ自体はbackfillを必要としない
+    (`FACTS_SCHEMA_VERSION` の方針コメント参照)。この判断をテストで固定する。
+
+    Issue #22 C1(2026-09-14): 本テストは以前
+    test_observation_key_is_additive_and_does_not_bump_facts_schema_version
+    という名前だったが、B2でversionが"v2"へ上がった際にassertだけを
+    書き換えたため、名前(引き上げない)と中身(引き上がっている)が逆の
+    意味になっていた。名前を実体へ合わせる。名前が固定していた命題
+    (観測キーの追加それ自体はversionの引き上げを必要としない)は、下の
+    test_facts_schema_version_is_read_from_the_constant_not_derived_from_facts
+    と test_facts_schema_version_constant_is_pinned_to_an_explicit_value
+    で固定する。
+
+    C1'(2026-09-14): 最初に書いた復元テストは恒真だった(同じfactsを絞って
+    作った2つのviewを比べており、本番コードへ与え直していなかった)。
+    独立レビューの反証で落ちないことが実測され、上記2件へ置き換えた。
+    """
+    outcome = _analyze_with_jpx(monkeypatch, _NIHON_SHINYAKU, _jpx_source({}))
+    rec = outcome.recommendation
+    assert rec is not None
+    facts = rec.buy_score_input_facts
+    assert facts is not None
+
+    assert facts["buy_score_input_facts_schema_version"] == "v2"
+    # 観測キーを取り除いた状態(=既存レコード)でも、他のキーは何も変わらない。
+    legacy_view = {k: v for k, v in facts.items() if k != "canonical_industry_observation"}
+    assert "canonical_industry_observation" not in legacy_view
+    assert legacy_view["buy_score_input_facts_schema_version"] == "v2"
+
+
+def test_facts_schema_version_is_read_from_the_constant_not_derived_from_facts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """観測キーを増やしたこと自体はschema versionを動かさない(Issue #22 C1')。
+
+    固定したい命題は「versionはfactsの中身(とくに観測キーの集合)から
+    導出されない」ことである。導出されないなら、観測キーを足しただけで
+    versionは動かず、動かすには定数を書き換える判断が要る。
+
+    ★ 恒真にしないための形
+      本番コードが返す値と、**本番コードの外から注入した値**を比べる。
+      同じfactsを絞って作ったviewどうしを比べない(それは同一物の比較で
+      あり、どんな実装でも通る)。
+
+    ★ 反証
+      version をキー集合から導出する実装
+      (例: f"v{len(buy_score_input_facts)}")へ差し替えると、注入した定数は
+      無視されるため本テストはFAILする。C1'(2026-09-14)で実際に
+      差し替えて落ちることを確認した。
+
+    最初に書いた復元テストはこの反証で落ちなかった(恒真だった)。
+    """
+    # factsに現れうるどのキー名・キー数からも導出できない値を注入する。
+    sentinel = "v-sentinel-not-derivable-from-any-key-set"
+    monkeypatch.setattr(service_module, "FACTS_SCHEMA_VERSION", sentinel)
+
+    outcome = _analyze_with_jpx(monkeypatch, _NIHON_SHINYAKU, _jpx_source({}))
+    rec = outcome.recommendation
+    assert rec is not None
+    facts = rec.buy_score_input_facts
+    assert facts is not None
+
+    # 観測キーが実際に入っていること(前提が崩れたらテストの意味が無くなる)。
+    observation_only_keys = [
+        "canonical_industry_observation",
+        "common_quality_shadow",
+        "style_attractiveness_shadow",
+        "stock_classification_thresholds",
+    ]
+    assert [k for k in observation_only_keys if k in facts] == observation_only_keys
+
+    # 本番コードは定数をそのまま書いている = factsの中身から導出していない。
+    assert facts["buy_score_input_facts_schema_version"] == sentinel
+
+
+def test_facts_schema_version_constant_is_pinned_to_an_explicit_value() -> None:
+    """versionの値そのものを固定し、変更に必ず判断を挟ませる(Issue #22 C1')。
+
+    上のテストは「定数から読んでいる」ことを固定するが、定数の値が
+    いくつであるべきかは固定しない。観測キーを足したついでに値を動かす
+    変更は、ここで必ず落ちる。落ちたときは「今回の変更はforward replayの
+    識別のためにversionを動かす必要があるのか」を判断してから直す
+    (B2ではその判断の結果として v1 -> v2 へ上げた)。
+
+    ★ 反証
+      定数を消してキー集合から導出する実装にすると、参照そのものが
+      失敗して本テストもFAILする。
+    """
+    assert service_module.FACTS_SCHEMA_VERSION == "v2"
+
+
+def test_common_quality_shadow_failure_is_isolated_from_the_v1_decision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """common_quality shadowの算出で例外が出ても、v1の判定結果は1つも変わらない
+    (Issue #22 C2 / #384 PR-1レビュー対応)。
+
+    style_attractiveness_shadow・canonical_industry_observationには既に
+    同型のcaller-level例外注入テストがあったが、common_quality_shadowには
+    無く、この観測だけisolated_shadow_observation()を外す変異を入れても
+    既存テストがPASSしてしまう状態だった(独立レビューで指摘)。
+
+    固定するのは次の3点である(他2つのshadowテストと同じ観点)。
+      ・common_qualityの算出が落ちてもv1の出力(BuyAction / score / 買付価格)
+        が変わらない
+      ・失敗を握りつぶさない(「算出できなかった」がfactsに残る)
+      ・失敗を0.0や空へ潰さない
+    """
+    baseline = _analyze_with_jpx(monkeypatch, _NIHON_SHINYAKU, _jpx_source({}))
+    baseline_rec = baseline.recommendation
+    assert baseline_rec is not None
+    baseline_facts = baseline_rec.buy_score_input_facts
+    assert baseline_facts is not None
+    assert baseline_facts["common_quality_shadow"]["shadow_state"] == "COMPUTED"
+
+    def _boom(*args: object, **kwargs: object) -> object:
+        raise ZeroDivisionError("injected common quality shadow failure")
+
+    monkeypatch.setattr(service_module, "score_company_quality", _boom)
+    degraded = _analyze_with_jpx(monkeypatch, _NIHON_SHINYAKU, _jpx_source({}))
+    degraded_rec = degraded.recommendation
+    assert degraded_rec is not None
+
+    # 1 v1の出力が変わらない。
+    assert degraded_rec.buy_action == baseline_rec.buy_action
+    assert degraded_rec.raw_buy_action == baseline_rec.raw_buy_action
+    assert degraded_rec.total_score == baseline_rec.total_score
+    assert degraded_rec.company_quality_score == baseline_rec.company_quality_score
+    assert degraded_rec.entry_buy_price == baseline_rec.entry_buy_price
+    assert degraded_rec.standard_buy_price == baseline_rec.standard_buy_price
+    assert degraded_rec.strong_buy_price == baseline_rec.strong_buy_price
+    assert degraded_rec.valuation_anchor == baseline_rec.valuation_anchor
+    assert degraded_rec.confidence == baseline_rec.confidence
+
+    degraded_facts = degraded_rec.buy_score_input_facts
+    assert degraded_facts is not None
+
+    # 2 失敗が記録に残る(黙って何も保存しない、にしない)。
+    failed = degraded_facts["common_quality_shadow"]
+    assert failed["shadow_state"] == "COMPUTATION_FAILED"
+    assert failed["error_type"] == "ZeroDivisionError"
+
+    # 3 0.0や空へ潰さない。「算出できなかった」を「スコア0」「該当0件」と
+    # 読める形で保存しない。
+    assert "score" not in failed
+    assert "coverage_ratio" not in failed
+    assert "items" not in failed
+
+    # 4 隔離は観測ごと。もう片方のshadowは算出されたまま残る。
+    assert degraded_facts["style_attractiveness_shadow"]["shadow_state"] == "COMPUTED"
+    assert (
+        degraded_facts["style_attractiveness_shadow"]
+        == baseline_facts["style_attractiveness_shadow"]
+    )
+
+
+def test_shadow_failure_is_isolated_from_the_v1_decision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """shadowの算出で例外が出ても、v1の判定結果は1つも変わらない(Issue #22 C2)。
+
+    STYLE_ATTRACTIVENESS = SHADOW_ONLY / NON_BLOCKING はUSERが承認した性質
+    であり、「BUY判定へ接続しない」だけでは満たさない。算出がanalyze()の
+    本流にある限り、例外が出ればその銘柄だけでなくbatch全体が止まる。
+
+    ここで固定するのは次の3点である。
+      ・shadowが落ちてもv1の出力(BuyAction / score / 買付価格)が変わらない
+      ・失敗を握りつぶさない(「算出できなかった」がfactsに残る)
+      ・失敗を0.0や空へ潰さない(「魅力が無い」と読める形で保存しない)
+
+    隔離の粒度は観測ごとである。片方が落ちても、もう片方の観測は残る。
+    """
+    baseline = _analyze_with_jpx(monkeypatch, _NIHON_SHINYAKU, _jpx_source({}))
+    baseline_rec = baseline.recommendation
+    assert baseline_rec is not None
+    baseline_facts = baseline_rec.buy_score_input_facts
+    assert baseline_facts is not None
+    assert baseline_facts["style_attractiveness_shadow"]["shadow_state"] == "COMPUTED"
+
+    def _boom(*args: object, **kwargs: object) -> object:
+        raise ZeroDivisionError("injected shadow failure")
+
+    monkeypatch.setattr(service_module, "score_style_attractiveness", _boom)
+    degraded = _analyze_with_jpx(monkeypatch, _NIHON_SHINYAKU, _jpx_source({}))
+    degraded_rec = degraded.recommendation
+    assert degraded_rec is not None
+
+    # 1 v1の出力が変わらない。
+    assert degraded_rec.buy_action == baseline_rec.buy_action
+    assert degraded_rec.raw_buy_action == baseline_rec.raw_buy_action
+    assert degraded_rec.total_score == baseline_rec.total_score
+    assert degraded_rec.company_quality_score == baseline_rec.company_quality_score
+    assert degraded_rec.entry_buy_price == baseline_rec.entry_buy_price
+    assert degraded_rec.standard_buy_price == baseline_rec.standard_buy_price
+    assert degraded_rec.strong_buy_price == baseline_rec.strong_buy_price
+    assert degraded_rec.valuation_anchor == baseline_rec.valuation_anchor
+    assert degraded_rec.confidence == baseline_rec.confidence
+
+    degraded_facts = degraded_rec.buy_score_input_facts
+    assert degraded_facts is not None
+
+    # 2 失敗が記録に残る(黙って何も保存しない、にしない)。
+    failed = degraded_facts["style_attractiveness_shadow"]
+    assert failed["shadow_state"] == "COMPUTATION_FAILED"
+    assert failed["error_type"] == "ZeroDivisionError"
+
+    # 3 0.0や空へ潰さない。「該当0件」「魅力が無い」と読める形で残さない。
+    assert "styles" not in failed
+    assert "style_layer_state" not in failed
+
+    # 4 隔離は観測ごと。もう片方のshadowは算出されたまま残る。
+    assert degraded_facts["common_quality_shadow"]["shadow_state"] == "COMPUTED"
+    assert (
+        degraded_facts["common_quality_shadow"]["score"]
+        == baseline_facts["common_quality_shadow"]["score"]
+    )
+
+    # 5 shadow以外の観測キーも残る(失敗がfacts全体を巻き込まない)。
+    assert (
+        degraded_facts["stock_classification_thresholds"]
+        == (baseline_facts["stock_classification_thresholds"])
+    )
+
+
+def test_canonical_industry_observation_failure_is_isolated_from_the_v1_decision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """canonical業種観測(Issue #54 Phase B-1)で例外が出ても、v1の判定は変わらない(Issue #371)。
+
+    #22 C2と同型: 観測(_observe_canonical_industry())がanalyze()の本流に
+    inlineで置かれ、try/exceptが無かった。想定外の例外はjpx_lookup_status
+    という想定済みの失敗経路を通らず、v1のBUY判定まで巻き込んで止まる。
+
+    ここで固定するのは次の3点である(#22 C2のテストと同じ観点)。
+      ・観測が落ちてもv1の出力(BuyAction / score / 買付価格)が変わらない
+      ・失敗を握りつぶさない(「算出できなかった」がfactsに残る)
+      ・失敗を0.0や空へ潰さない(canonical業種が「未分類」と読める形にしない)
+
+    隔離の粒度は観測ごとである。他の観測(style/common_quality)は影響を
+    受けない。
+    """
+    baseline = _analyze_with_jpx(monkeypatch, _NIHON_SHINYAKU, _jpx_source({}))
+    baseline_rec = baseline.recommendation
+    assert baseline_rec is not None
+    baseline_facts = baseline_rec.buy_score_input_facts
+    assert baseline_facts is not None
+    assert "canonical_industry_33_code" in baseline_facts["canonical_industry_observation"]
+
+    def _boom(*args: object, **kwargs: object) -> object:
+        raise RuntimeError("injected canonical industry observation failure")
+
+    monkeypatch.setattr(service_module, "classify_canonical_industry", _boom)
+    degraded = _analyze_with_jpx(monkeypatch, _NIHON_SHINYAKU, _jpx_source({}))
+    degraded_rec = degraded.recommendation
+    assert degraded_rec is not None
+
+    # 1 v1の出力が変わらない。
+    assert degraded_rec.buy_action == baseline_rec.buy_action
+    assert degraded_rec.raw_buy_action == baseline_rec.raw_buy_action
+    assert degraded_rec.total_score == baseline_rec.total_score
+    assert degraded_rec.company_quality_score == baseline_rec.company_quality_score
+    assert degraded_rec.entry_buy_price == baseline_rec.entry_buy_price
+    assert degraded_rec.standard_buy_price == baseline_rec.standard_buy_price
+    assert degraded_rec.strong_buy_price == baseline_rec.strong_buy_price
+    assert degraded_rec.valuation_anchor == baseline_rec.valuation_anchor
+    assert degraded_rec.confidence == baseline_rec.confidence
+
+    degraded_facts = degraded_rec.buy_score_input_facts
+    assert degraded_facts is not None
+
+    # 2 失敗が記録に残る(黙って何も保存しない、にしない)。
+    failed = degraded_facts["canonical_industry_observation"]
+    assert failed["shadow_state"] == "COMPUTATION_FAILED"
+    assert failed["error_type"] == "RuntimeError"
+
+    # 3 0.0や空へ潰さない。「未分類」「該当なし」と読める形で残さない。
+    assert "canonical_industry_33_code" not in failed
+    assert "jpx_lookup_status" not in failed
+
+    # 4 隔離は観測ごと。他の観測は算出されたまま残る。
+    assert degraded_facts["style_attractiveness_shadow"]["shadow_state"] == "COMPUTED"
+    assert degraded_facts["common_quality_shadow"]["shadow_state"] == "COMPUTED"
+
+    # 5 判定ロジック・閾値は変更していない(観測専用のキーが失敗しただけ)。
+    assert (
+        degraded_facts["stock_classification_thresholds"]
+        == baseline_facts["stock_classification_thresholds"]
+    )
+
+
+# ---------------------------------------------------------------------------
+# Issue #22 Phase B2(2026-09-13): v2 shadowのforward replayに必要な判定時点
+# 入力の保存。いずれも観測用であり、v1の判定・スコア・BuyActionへは接続しない。
+# 「得点から逆算できない生値」だけを保存する(既に保存済みの値は重複保存しない)。
+# ---------------------------------------------------------------------------
+
+
+def test_b2_shadow_inputs_are_stored_in_facts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """B2で追加した判定時点入力が、判定時点の値のまま保存されることを固定する。
+
+    Common Qualityは自己資本比率・継続企業の疑義・上場継続リスク・CF分解の
+    判定結果を入力に持つが、いずれも得点からは実値を復元できない
+    (0点側に潰れるため)。forward replayのためにそのまま保存する。
+    """
+    outcome = _analyze(monkeypatch, _NIHON_SHINYAKU)
+    rec = outcome.recommendation
+    assert rec is not None
+    facts = rec.buy_score_input_facts
+    assert facts is not None
+
+    # fixtureの財務サマリの判定時点値をそのまま保存する(推測で埋めない)。
+    assert "equity_ratio_pct" in facts
+    assert facts["is_going_concern_doubt"] is False
+    # 重要事象キーワードが検出されていないfixtureでは False。
+    assert facts["listing_risk_keyword_confirmed"] is False
+    # CF分解が無い場合は判定不能。NoneをFalseへ潰さない。
+    assert facts["cashflow_fundamentally_driven"] is None
+
+
+def test_b2_stores_classification_thresholds_at_judgment_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """StockType分類の判定時点閾値が保存されることを固定する。
+
+    Style Attractivenessは分類閾値からの距離を使うため、事後に現在のconfigで
+    再解釈すると値が変わる(score_thresholds / undervaluation_category_capsと
+    同じ理由)。keyword列を持つだけのstyleは数値閾値が無く、設計上SAが
+    NOT_APPLICABLEであるため保存しない。
+    """
+    outcome = _analyze(monkeypatch, _NIHON_SHINYAKU)
+    rec = outcome.recommendation
+    assert rec is not None
+    facts = rec.buy_score_input_facts
+    assert facts is not None
+
+    thresholds = facts["stock_classification_thresholds"]
+    assert isinstance(thresholds, dict)
+    # 数値閾値を持つstyleの閾値がそろっていること。
+    for key in (
+        "income_min_dividend_yield_pct",
+        "income_max_payout_ratio_pct",
+        "growth_min_consecutive_growth_quarters",
+        "value_max_pbr",
+        "value_max_per",
+        "dividend_growth_min_consecutive_years",
+        "dividend_growth_min_growth_pct",
+        "quality_min_equity_ratio_pct",
+        "quality_min_roe_pct",
+        "turnaround_min_consecutive_improvement_quarters",
+        "asset_play_max_pbr",
+        "asset_play_min_equity_ratio_pct",
+    ):
+        assert key in thresholds, key
+        assert thresholds[key] is not None, key
+    # 由来を追えるようにconfigのversionも保存する。
+    assert "version" in thresholds
+    # keyword列のstyleは保存しない(数値閾値が無く、SAはNOT_APPLICABLE)。
+    assert "cyclical_industry_keywords" not in thresholds
+    assert "defensive_industry_keywords" not in thresholds
+    assert "event_driven_disclosure_keywords" not in thresholds
+
+
+def test_b2_inputs_do_not_change_v1_score_or_action(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """B2で追加した保存が、v1のスコアとBuyActionを変えないことを固定する。
+
+    B2は観測用snapshotへの追加のみであり、判定は不変である
+    (V2_SHADOW_DECISION = CURRENT_PRODUCTION_DECISION_UNCHANGED)。
+    """
+    outcome = _analyze(monkeypatch, _NIHON_SHINYAKU)
+    rec = outcome.recommendation
+    assert rec is not None
+    facts = rec.buy_score_input_facts
+    assert facts is not None
+
+    # 追加したキーはいずれもscore_formulasへ現れない(算出に参加していない)。
+    formulas = facts["score_formulas"]
+    assert isinstance(formulas, dict)
+    for key in (
+        "equity_ratio_pct",
+        "is_going_concern_doubt",
+        "listing_risk_keyword_confirmed",
+        "cashflow_fundamentally_driven",
+        "stock_classification_thresholds",
+    ):
+        assert key not in formulas, key
+
+
+# ---------------------------------------------------------------------------
+# Issue #22 Phase B3(2026-09-13): 共有Common Qualityのshadow算出。
+# 保有判断側と同じ共有関数・同じconfigをBUY経路から呼び、結果を観測用factsへ
+# 保存する。v1のスコア・BuyAction・通知・価格判定へは接続しない。
+# ---------------------------------------------------------------------------
+
+
+def test_b3_common_quality_shadow_matches_shared_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BUY経路のshadowが、共有モデルを同じ入力で呼んだ結果と一致することを固定する。
+
+    共有モデルを作り直すと経路間で値がずれ、責務分離のshadow検証が成立しない
+    (設計のFILES_PROHIBITED=「共有スコアリング本体を作り直さない」)。ここでは
+    テスト側で共有関数を直接呼び、BUY経路が保存した値と突き合わせる。
+    """
+    from jstock_advisor.domain.classification.financial_industry import classify_industry
+    from jstock_advisor.domain.entities.enums import PeriodType
+    from jstock_advisor.domain.financial_series import FinancialPeriodValue
+    from jstock_advisor.domain.signals.company_quality_scoring import (
+        CompanyQualityInputs,
+        score_company_quality,
+    )
+
+    snapshot = _build_snapshot(_NIHON_SHINYAKU)
+    monkeypatch.setattr(service_module, "build_stock_snapshot", lambda *a, **kw: (snapshot, None))
+    service = BuySignalService(providers=_providers(), config=_CONFIG, business_calendar=_CALENDAR)
+    outcome = service.analyze(_NIHON_SHINYAKU.stock_code, _NOW, RecommendationType.BUY)
+
+    rec = outcome.recommendation
+    assert rec is not None
+    facts = rec.buy_score_input_facts
+    assert facts is not None
+    shadow = facts["common_quality_shadow"]
+    assert isinstance(shadow, dict)
+
+    expected = score_company_quality(
+        CompanyQualityInputs(
+            financial=snapshot.financial,
+            quarterly_operating_income_periods=(snapshot.quarterly_operating_income_periods),
+            quarterly_operating_cashflow_periods=(snapshot.quarterly_operating_cashflow_periods),
+            eps_period_values=[
+                FinancialPeriodValue(
+                    value=hv.eps, period_end=hv.date, period_type=PeriodType.ANNUAL
+                )
+                for hv in snapshot.historical_valuations
+                if hv.eps is not None
+            ],
+            cashflow_decomposition=snapshot.cashflow_decomposition,
+            industry_classification=classify_industry(
+                snapshot.financial.sector, snapshot.financial.industry
+            ),
+            listing_risk_keyword_confirmed=bool(snapshot.material_event_keywords_found),
+        ),
+        _CONFIG.holding_decision.company_quality_weights,
+        _CONFIG.holding_decision.company_quality_score_thresholds,
+        _CONFIG.holding_decision_ratio,
+    )
+
+    assert shadow["score"] == expected.score
+    assert shadow["coverage_ratio"] == expected.coverage_ratio
+    assert [i["item_code"] for i in shadow["items"]] == [i.item_code for i in expected.items]
+
+
+def test_b3_data_missing_is_separated_from_low_quality(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """欠測が「品質が低い」と区別できる形で記録されることを固定する。
+
+    共有モデルはNOT_EVALUATED(データ欠測)を分母に残して0点として合算するため、
+    scoreだけでは「品質が低い」と「データが無い」を区別できない(要件6)。
+    coverage_ratioと項目別statusを併せて保存することで判定層が分離できる。
+    ここでは閾値を置かない(COVERAGE_THRESHOLDはshadow calibrationで決める)。
+    """
+    outcome = _analyze(monkeypatch, _NIHON_SHINYAKU)
+    rec = outcome.recommendation
+    assert rec is not None
+    facts = rec.buy_score_input_facts
+    assert facts is not None
+    shadow = facts["common_quality_shadow"]
+    assert isinstance(shadow, dict)
+
+    statuses = [i["status"] for i in shadow["items"]]
+    # 3値がそのまま残っていること(NOT_EVALUATEDをNOT_APPLICABLEへ潰さない)。
+    assert set(statuses) <= {"EVALUATED", "NOT_EVALUATED", "NOT_APPLICABLE"}
+    # fixtureは財務データが乏しく、少なくとも1項目は欠測として記録される。
+    assert "NOT_EVALUATED" in statuses
+    # 欠測がある以上、coverage_ratioは1.0未満になる(scoreだけを見ない)。
+    coverage = shadow["coverage_ratio"]
+    assert isinstance(coverage, float)
+    assert coverage < 1.0
+
+
+def test_b3_shadow_does_not_change_v1_score_or_action(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """shadow算出がv1のスコア・BuyActionを変えないことを固定する。
+
+    V2_SHADOW_DECISION = CURRENT_PRODUCTION_DECISION_UNCHANGED。shadowは観測用
+    factsへ保存するだけであり、算出式にも判定にも参加しない。
+    """
+    outcome = _analyze(monkeypatch, _NIHON_SHINYAKU)
+    rec = outcome.recommendation
+    assert rec is not None
+    facts = rec.buy_score_input_facts
+    assert facts is not None
+
+    # shadowはscore_formulasに現れない(v1の算出に参加していない)。
+    formulas = facts["score_formulas"]
+    assert isinstance(formulas, dict)
+    assert "common_quality_shadow" not in formulas
+    # 版はv1のまま(v2の書き込み開始は本Phaseの承認範囲外)。
+    assert rec.company_quality_score_model_version == "v1"
+
+
+# ---------------------------------------------------------------------------
+# Issue #52 Phase B3-B1: 財務データの「報告サイクル上の鮮度」をBUYへ接続する
+#
+# data_age_business_days(いつ取得したか)とは別concept である。無料providerは
+# 取得の都度いまの時刻を入れるため、取得時刻をいくら見ても「決算発表後なのに
+# 旧期のままである」ことは検知できない。ここでは取得時刻を新しいままにした上で
+# 財務期間だけを古くし、判定が実際に変わることを固定する。
+#
+# 確定仕様(人間確定。ここで再判断しない)
+#   猶予          50暦日(config: data_quality.financial_reporting_lag_calendar_days)
+#   STALE         警告のみ。hard exclusionしない。confidence減点もしない
+#                 (BUY経路に共通confidence scoreが存在しないため)
+#   UNKNOWN       警告なし・減点なし。監査項目としてのみ残す
+# ---------------------------------------------------------------------------
+
+# 期末2026-03-31 -> 期待される次の期末2026-06-30 -> 報告期限 2026-06-30+50日
+# = 2026-08-19。期限当日はSTALE側に含める(domain契約)。
+_B3_DEADLINE = dt.date(2026, 8, 19)
+_B3_FRESH_NOW = dt.datetime(2026, 8, 18, 7, 0, tzinfo=dt.UTC)
+_B3_STALE_NOW = dt.datetime(2026, 8, 19, 7, 0, tzinfo=dt.UTC)
+_B3_STALE_COUNTER_FACTOR = "最新の決算が財務データへ反映されていない可能性がある"
+
+
+def _b3_quarterly_financial(base: FinancialSummary) -> FinancialSummary:
+    """四半期実績の履歴を持つ財務データ(期末は2026-03-31)。"""
+    return base.model_copy(
+        update={
+            "fiscal_period_end": dt.date(2026, 3, 31),
+            "fiscal_year_end_month": 3,
+            "recent_quarters": [
+                QuarterlyFinancials(stock_code=base.stock_code, quarter_end=q, source=_SOURCE)
+                for q in (dt.date(2025, 12, 31), dt.date(2026, 3, 31))
+            ],
+            "recent_periods_source": RecentPeriodsSource.QUARTERLY,
+        }
+    )
+
+
+def _b3_unresolvable_financial(base: FinancialSummary) -> FinancialSummary:
+    """決算サイクルを確認できない財務データ(UNKNOWNへ倒れる)。"""
+    return base.model_copy(
+        update={
+            "fiscal_period_end": dt.date(2026, 3, 31),
+            "fiscal_year_end_month": None,
+            "recent_quarters": [],
+            "recent_periods_source": RecentPeriodsSource.UNAVAILABLE,
+        }
+    )
+
+
+def _b3_analyze(
+    monkeypatch: pytest.MonkeyPatch,
+    now: dt.datetime,
+    financial_builder: Callable[[FinancialSummary], FinancialSummary],
+) -> service_module.BuyAnalysisOutcome:
+    """財務期間だけを差し替え、取得時刻・価格鮮度は常に正常なまま評価する。"""
+    import dataclasses
+
+    fx = dataclasses.replace(_TACHI_S, next_earnings_date=dt.date(2026, 11, 13))
+    base = _build_snapshot(fx)
+    snapshot = dataclasses.replace(
+        base,
+        financial=financial_builder(base.financial),
+        # 「取得は当日。しかし財務データの対象期間が古い」状況を作るため、
+        # 取得時刻と価格基準日は常に鮮度が正常な値へ揃える。
+        data_fetched_at=now,
+        price_as_of_date=expected_latest_completed_trading_session(now, _CALENDAR),
+    )
+    monkeypatch.setattr(service_module, "build_stock_snapshot", lambda *a, **kw: (snapshot, None))
+    service = BuySignalService(providers=_providers(), config=_CONFIG, business_calendar=_CALENDAR)
+    return service.analyze(fx.stock_code, now, RecommendationType.BUY)
+
+
+def test_b3_b1_financial_stale_adds_counter_factor(monkeypatch: pytest.MonkeyPatch) -> None:
+    """報告期限を過ぎても旧期のままなら、反対材料として利用者へ提示する。"""
+    rec = _b3_analyze(monkeypatch, _B3_STALE_NOW, _b3_quarterly_financial).recommendation
+    assert rec is not None
+    assert _B3_STALE_COUNTER_FACTOR in rec.counter_factors
+    facts = rec.buy_score_input_facts or {}
+    assert facts["financial_freshness_verdict"] == "STALE"
+    assert facts["financial_freshness_warning"] is True
+    assert facts["expected_financial_report_deadline"] == _B3_DEADLINE.isoformat()
+
+
+def test_b3_b1_financial_fresh_does_not_add_counter_factor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """期限前は「まだ発表前なので旧期が正常」であり、警告しない。"""
+    rec = _b3_analyze(monkeypatch, _B3_FRESH_NOW, _b3_quarterly_financial).recommendation
+    assert rec is not None
+    assert _B3_STALE_COUNTER_FACTOR not in rec.counter_factors
+    facts = rec.buy_score_input_facts or {}
+    assert facts["financial_freshness_verdict"] == "FRESH"
+    assert facts["financial_freshness_warning"] is False
+
+
+def test_b3_b1_deadline_day_itself_is_stale(monkeypatch: pytest.MonkeyPatch) -> None:
+    """50暦日の境界。期限前日はFRESH、期限当日はSTALE(境界は1つに固定する)。"""
+    fresh = _b3_analyze(monkeypatch, _B3_FRESH_NOW, _b3_quarterly_financial).recommendation
+    stale = _b3_analyze(monkeypatch, _B3_STALE_NOW, _b3_quarterly_financial).recommendation
+    assert fresh is not None
+    assert stale is not None
+    assert (fresh.buy_score_input_facts or {})["financial_freshness_verdict"] == "FRESH"
+    assert (stale.buy_score_input_facts or {})["financial_freshness_verdict"] == "STALE"
+
+
+def test_b3_b1_unknown_is_observability_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    """判定根拠が無い場合は「古い」ではないため、警告を出さず監査項目のみ残す。"""
+    rec = _b3_analyze(monkeypatch, _B3_STALE_NOW, _b3_unresolvable_financial).recommendation
+    assert rec is not None
+    assert _B3_STALE_COUNTER_FACTOR not in rec.counter_factors
+    facts = rec.buy_score_input_facts or {}
+    assert facts["financial_freshness_verdict"] == "UNKNOWN"
+    assert facts["financial_freshness_warning"] is False
+    assert facts["financial_freshness_basis"] == "UNRESOLVED"
+    # 根拠が無いことは reason として残す(空文字で潰さない)。
+    assert facts["financial_freshness_reason"]
+
+
+def test_b3_b1_fetched_today_but_financial_period_is_stale(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #52の中核: 取得は当日でも、財務期間が古ければSTALEとして検知する。
+
+    取得時刻ベースの鮮度(data_age_business_days)は0のままである。ここが0のまま
+    STALEを検知できることが、2つの鮮度が別concept であることの証明になる。
+    """
+    rec = _b3_analyze(monkeypatch, _B3_STALE_NOW, _b3_quarterly_financial).recommendation
+    assert rec is not None
+    facts = rec.buy_score_input_facts or {}
+    assert facts["data_age_business_days"] == 0
+    assert facts["financial_freshness_verdict"] == "STALE"
+    assert _B3_STALE_COUNTER_FACTOR in rec.counter_factors
+
+
+def test_b3_b1_stale_does_not_change_valuation_confidence_or_margin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """警告のみである(hard exclusionも減点もしない)ことを判定結果で固定する。
+
+    財務鮮度をdata_quality_warning/adjustment_codesへ合流させると、
+    margin_of_safety・買付価格信頼性・データ品質スコアの3経路へ波及して
+    実質的な減点になる。適正価格の信頼度(determine_valuation_confidence)は
+    算出手法の信頼性という別concept であり、そこへも混ぜない。
+    """
+    results = {
+        verdict: _b3_analyze(monkeypatch, now, builder)
+        for verdict, now, builder in (
+            ("FRESH", _B3_FRESH_NOW, _b3_quarterly_financial),
+            ("STALE", _B3_STALE_NOW, _b3_quarterly_financial),
+            ("UNKNOWN", _B3_STALE_NOW, _b3_unresolvable_financial),
+        )
+    }
+    fresh = results["FRESH"].recommendation
+    assert fresh is not None
+    for verdict, outcome in results.items():
+        rec = outcome.recommendation
+        assert rec is not None, verdict
+        assert rec.confidence == fresh.confidence, verdict
+        assert rec.buy_price_reliability == fresh.buy_price_reliability, verdict
+        assert rec.required_margin_of_safety_entry == fresh.required_margin_of_safety_entry, verdict
+        assert outcome.buy_action == results["FRESH"].buy_action, verdict
+        assert outcome.screening_passed is True, verdict
+
+
+def test_b3_b1_penalty_is_recorded_as_not_applicable_not_false(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BUYには減点を適用する共通confidence scoreが存在しないことを監査へ明示する。
+
+    boolean falseで残すと、将来「減点しなかった(=経路はある)」と誤読されうる。
+    """
+    rec = _b3_analyze(monkeypatch, _B3_STALE_NOW, _b3_quarterly_financial).recommendation
+    assert rec is not None
+    facts = rec.buy_score_input_facts or {}
+    assert facts["financial_stale_confidence_penalty_applied"] == "N/A_NO_BUY_CONFIDENCE_SCORE"
+
+
+def test_b3_b1_audit_records_the_lag_actually_used(monkeypatch: pytest.MonkeyPatch) -> None:
+    """判定に実際に使った猶予日数・期間末をそのまま保存する(事後に再検証できる)。"""
+    rec = _b3_analyze(monkeypatch, _B3_STALE_NOW, _b3_quarterly_financial).recommendation
+    assert rec is not None
+    facts = rec.buy_score_input_facts or {}
+    assert (
+        facts["financial_reporting_lag_calendar_days"]
+        == _CONFIG.screening.data_quality.financial_reporting_lag_calendar_days
+    )
+    assert facts["latest_financial_period_end"] == "2026-03-31"
+    assert facts["expected_next_financial_period_end"] == "2026-06-30"
+    assert facts["financial_freshness_basis"] == "QUARTERLY_HISTORY"
+
+
+# ---------------------------------------------------------------------------
+# Issue #160 shadow計測 PR-2a: 財務鮮度のverdictを、判定に入る前の事実(非永続)として載せる
+#
+# STALE -> True / FRESH -> False / UNKNOWN -> None(評価していない)。判定・警告・保存は変えない。
+# ---------------------------------------------------------------------------
+
+
+def test_safety_facts_map_stale_to_true(monkeypatch: pytest.MonkeyPatch) -> None:
+    outcome = _b3_analyze(monkeypatch, _B3_STALE_NOW, _b3_quarterly_financial)
+
+    assert outcome.safety_facts is not None
+    assert outcome.safety_facts.financials_are_stale is True
+
+
+def test_safety_facts_map_fresh_to_false(monkeypatch: pytest.MonkeyPatch) -> None:
+    outcome = _b3_analyze(monkeypatch, _B3_FRESH_NOW, _b3_quarterly_financial)
+
+    assert outcome.safety_facts is not None
+    assert outcome.safety_facts.financials_are_stale is False
+
+
+def test_safety_facts_map_unknown_to_none_not_to_false(monkeypatch: pytest.MonkeyPatch) -> None:
+    """UNKNOWN(判定できなかった)は「古くない」ではない。Noneのまま(評価していない)。"""
+    outcome = _b3_analyze(monkeypatch, _B3_STALE_NOW, _b3_unresolvable_financial)
+
+    assert outcome.safety_facts is not None
+    assert outcome.safety_facts.financials_are_stale is None
+
+
+def test_safety_facts_are_unset_when_no_recommendation_is_produced(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(service_module, "build_stock_snapshot", lambda *a, **kw: (None, "boom"))
+    service = BuySignalService(providers=_providers(), config=_CONFIG, business_calendar=_CALENDAR)
+
+    outcome = service.analyze("0000", _B3_FRESH_NOW, RecommendationType.BUY)
+
+    assert outcome.data_error == "boom"
+    assert outcome.recommendation is None
+    assert outcome.safety_facts is None
+
+
+def test_safety_facts_do_not_change_the_recommendation_or_the_existing_audit_facts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """既存の出力(警告・反対材料・監査項目)はfactsの有無と無関係で、従来どおり。"""
+    stale = _b3_analyze(monkeypatch, _B3_STALE_NOW, _b3_quarterly_financial).recommendation
+    fresh = _b3_analyze(monkeypatch, _B3_FRESH_NOW, _b3_quarterly_financial).recommendation
+
+    assert stale is not None
+    assert fresh is not None
+    assert _B3_STALE_COUNTER_FACTOR in stale.counter_factors
+    assert _B3_STALE_COUNTER_FACTOR not in fresh.counter_factors
+    assert (stale.buy_score_input_facts or {})["financial_freshness_warning"] is True
+    assert (fresh.buy_score_input_facts or {})["financial_freshness_warning"] is False
+    assert not hasattr(stale, "safety_facts")  # Recommendation(永続schema)へは載せない
+
+
+def test_safety_facts_are_excluded_from_equality_and_repr() -> None:
+    from jstock_advisor.domain.signals.judgment_safety import SafetyFacts
+
+    plain = service_module.BuyAnalysisOutcome("0000", None, False, [], None)
+    with_facts = service_module.BuyAnalysisOutcome(
+        "0000", None, False, [], None, safety_facts=SafetyFacts(financials_are_stale=True)
+    )
+
+    assert plain == with_facts  # 既存の比較を変えない
+    assert "safety_facts" not in repr(with_facts)  # 既存のログを変えない
+
+
+@pytest.mark.parametrize(
+    ("verdict", "expected"),
+    [("STALE", True), ("FRESH", False), ("UNKNOWN", None)],
+)
+def test_financials_are_stale_fact_covers_every_verdict(
+    verdict: str, expected: bool | None
+) -> None:
+    from jstock_advisor.domain.financial_freshness import FinancialFreshnessVerdict
+
+    assert service_module._financials_are_stale_fact(FinancialFreshnessVerdict(verdict)) is expected
+    assert {v.value for v in FinancialFreshnessVerdict} == {"STALE", "FRESH", "UNKNOWN"}
+
+
+def test_safety_facts_are_unset_on_the_excluded_and_disclosure_unavailable_paths(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """推奨が生成されない全経路(data_error / 開示取得不能 / excluded)でfactsを持たない。
+
+    shadowが「推奨が出た件」を数え始めたとき、推奨の無い件が母数へ紛れ込まないようにする。
+    """
+    excluded = _analyze_with_disclosure(
+        monkeypatch,
+        _NIHON_SHINYAKU,
+        DisclosureAvailability.AVAILABLE,
+        disclosure_risk_keywords_found=["上場廃止"],
+    )
+    unavailable = _analyze_with_disclosure(
+        monkeypatch, _NIHON_SHINYAKU, DisclosureAvailability.UNAVAILABLE
+    )
+
+    assert excluded.buy_action == BuyAction.EXCLUDED
+    assert excluded.recommendation is None
+    assert excluded.safety_facts is None
+    assert unavailable.buy_action == BuyAction.DATA_INSUFFICIENT
+    assert unavailable.recommendation is None
+    assert unavailable.safety_facts is None

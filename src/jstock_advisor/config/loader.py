@@ -1,0 +1,217 @@
+"""config/ 配下のYAML/JSONファイルを読み込み、AppConfig(pydantic)に変換する。
+
+設定ファイルはユーザーが直接編集する運用を前提とするため(要求仕様14節)、
+読み込み時にスキーマ検証を行い、不正な値があれば起動時に例外を送出する。
+"""
+
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+from typing import Any, cast
+
+import yaml
+
+from jstock_advisor.config.models import (
+    AddOnRulesConfig,
+    AppConfig,
+    BuyDecisionRulesConfig,
+    ConfidenceRulesConfig,
+    DataValidationRulesConfig,
+    DecisionEvaluationConfig,
+    EarningsSurpriseRulesConfig,
+    EarningsTrendRulesConfig,
+    EarningsWindowRulesConfig,
+    EntryExitPriceRulesConfig,
+    EvaluationRulesConfig,
+    HistoricalValuationRulesConfig,
+    HoldingDecisionRatioRulesConfig,
+    HoldingDecisionRiskRulesConfig,
+    HoldingDecisionRulesConfig,
+    HolidayCalendarConfig,
+    IncidentNotificationConfig,
+    IndustryScoringPolicyConfig,
+    InvestmentThesisTemplateConfig,
+    MarketSectorEnvironmentRulesConfig,
+    MomentumRulesConfig,
+    NotificationRulesConfig,
+    PortfolioConcentrationRulesConfig,
+    ProfitTakingRulesConfig,
+    ReviewImprovementConfig,
+    ScheduleConfig,
+    ScoringWeightsConfig,
+    ScreeningRulesConfig,
+    SellRulesConfig,
+    ShareholderReturnPoliciesConfig,
+    StockClassificationRulesConfig,
+    TimingScoreRulesConfig,
+    ValuationRulesConfig,
+    WatchlistScreeningRulesConfig,
+)
+
+# Lambda環境ではconfig/がリポジトリ構成のまま同梱されないため、
+# JSTOCK_CONFIG_DIR(Lambda Layerのマウント先)で上書きできるようにする。
+DEFAULT_CONFIG_DIR = (
+    Path(os.environ["JSTOCK_CONFIG_DIR"])
+    if "JSTOCK_CONFIG_DIR" in os.environ
+    else Path(__file__).resolve().parents[3] / "config"
+)
+
+
+def _strip_comment_keys(value: Any) -> Any:
+    """先頭が"_"のキー(コメント用途)を再帰的に除去する。"""
+    if isinstance(value, dict):
+        return {
+            key: _strip_comment_keys(val) for key, val in value.items() if not key.startswith("_")
+        }
+    if isinstance(value, list):
+        return [_strip_comment_keys(item) for item in value]
+    return value
+
+
+def _load_yaml(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        raise FileNotFoundError(f"設定ファイルが見つかりません: {path}")
+    with path.open(encoding="utf-8") as f:
+        data = yaml.safe_load(f)
+    if not isinstance(data, dict):
+        raise ValueError(f"設定ファイルの形式が不正です(辞書ではありません): {path}")
+    return cast(dict[str, Any], _strip_comment_keys(data))
+
+
+def _load_json(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        raise FileNotFoundError(f"設定ファイルが見つかりません: {path}")
+    with path.open(encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
+        raise ValueError(f"設定ファイルの形式が不正です(辞書ではありません): {path}")
+    return cast(dict[str, Any], _strip_comment_keys(data))
+
+
+def load_config(config_dir: Path | None = None) -> AppConfig:
+    """config_dir配下の全設定ファイルを読み込み、検証済みのAppConfigを返す。"""
+    directory = config_dir or DEFAULT_CONFIG_DIR
+
+    screening = ScreeningRulesConfig.model_validate(_load_yaml(directory / "screening_rules.yaml"))
+    valuation = ValuationRulesConfig.model_validate(_load_yaml(directory / "valuation_rules.yaml"))
+    profit_taking = ProfitTakingRulesConfig.model_validate(
+        _load_yaml(directory / "profit_taking_rules.yaml")
+    )
+    sell = SellRulesConfig.model_validate(_load_yaml(directory / "sell_rules.yaml"))
+    scoring = ScoringWeightsConfig.model_validate(_load_yaml(directory / "scoring_weights.yaml"))
+    schedule = ScheduleConfig.model_validate(_load_yaml(directory / "schedule.yaml"))
+    notification = NotificationRulesConfig.model_validate(
+        _load_yaml(directory / "notification_rules.yaml")
+    )
+    data_validation = DataValidationRulesConfig.model_validate(
+        _load_yaml(directory / "data_validation_rules.yaml")
+    )
+    evaluation = EvaluationRulesConfig.model_validate(
+        _load_yaml(directory / "evaluation_rules.yaml")
+    )
+    holiday_calendar = HolidayCalendarConfig.model_validate(
+        _load_json(directory / "holiday_calendar.json")
+    )
+    stock_classification = StockClassificationRulesConfig.model_validate(
+        _load_yaml(directory / "stock_classification_rules.yaml")
+    )
+    momentum = MomentumRulesConfig.model_validate(_load_yaml(directory / "momentum_rules.yaml"))
+    confidence = ConfidenceRulesConfig.model_validate(
+        _load_yaml(directory / "confidence_rules.yaml")
+    )
+    earnings_window = EarningsWindowRulesConfig.model_validate(
+        _load_yaml(directory / "earnings_window_rules.yaml")
+    )
+    portfolio_concentration = PortfolioConcentrationRulesConfig.model_validate(
+        _load_yaml(directory / "portfolio_concentration_rules.yaml")
+    )
+    buy_decision = BuyDecisionRulesConfig.model_validate(
+        _load_yaml(directory / "buy_decision_rules.yaml")
+    )
+    add_on = AddOnRulesConfig.model_validate(_load_yaml(directory / "add_on_rules.yaml"))
+    watchlist_screening = WatchlistScreeningRulesConfig.model_validate(
+        _load_yaml(directory / "watchlist_screening_rules.yaml")
+    )
+    holding_decision = HoldingDecisionRulesConfig.model_validate(
+        _load_yaml(directory / "holding_decision_rules.yaml")
+    )
+    holding_decision_risk = HoldingDecisionRiskRulesConfig.model_validate(
+        _load_yaml(directory / "holding_decision_risk_rules.yaml")
+    )
+    holding_decision_ratio = HoldingDecisionRatioRulesConfig.model_validate(
+        _load_yaml(directory / "holding_decision_ratio_rules.yaml")
+    )
+    investment_thesis_template = InvestmentThesisTemplateConfig.model_validate(
+        _load_yaml(directory / "investment_thesis_template.yaml")
+    )
+    industry_scoring_policy = IndustryScoringPolicyConfig.model_validate(
+        _load_yaml(directory / "industry_scoring_policy.yaml")
+    )
+    review_improvement = ReviewImprovementConfig.model_validate(
+        _load_yaml(directory / "review_improvement.yaml")
+    )
+    decision_evaluation = DecisionEvaluationConfig.model_validate(
+        _load_yaml(directory / "decision_evaluation.yaml")
+    )
+    historical_valuation = HistoricalValuationRulesConfig.model_validate(
+        _load_yaml(directory / "historical_valuation_rules.yaml")
+    )
+    timing_score = TimingScoreRulesConfig.model_validate(
+        _load_yaml(directory / "timing_score_rules.yaml")
+    )
+    earnings_surprise = EarningsSurpriseRulesConfig.model_validate(
+        _load_yaml(directory / "earnings_surprise_rules.yaml")
+    )
+    earnings_trend = EarningsTrendRulesConfig.model_validate(
+        _load_yaml(directory / "earnings_trend_rules.yaml")
+    )
+    entry_exit_price = EntryExitPriceRulesConfig.model_validate(
+        _load_yaml(directory / "entry_exit_price_rules.yaml")
+    )
+    market_sector_environment = MarketSectorEnvironmentRulesConfig.model_validate(
+        _load_yaml(directory / "market_sector_environment_rules.yaml")
+    )
+    shareholder_return_policies = ShareholderReturnPoliciesConfig.model_validate(
+        _load_yaml(directory / "shareholder_return_policies.yaml")
+    )
+    incident_notification = IncidentNotificationConfig.model_validate(
+        _load_yaml(directory / "incident_notification.yaml")
+    )
+
+    return AppConfig(
+        screening=screening,
+        valuation=valuation,
+        profit_taking=profit_taking,
+        sell=sell,
+        scoring=scoring,
+        schedule=schedule,
+        notification=notification,
+        data_validation=data_validation,
+        evaluation=evaluation,
+        holiday_calendar=holiday_calendar,
+        stock_classification=stock_classification,
+        momentum=momentum,
+        confidence=confidence,
+        earnings_window=earnings_window,
+        portfolio_concentration=portfolio_concentration,
+        buy_decision=buy_decision,
+        add_on=add_on,
+        watchlist_screening=watchlist_screening,
+        holding_decision=holding_decision,
+        holding_decision_risk=holding_decision_risk,
+        holding_decision_ratio=holding_decision_ratio,
+        investment_thesis_template=investment_thesis_template,
+        industry_scoring_policy=industry_scoring_policy,
+        review_improvement=review_improvement,
+        decision_evaluation=decision_evaluation,
+        historical_valuation=historical_valuation,
+        timing_score=timing_score,
+        earnings_surprise=earnings_surprise,
+        earnings_trend=earnings_trend,
+        entry_exit_price=entry_exit_price,
+        market_sector_environment=market_sector_environment,
+        shareholder_return_policies=shareholder_return_policies,
+        incident_notification=incident_notification,
+    )

@@ -1,0 +1,2922 @@
+"""買い候補分析Lambda(schedule.yaml daily_buy_candidates_analysis、平日08:00)。
+
+CLIの`jstock analyze buy-candidates --source real --notify`と同じロジックを
+EventBridge Scheduler経由で自動実行する薄いアダプタ。
+
+【気になる銘柄と保有銘柄を統合したBUY候補パイプライン(2026-07)】
+「気になる銘柄(ウォッチリスト)」と「保有銘柄」を銘柄コード単位で統合し
+(両方に登録されている銘柄は1回だけ評価する)、共通の購入判断ロジック
+(BuySignalService)をそのまま両方に適用する。保有銘柄については、
+「保有しているから買う」を許さず、共通購入判断がBUY系判定を出した場合のみ
+追加で買い増し固有リスク(銘柄集中・業種集中・売却判定との競合・保有データの
+整合性)を確認する(domain/signals/add_on_risk.py)。統合ランキング・再送防止・
+最大5件のLINE通知は気になる銘柄と保有銘柄で分離しない(保有銘柄であること
+自体を優遇・冷遇しない)。
+
+以前は保有銘柄の買いシグナル評価をholdings_watchlist_handler.py側でも
+別経路(recommendation_type=WATCH_BUY、ランキングなしの個別即時通知)として
+実施しており、同一銘柄が同日に二重通知されうる不具合があった。統合後は
+その経路を廃止し、本ハンドラへ一本化している(要求仕様§16)。
+
+銘柄単位のファンアウト(_fanout.py)を採用しており、通常のスケジュール起動では
+対象銘柄一覧を取得して銘柄ごとに自分自身を非同期再帰呼び出しするだけで
+即座に戻る。
+
+【購入候補のみをランキング・通知】
+「企業として投資候補になり得るか」と「現在の株価で実際に購入すべきか」を分離した
+ため、監視継続・購入見送り・要確認・データ不足・対象外はLINE通知しない
+(分析結果・監査ログへの記録はBuySignalService.analyze()側で全銘柄について既に
+完了しており、本ハンドラもすべての評価対象についてunified_buy_candidate_
+evaluation監査を追加で記録する)。各ワーカーはBuyAction判定が確定した時点で、
+購入候補(STRONG_BUY/BUY/SMALL_ENTRY)のみをランキング候補としてバッチトラッカーへ
+登録する(価格待ちは件数カウントのみ行い、送信対象のランキングには載せない)。
+全銘柄の処理が完了した時点(最後のワーカーが検知)で、購入候補ランキング順に
+1件ずつ以下の順序でゲートを評価し(要求仕様§2の11ステップ)、
+条件を満たしたものを最大5件(気になる銘柄・保有銘柄の合計)に達するまで、
+または全件評価し終えるまで繰り上げながら集める:
+  1. データ品質  2. 保有銘柄固有ゲート(売却競合→保有データ整合性→
+  ポートフォリオデータ信頼性→銘柄集中→業種集中)  3. 再送防止  4. 最大5件判定
+ランキング上位であっても、いずれかのゲートで弾かれた場合はOUTSIDE_TOP_5には
+ならず、本来のブロック理由(SECTOR_CONCENTRATION等)が監査へ記録される。
+OUTSIDE_TOP_5は全ゲートを通過したうえで6位以下だった場合のみ付与される。
+
+購入候補が1件も無い場合も、バッチ完了サマリーで「今回の購入候補: 該当なし」を
+明示送信する(Issue #568。docs/functional_spec.md 10.2節、保有銘柄側
+[holdings_watchlist_handler.py]と対称)。config.notification.
+send_empty_summaryがfalseの場合のみ例外的に送信を抑止できるが、既定はtrueで
+あり、通常運用でfalseにする想定はない。
+
+個別のデータ取得エラーは既定でLINEへ配信せず(config.notification.
+buy_candidates.notify_data_errorsで制御)、CloudWatch警告ログとバッチサマリーの
+data_insufficient件数にのみ記録する。全銘柄の処理が完了した時点で全体件数・
+正常件数・異常件数のサマリーを1通だけ送信する(batch_tracker.pyのDynamoDB
+原子カウンタで完了を検知する)。
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+import logging
+import os
+import re
+import uuid
+from collections.abc import Callable
+from dataclasses import dataclass
+from decimal import Decimal
+from enum import StrEnum
+from typing import Any
+
+from jstock_advisor.config.loader import load_config
+from jstock_advisor.config.models import AppConfig
+from jstock_advisor.domain.business_calendar import BusinessCalendar
+from jstock_advisor.domain.classification.buy_industry import classify_buy_industry_sector
+from jstock_advisor.domain.entities.buy_candidate_batch_pointer import (
+    LatestBuyCandidateBatchPointer,
+)
+from jstock_advisor.domain.entities.buy_candidate_evaluation_record import (
+    BuyCandidateEvaluationRecord,
+    build_evaluation_id,
+)
+from jstock_advisor.domain.entities.buy_evaluation_target import BuyEvaluationTarget
+from jstock_advisor.domain.entities.enums import (
+    BUY_FAMILY_ACTIONS,
+    AddOnEligibility,
+    BuyAction,
+    BuyIndustrySector,
+    CandidateSource,
+    DecisionType,
+    EligibilityBlockCategory,
+    ExecutionMode,
+    NotificationContext,
+    PortfolioValuationBasis,
+    PurchaseCategory,
+    RecommendationType,
+    StockType,
+    WatchTransitionType,
+    WatchType,
+    resolve_purchase_category,
+)
+from jstock_advisor.domain.entities.execution_context import ExecutionContext
+from jstock_advisor.domain.entities.holding import Holding
+from jstock_advisor.domain.entities.notification_eligibility import NotificationEligibility
+from jstock_advisor.domain.entities.recommendation import Recommendation
+from jstock_advisor.domain.jst import evaluation_date_jst
+from jstock_advisor.domain.signals.add_on_risk import evaluate_add_on_eligibility
+from jstock_advisor.infrastructure.aws.batch_tracker import (
+    DISPATCH_MODE_LEGACY,
+    DISPATCH_MODE_SQS,
+    MAX_SECTOR_ENTRIES,
+    MAX_SECTOR_ENTRY_BYTES,
+    BatchFamily,
+    BatchProgress,
+    CompletionBatchRecord,
+    mark_completion_finalize_completed,
+    mark_completion_finalize_failed,
+    record_result,
+    start_batch,
+    try_acquire_completion_finalize,
+)
+from jstock_advisor.infrastructure.edinet.window_prefetch import (
+    prefetch_recent_document_lists_safely,
+)
+from jstock_advisor.infrastructure.line.client import build_line_client_for_run
+from jstock_advisor.infrastructure.local_repository.buy_candidate_evaluation_record_repository import (  # noqa: E501
+    BuyCandidateEvaluationRecordRepository,
+)
+from jstock_advisor.infrastructure.local_repository.decision_snapshot_repository import (
+    DecisionSnapshotRepository,
+)
+from jstock_advisor.infrastructure.local_repository.latest_buy_candidate_batch_pointer_repository import (  # noqa: E501
+    LatestBuyCandidateBatchPointerRepository,
+)
+from jstock_advisor.infrastructure.local_repository.notification_claim_repository import (
+    NotificationClaimRepository,
+)
+from jstock_advisor.infrastructure.local_repository.notification_log_repository import (
+    NotificationLogRepository,
+)
+from jstock_advisor.infrastructure.local_repository.recommendation_repository import (
+    RecommendationRepository,
+)
+from jstock_advisor.lambda_handlers._execution_mode import resolve_execution_context
+from jstock_advisor.lambda_handlers._fanout import (
+    buy_candidate_sqs_dispatch_enabled,
+    dispatch_async,
+    dispatch_sqs,
+    resolve_function_name,
+)
+from jstock_advisor.lambda_handlers._finalize_recovery import (
+    is_recovery_event,
+    resolve_finalize_only_request,
+)
+from jstock_advisor.lambda_handlers._market_holiday import (
+    SKIP_REASON,
+    should_skip_for_market_closed,
+)
+from jstock_advisor.lambda_handlers._scheduling import derive_scheduled_batch_id
+from jstock_advisor.services.allocation_shadow_service import (
+    ShadowRunner,
+    observe_allocation_shadow,
+)
+from jstock_advisor.services.audit_service import AuditService
+from jstock_advisor.services.buy_signal_service import RULE_VERSION_PLACEHOLDER, BuySignalService
+from jstock_advisor.services.decision_snapshot_service import save_decision_snapshot_safely
+from jstock_advisor.services.incident_envelope_publisher import publish_incident_envelope
+from jstock_advisor.services.judgment_safety_shadow_service import (
+    ENGINE_BUY_CANDIDATES,
+    observe_judgment_safety_shadow,
+)
+from jstock_advisor.services.line_notification_service import (
+    LineNotificationService,
+    notification_priority_for_recommendation,
+)
+from jstock_advisor.services.portfolio_service import PortfolioService
+from jstock_advisor.services.profit_taking_service import ProfitTakingService
+from jstock_advisor.services.provider_bundle import ProviderBundle
+from jstock_advisor.services.provider_factory import build_real_provider_bundle
+from jstock_advisor.services.rule_version_service import RuleVersionService
+from jstock_advisor.services.sell_signal_service import SellSignalService
+from jstock_advisor.services.shareholder_benefit_registry_service import (
+    check_registry_coverage,
+    check_registry_health,
+)
+from jstock_advisor.services.stock_snapshot_service import StockSnapshot, build_stock_snapshot
+from jstock_advisor.services.trade_cooldown_service import TradeCooldownService
+from jstock_advisor.services.valuation_confidence_shadow_service import (
+    observe_valuation_confidence_shadow,
+)
+from jstock_advisor.services.watch_state_service import (
+    WATCH_END_NOTIFIABLE_REASONS,
+    WatchStateService,
+)
+from jstock_advisor.services.watchlist_service import WatchlistService
+from jstock_advisor.services.yfinance_rate_limit import call_with_rate_limit_retry
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+
+_PROCESS_NAME = "買い候補分析"
+# handler()は常に明示的にexecution_contextを渡す(NORMAL/VALIDATIONを問わず)。
+# このデフォルトは_process_single_candidate/_finalize_batchを直接呼ぶ既存テスト
+# コード(白箱テスト)向けの後方互換専用で、本番の呼び出し経路では使われない。
+_DEFAULT_EXECUTION_CONTEXT = ExecutionContext.normal()
+_RANKING_ENTRY_DELIMITER = "|"
+_SECTOR_ENTRY_DELIMITER = "|"
+_STOCK_CODE_PATTERN = re.compile(r"^[0-9]{4,5}$")
+
+# Issue #71 F-D2/F-C8: _fanout.dispatch_async()はdedupトークンを持たないため、
+# AWSの非同期invoke失敗時リトライ(最大2回)が同一(batch_id, stock_code)を
+# 再処理するとrecommendation_id=uuid4()により毎回新規のRecommendationが
+# 二重保存されていた。batch_id+stock_codeから決定的に導出したUUID(既存の
+# recommendation_id列がUUID文字列であることを前提にしている呼び出し元への
+# 影響を避けるため、フォーマットはuuid4と同じUUID文字列のまま保つ)を使い、
+# 同一の再処理は同じrecommendation_idになるようにする。異なるbatch_id
+# (=別日の正当な再評価)は別IDのまま変わらない。
+_RECOMMENDATION_ID_NAMESPACE = uuid.UUID("6f1b1b4a-6b2d-4c7b-9b1a-2a6b7c8d9e0f")
+
+# Issue #667(HF-2): HANDLED_FAILURE通知のsource/job_name。job_nameは
+# incident_message.py::_INTERNAL_NAME_TO_JOB(`"buy-candidates"`)がそのまま
+# resolve_incident_job()で解決できる既存の値を使う(新規対応表を増やさない)。
+_INCIDENT_SOURCE_BUY_CANDIDATES = "buy_candidates"
+_INCIDENT_JOB_NAME_BUY_CANDIDATES = "buy-candidates"
+
+
+def _scoped_failure_stage(failure_stage: str, batch_id: str | None) -> str:
+    """Issue #717 MUST-1是正: fingerprintをbatch単位で区別するため、batch_idを
+    `failure_stage`へ埋め込む。
+
+    #665のfingerprint計算(`compute_fingerprint()`)は、`error_type`/`error_message`
+    のみを`normalize_error_signature()`で正規化する(UUID・ISO8601日時・16進数の
+    並び・数字の並びを`<ID>`/`<TS>`/`<HEX>`/`<N>`へ置換する)。`failure_stage`/
+    `failure_type`/`job_name`はこの正規化を受けず、生の値がそのまま
+    `_field_digest()`でハッシュされる(incident_fingerprint.py実測済み)。
+
+    したがって、batch_idを`reason_code`(error_type/error_messageへ渡る)へ
+    含めても正規化で失われてしまうが、`failure_stage`へ含めれば失われない。
+    これにより、同一batch_id内の複数回failureは同一fingerprintとして
+    既存のclaim/dedup機構で1件に集約され(SAME_BATCH_MULTIPLE_FAILURES ->
+    max 1)、異なるbatch_idは完全に異なるfingerprintとなるため、時間的な
+    近接の有無に関わらず常に独立して観測できる(DIFFERENT_BATCH_FAILURES ->
+    independently observable)。旧版(batch_idを含まない固定failure_stage)は
+    30分の時間窓dedupのみに依存しており、この2つの不変条件を保証しなかった
+    (ChatGPTレビューMUST-1指摘、2026-10-02)。
+
+    batch_idがNone(白箱テスト・recovery経路等、batch概念が無い呼び出し)の
+    場合は、従来どおりfailure_stageをそのまま返す(この場合は時間窓dedupの
+    みに頼ることになるが、batch_id自体が無い以上、他に取りうる識別子が無い)。
+    """
+    if batch_id is None:
+        return failure_stage
+    return f"{failure_stage}#{batch_id}"
+
+
+def _notify_handled_failure(
+    failure_stage: str, reason_code: str, now: dt.datetime, batch_id: str | None
+) -> None:
+    """Issue #667(HF-2): catchされた技術的部分失敗をHF-0契約(#665)でUSER通知する。
+
+    1銘柄ごとに直接publishするが、batch_idを`failure_stage`へ埋め込むことで
+    (`_scoped_failure_stage()`参照)、#665のfingerprintがbatch単位で区別される。
+    batch_idをまたいでカウンタを集約する新しい永続schema
+    (infrastructure/aws/batch_tracker.py側の変更)を必要としない、既存資産の
+    再利用である。
+
+    通知自体の失敗が候補銘柄の判定・保存・通知処理を一切妨げないよう、
+    呼び出し元から独立したtry/exceptで囲む(本関数の外側)。
+    """
+    envelope = {
+        "source": _INCIDENT_SOURCE_BUY_CANDIDATES,
+        "job_name": _INCIDENT_JOB_NAME_BUY_CANDIDATES,
+        "failure_stage": _scoped_failure_stage(failure_stage, batch_id),
+        "failure_type": "UNEXPECTED_EXCEPTION",
+        "reason_code": reason_code,
+        "occurred_at": now.isoformat(),
+        "failure_class": "HANDLED_FAILURE",
+    }
+    publish_incident_envelope(envelope)
+
+
+def _notify_handled_failure_safely(
+    failure_stage: str, reason_code: str, now: dt.datetime, batch_id: str | None
+) -> None:
+    """`_notify_handled_failure()`の失敗(SNS権限不足・Topic ARN未設定等)が、
+    候補銘柄の判定・保存・既存通知処理を絶対にブロックしないためのラッパー
+    (`_save_evaluation_record_safely()`と同じ設計方針)。"""
+    try:
+        _notify_handled_failure(failure_stage, reason_code, now, batch_id)
+    except Exception:  # noqa: BLE001 - HANDLED_FAILURE通知自体の失敗で本処理を止めない
+        logger.warning(
+            "buy_candidates_handler: failed to publish HANDLED_FAILURE envelope failure_stage=%s",
+            failure_stage,
+        )
+
+
+def _deterministic_recommendation_id(batch_id: str, stock_code: str) -> str:
+    return str(uuid.uuid5(_RECOMMENDATION_ID_NAMESPACE, f"{batch_id}:{stock_code}"))
+
+
+# 購入候補ランキングの第一ソートキー(BuyActionの強さ。数値が大きいほど優先)。
+_ACTION_PRIORITY: dict[BuyAction, int] = {
+    BuyAction.SMALL_ENTRY: 0,
+    BuyAction.BUY: 1,
+    BuyAction.STRONG_BUY: 2,
+}
+
+
+def _encode_buy_ranking_entry(recommendation: Recommendation) -> str:
+    """購入候補ランキングキー(要求仕様15節): action_priority(BuyActionの強さ)
+    → purchase_attractiveness_score → company_quality_score →
+    現在値が標準買い価格をどれだけ下回るか、の降順。同点時は銘柄コード昇順で
+    決定性を確保する(_finalize_batch側でタプルの最後の要素として比較される)。
+
+    価格待ち(WATCH_FOR_PRICE/WATCH_BEFORE_EARNINGS)はLINE通知対象外のため
+    ランキング登録自体を行わない。保有銘柄であること自体はソートキーに含めない
+    (統合BUY候補パイプライン2026-07: 保有銘柄を優遇・冷遇しない)。
+    """
+    action_priority = _ACTION_PRIORITY.get(recommendation.buy_action, 0)  # type: ignore[arg-type]
+    purchase_score = recommendation.purchase_attractiveness_score or 0.0
+    quality_score = recommendation.company_quality_score or 0.0
+    standard_price = (
+        recommendation.standard_buy_price if recommendation.standard_buy_price is not None else None
+    )
+    discount_to_standard_pct = (
+        float((standard_price - recommendation.price_at_recommendation) / standard_price * 100)
+        if standard_price is not None and standard_price > 0
+        else 0.0
+    )
+    return _RANKING_ENTRY_DELIMITER.join(
+        [
+            str(action_priority),
+            str(purchase_score),
+            str(quality_score),
+            str(discount_to_standard_pct),
+            recommendation.stock_code,
+            recommendation.recommendation_id,
+        ]
+    )
+
+
+def _decode_buy_ranking_entry(entry: str) -> tuple[tuple[float, ...], str, str]:
+    action_priority, purchase_score, quality_score, discount_pct, stock_code, recommendation_id = (
+        entry.split(_RANKING_ENTRY_DELIMITER)
+    )
+    sort_key = (
+        float(action_priority),
+        float(purchase_score),
+        float(quality_score),
+        float(discount_pct),
+    )
+    return sort_key, stock_code, recommendation_id
+
+
+def _encode_near_buy_ranking_entry(recommendation: Recommendation) -> str:
+    """NEAR BUY/WATCH_BEFORE_EARNINGS用のランキングキー(BUY候補裾野拡大機能2026-08、
+    要求仕様: NEAR BUY日次上限の超過分選択は1st distance_pct昇順、2nd
+    company_quality_score降順)。WATCH_BEFORE_EARNINGSは日次上限の対象外だが、
+    同じランキング機構を共用するためここでもエンコードする。
+    """
+    distance_pct = (
+        float(recommendation.required_decline_to_entry_pct)
+        if recommendation.required_decline_to_entry_pct is not None
+        else float("inf")
+    )
+    quality_score = recommendation.company_quality_score or 0.0
+    return _RANKING_ENTRY_DELIMITER.join(
+        [
+            str(distance_pct),
+            str(-quality_score),
+            recommendation.stock_code,
+            recommendation.recommendation_id,
+        ]
+    )
+
+
+def _decode_near_buy_ranking_entry(entry: str) -> tuple[tuple[float, ...], str, str]:
+    distance_pct, neg_quality_score, stock_code, recommendation_id = entry.split(
+        _RANKING_ENTRY_DELIMITER
+    )
+    sort_key = (float(distance_pct), float(neg_quality_score))
+    return sort_key, stock_code, recommendation_id
+
+
+class SectorClassificationAvailability(StrEnum):
+    """portfolio exposure factにおける業種分類の可用性(Issue #82)。
+
+    **時価の可用性とは独立の軸**である。時価が判明していれば銘柄集中度は
+    算出できるため、業種が不明であることを理由に銘柄集中度まで無効化しない。
+    """
+
+    KNOWN = "KNOWN"
+    UNKNOWN = "UNKNOWN"
+
+
+@dataclass(frozen=True)
+class PortfolioExposureFact:
+    """1保有銘柄のポートフォリオ露出(Issue #82)。
+
+    **screening eligibility とは無関係**である。screeningで除外された銘柄でも、
+    実際に保有している以上、ポートフォリオ時価の分母から消してはならない
+    (「買い候補として不適」は「保有していない」を意味しない)。
+
+    したがって本factは screening_outcome / BuyAction / BuyAnalysisOutcome の
+    いずれにも依存せず、snapshot取得直後に生成される。
+    """
+
+    stock_code: str
+    current_market_value: Decimal
+    sector: BuyIndustrySector
+    sector_availability: SectorClassificationAvailability
+
+    @property
+    def sector_is_known(self) -> bool:
+        return self.sector_availability is SectorClassificationAvailability.KNOWN
+
+
+def _encode_portfolio_exposure_fact(fact: PortfolioExposureFact) -> str:
+    """DynamoDB String Setへ格納する文字列へ変換する(Issue #82)。
+
+    **形式(v2、4フィールド)**: `{sector}|{market_value}|{stock_code}|{availability}`
+
+    旧形式(v1、3フィールド)からの拡張であり、**旧デコーダはv2を読めない**
+    (`len(parts) != 3` でNoneを返す)。これは意図的な設計である。
+    デプロイ跨ぎで新workerと旧finalizeが混在した場合、旧finalizeはv2エントリを
+    無視するため coverage 不足 → `UNAVAILABLE` → **現行と同じfail-close**へ退避する。
+    v1へUNKNOWNを詰めて3フィールドのまま送ると、旧finalizeがそれを通常の
+    業種バケットとして集計し、**業種不明でも業種集中度を算出してしまう**
+    (新契約のfail-closeが効かない)。安全側に倒れる方を選ぶ。
+
+    逆方向(旧workerのv1エントリ → 新finalize)は
+    `_decode_portfolio_exposure_fact` が受理する。
+    """
+    return _SECTOR_ENTRY_DELIMITER.join(
+        [
+            fact.sector.value,
+            str(fact.current_market_value),
+            fact.stock_code,
+            fact.sector_availability.value,
+        ]
+    )
+
+
+def _decode_portfolio_exposure_fact(entry: str) -> PortfolioExposureFact | None:
+    """v1(3フィールド)/ v2(4フィールド)の双方を受理する(Issue #82)。
+
+    不正なエントリはNoneを返す(呼び出し側でログ・無視すること)。
+
+    v1は業種可用性フィールドを持たないため、業種値そのものから復元する
+    (`UNKNOWN` → 不明、それ以外 → 既知)。v1は「screening通過銘柄のみが報告」
+    という前提で書かれているが、値の解釈としてはこの復元で過不足がない。
+    """
+    parts = entry.split(_SECTOR_ENTRY_DELIMITER)
+    if len(parts) == 3:
+        sector_raw, value_raw, stock_code = parts
+        availability_raw = None
+    elif len(parts) == 4:
+        sector_raw, value_raw, stock_code, availability_raw = parts
+    else:
+        return None
+    if not _STOCK_CODE_PATTERN.match(stock_code):
+        return None
+    try:
+        sector = BuyIndustrySector(sector_raw)
+        market_value = Decimal(value_raw)
+        availability = (
+            SectorClassificationAvailability(availability_raw)
+            if availability_raw is not None
+            else (
+                SectorClassificationAvailability.UNKNOWN
+                if sector is BuyIndustrySector.UNKNOWN
+                else SectorClassificationAvailability.KNOWN
+            )
+        )
+    except (ValueError, ArithmeticError):
+        return None
+    # 値の内部整合: UNKNOWN業種をKNOWNと主張するエントリは受理しない
+    # (業種不明のまま業種集中度へ算入されるのを防ぐ)。
+    if sector is BuyIndustrySector.UNKNOWN:
+        availability = SectorClassificationAvailability.UNKNOWN
+    return PortfolioExposureFact(
+        stock_code=stock_code,
+        current_market_value=market_value,
+        sector=sector,
+        sector_availability=availability,
+    )
+
+
+def _build_portfolio_exposure_fact(
+    *,
+    stock_code: str,
+    source: CandidateSource,
+    holding_quantity: int | None,
+    snapshot: StockSnapshot,
+) -> PortfolioExposureFact | None:
+    """保有銘柄のportfolio exposure factを生成する(Issue #82)。
+
+    **screeningの結果を一切参照しない。** 引数に screening_outcome / BuyAction /
+    BuyAnalysisOutcome を取らないことで、「特定のscreening経路を通過した場合だけ
+    exposureが生成される」という責務結合を構造的に排除する。将来
+    screening/analysis側に新しいearly-returnが追加されても、本関数の呼び出しは
+    その手前にあるためexposure報告は消えない。
+
+    Noneを返すのは「そもそもポートフォリオ露出が無い/測れない」場合だけ:
+
+    - 保有銘柄ではない(watchlist専用)
+    - 保有株数が不明・0以下(時価を算出できない。**0円補完はしない**)
+    - 現在値が0以下(同上)
+
+    業種が判定できない場合もfactは生成する(`sector_availability=UNKNOWN`)。
+    時価が判明していれば銘柄集中度は算出できるため、業種不明を理由に
+    ポートフォリオ分母から銘柄を消してはならない。
+    """
+    if source not in (CandidateSource.HOLDING, CandidateSource.BOTH):
+        return None
+    if holding_quantity is None or holding_quantity <= 0:
+        return None
+    current_price = snapshot.current_price
+    if current_price <= 0:
+        return None
+
+    # 既存分類器をそのまま使う(Issue #54のcanonical taxonomyは先取りしない)。
+    # holding_quantity/current_priceは_build_unified_targets側で全owner集約済み
+    # (M3.1)。owner scopeの意味論(#64)は変更しない。
+    is_growth_stock = StockType.GROWTH in snapshot.stock_type_classification.types
+    sector = classify_buy_industry_sector(
+        snapshot.financial.industry, snapshot.financial.sector, is_growth_stock
+    )
+    availability = (
+        SectorClassificationAvailability.UNKNOWN
+        if sector is BuyIndustrySector.UNKNOWN
+        else SectorClassificationAvailability.KNOWN
+    )
+    return PortfolioExposureFact(
+        stock_code=stock_code,
+        current_market_value=current_price * holding_quantity,
+        sector=sector,
+        sector_availability=availability,
+    )
+
+
+def _holding_data_consistency(
+    holding_quantity: int | None, average_acquisition_price: Decimal | None, trading_unit: int
+) -> tuple[bool, bool]:
+    """保有データの整合性を判定する(戻り値: (holding_data_inconsistent, is_odd_lot))。
+
+    ハードブロック対象(holding_data_inconsistent=True)は株数・平均取得単価が
+    存在しない・0以下の場合のみ。単元未満株(端株)はそれだけでは不整合扱いに
+    しない(統合BUY候補パイプライン2026-07: 単元未満株・株式分割等で正当に
+    発生しうるため。ブロックするかはconfig.add_on.block_add_on_on_odd_lotで
+    別途制御する)。
+    """
+    if holding_quantity is None or holding_quantity <= 0:
+        return True, False
+    if average_acquisition_price is None or average_acquisition_price <= 0:
+        return True, False
+    is_odd_lot = trading_unit > 0 and holding_quantity % trading_unit != 0
+    return False, is_odd_lot
+
+
+def _build_unified_targets(
+    config: AppConfig,
+    now: dt.datetime,
+    execution_context: ExecutionContext = _DEFAULT_EXECUTION_CONTEXT,
+    batch_id: str | None = None,
+) -> list[BuyEvaluationTarget]:
+    """気になる銘柄と保有銘柄を銘柄コード単位で統合する(要求仕様§2)。
+
+    事前ガード(要求仕様§8): 保有銘柄(ユニーク銘柄コード数)がMAX_SECTOR_ENTRIES
+    を超える場合、sector_entriesの書き込み上限に達する恐れがあるため保有銘柄側は
+    評価対象へ含めない(監査へ記録したうえで、気になる銘柄側の評価は継続する)。
+
+    M3.1(複数owner対応): 同一stock_codeを複数ownerが保有していても、BUY候補
+    評価はowner別に分割せず銘柄コード単位で1回だけ行う(要求仕様§2)。
+    holding_quantity/average_acquisition_priceは全owner分を集約した値とする
+    (単純なowner間平均ではなく、購入金額合計÷株数合計の加重平均)。
+
+    batch_id(Issue #558レビュー対応F1): 上記ガード発火時の中断監査記録を
+    `record_if_absent()`で決定的audit_idとして書き込むために使う。Scheduler
+    retryは同一batch_idになるため、retryのたびに監査レコードが重複しない
+    (呼び出し元がbatch_idを渡さない場合はNone。呼び出し元は現状handler()
+    のみでbatch_id確定後に呼ぶため、実際にはNoneにならない)。
+    """
+    watchlist_names: dict[str, str | None] = {}
+    if config.notification.include_watchlist:
+        for item in WatchlistService().list_items():
+            watchlist_names[item.stock_code] = item.stock_name
+
+    holdings_by_code: dict[str, list[Holding]] = {}
+    if config.notification.include_holdings:
+        holdings = PortfolioService().list_holdings()
+        unique_stock_codes = {h.stock_code for h in holdings}
+        if len(unique_stock_codes) > MAX_SECTOR_ENTRIES:
+            logger.error(
+                "buy_candidates_handler: holding_count=%d exceeds MAX_SECTOR_ENTRIES=%d; "
+                "skipping holding-side evaluation for this run",
+                len(unique_stock_codes),
+                MAX_SECTOR_ENTRIES,
+            )
+            # Issue #558レビュー対応F1: Scheduler retryは同一batch_idになるため、
+            # record()(呼び出しごとにaudit_idをuuid4で新規生成)のままだと
+            # retryのたびに監査レコードが重複する。record_if_absent()で
+            # batch_id由来の決定的audit_idを使い、2回目以降は書き込まない。
+            audit_id = (
+                f"unified_buy_candidate_batch_aborted:{batch_id}" if batch_id else str(uuid.uuid4())
+            )
+            AuditService(execution_context=execution_context).record_if_absent(
+                audit_id=audit_id,
+                decision_type="unified_buy_candidate_batch_aborted",
+                stock_code=None,
+                input_values={"holding_count": len(unique_stock_codes)},
+                calculation_formulas={},
+                output_values={"reason": "SECTOR_ENTRIES_LIMIT_EXCEEDED"},
+                data_sources=[],
+                rule_version=RULE_VERSION_PLACEHOLDER,
+                timestamp=now,
+            )
+        else:
+            for holding in holdings:
+                holdings_by_code.setdefault(holding.stock_code, []).append(holding)
+
+    codes = sorted(set(watchlist_names) | set(holdings_by_code))
+    targets: list[BuyEvaluationTarget] = []
+    for code in codes:
+        in_watchlist = code in watchlist_names
+        in_holding = code in holdings_by_code
+        if in_watchlist and in_holding:
+            source = CandidateSource.BOTH
+        elif in_holding:
+            source = CandidateSource.HOLDING
+        else:
+            source = CandidateSource.WATCHLIST
+        holdings_for_code = holdings_by_code.get(code, [])
+        total_shares = sum(h.shares for h in holdings_for_code)
+        total_acquisition_amount = sum(
+            (h.total_purchase_amount for h in holdings_for_code), Decimal("0")
+        )
+        average_acquisition_price = (
+            total_acquisition_amount / total_shares if total_shares > 0 else None
+        )
+        stock_name = watchlist_names.get(code) or (
+            holdings_for_code[0].stock_name if holdings_for_code else None
+        )
+        targets.append(
+            BuyEvaluationTarget(
+                stock_code=code,
+                stock_name=stock_name,
+                source=source,
+                holding_quantity=total_shares if holdings_for_code else None,
+                average_acquisition_price=average_acquisition_price,
+            )
+        )
+    return targets
+
+
+def _record_evaluation_audit(
+    audit_service: AuditService,
+    rule_version: str,
+    now: dt.datetime,
+    stock_code: str,
+    source: CandidateSource,
+    holding_quantity: int | None,
+    average_acquisition_price: Decimal | None,
+    current_market_value: Decimal | None,
+    unrealized_profit_loss: Decimal | None,
+    unrealized_profit_loss_pct: Decimal | None,
+    base_buy_action: BuyAction,
+    final_buy_action: BuyAction,
+    conflicting_holding_action: RecommendationType | None,
+    holding_data_inconsistent: bool,
+    holding_owner_count: int | None = None,
+    holding_ids: tuple[str, ...] | None = None,
+    exclusion_reasons: list[str] | None = None,
+    batch_id: str | None = None,
+) -> None:
+    """全評価対象銘柄(BUY系以外も含む)について記録する監査(要求仕様§4・§14)。
+
+    M3.1: holding_quantity/average_acquisition_priceは(保有銘柄の場合)常に
+    owner横断の集約値であり、単一ownerの値ではない。holding_owner_count/
+    holding_idsを渡すことで、何名分・どのholding_id分の集約かを監査から
+    追跡できるようにする(owner単位の別Auditは作らない)。
+
+    Issue #531(#71 F-C14): batch_idを渡した場合、record()(呼び出しごとに
+    audit_idをuuid4で新規生成)ではなくrecord_if_absent()でbatch_id+
+    stock_code由来の決定的audit_idを使い、非同期fan-outの再配信(#528/#558と
+    同型の欠陥)による監査ログの重複を防ぐ。batch_id=None(白箱テスト等の
+    既存呼び出し)は従来どおりrecord()のまま(後方互換)。
+
+    audit_idは`f"unified_buy_candidate_evaluation:{batch_id}:{stock_code}"`
+    の3構成要素からなる(PR #622 F2と同型の粒度)。decision_type prefixを
+    落とすと他のdecision_typeの記録と衝突しうる。batch_idを落とすと、
+    別batchの同一stock_codeの評価がrecord_if_absent()に黙って抑止され
+    正当な監査記録が失われる。stock_codeを落とすと、同一batch内の
+    異なる銘柄の評価が互いを抑止する。
+
+    抑止(record_if_absentによる2回目以降のスキップ)は例外もログも出さず
+    完全にsilentである(PR #622 F3と同型の既知の限界。呼び出し元
+    `_process_single_candidate()`はこの戻り値を確認していない)。
+    """
+    input_values = {
+        "candidate_source": source.value,
+        "holding_quantity": holding_quantity,
+        "average_acquisition_price": (
+            str(average_acquisition_price) if average_acquisition_price is not None else None
+        ),
+        "holding_owner_count": holding_owner_count,
+        "holding_ids": list(holding_ids) if holding_ids is not None else None,
+        "exclusion_reasons": exclusion_reasons,
+    }
+    output_values = {
+        "current_market_value": (
+            str(current_market_value) if current_market_value is not None else None
+        ),
+        "unrealized_profit_loss": (
+            str(unrealized_profit_loss) if unrealized_profit_loss is not None else None
+        ),
+        "unrealized_profit_loss_pct": (
+            str(unrealized_profit_loss_pct) if unrealized_profit_loss_pct is not None else None
+        ),
+        "base_buy_action": base_buy_action.value,
+        "final_buy_action": final_buy_action.value,
+        "conflicting_holding_action": (
+            conflicting_holding_action.value if conflicting_holding_action is not None else None
+        ),
+        "holding_data_inconsistent": holding_data_inconsistent,
+    }
+    if batch_id is not None:
+        audit_service.record_if_absent(
+            audit_id=f"unified_buy_candidate_evaluation:{batch_id}:{stock_code}",
+            decision_type="unified_buy_candidate_evaluation",
+            stock_code=stock_code,
+            input_values=input_values,
+            calculation_formulas={},
+            output_values=output_values,
+            data_sources=[],
+            rule_version=rule_version,
+            timestamp=now,
+        )
+        return
+    audit_service.record(
+        decision_type="unified_buy_candidate_evaluation",
+        stock_code=stock_code,
+        input_values=input_values,
+        calculation_formulas={},
+        output_values=output_values,
+        data_sources=[],
+        rule_version=rule_version,
+        timestamp=now,
+    )
+
+
+def _process_single_candidate(
+    stock_code: str,
+    source: CandidateSource,
+    holding_quantity: int | None,
+    average_acquisition_price: Decimal | None,
+    batch_id: str | None,
+    now: dt.datetime,
+    providers: ProviderBundle,
+    config: AppConfig,
+    calendar: BusinessCalendar,
+    recommendation_repo: RecommendationRepository,
+    notification_service: LineNotificationService,
+    execution_context: ExecutionContext = _DEFAULT_EXECUTION_CONTEXT,
+    evaluation_record_repo: BuyCandidateEvaluationRecordRepository | None = None,
+    latest_batch_pointer_repo: LatestBuyCandidateBatchPointerRepository | None = None,
+    remaining_time_ms: Callable[[], int] | None = None,
+) -> dict[str, Any]:
+    service = BuySignalService(
+        providers=providers,
+        config=config,
+        business_calendar=calendar,
+        execution_context=execution_context,
+    )
+    audit_service = AuditService(execution_context=execution_context)
+    rule_version = RuleVersionService().get_active_version_or(RULE_VERSION_PLACEHOLDER)
+    category = "failed"
+    ranking_entry: str | None = None
+    near_buy_ranking_entry: str | None = None
+    watch_end_ranking_entry: str | None = None
+    sector_entry: str | None = None
+    validation_recommendation_id: str | None = None
+    # 買い候補サマリー表示改修(2026-08): 将来のLINE詳細理由照会機能に向けて、
+    # try/exceptのどの経路を通っても最終的な購入判定分類・recommendation_idを
+    # 記録できるよう、既定値(処理失敗扱い)をtry開始前に用意しておく。
+    record_purchase_category = PurchaseCategory.FAILED
+    record_final_buy_action: BuyAction | None = None
+    record_raw_buy_action: BuyAction | None = None
+    record_recommendation_id: str | None = None
+    record_exclusion_reasons: list[str] | None = None
+    try:
+        # --- 統合BUY候補パイプライン(2026-07)。購入判定と、保有銘柄の場合の
+        # 売却・利確判定(後段)とで同一のスナップショット(現在値・財務データ)を
+        # 使うことで、同一銘柄について矛盾した判定が同時に成立しないようにする ---
+        # Issue #59 Phase B1: providerが取得失敗を欠測へ潰さず例外を送出するように
+        # なったため、一過性障害(429等)がretryされないまま即FAILEDにならないよう、
+        # watchlist経路と同じ再試行ヘルパーで包む。再試行しても回復しない場合のみ
+        # 例外が伝播し、この関数末尾のexceptでPurchaseCategory.FAILEDとして記録される
+        # (「取得に失敗した」と「データが本当に不足していた(DATA_INSUFFICIENT)」を
+        # 混同しないための分離)。
+        retry_result = call_with_rate_limit_retry(
+            lambda: build_stock_snapshot(providers, stock_code, now, config)
+        )
+        if retry_result.error is not None:
+            raise retry_result.error
+        assert retry_result.value is not None
+        snapshot, snapshot_error = retry_result.value
+
+        # --- Issue #82(2026-08-30): portfolio exposure factの生成 ---
+        # **screening / BUY analysisより前に、それらの結果へ依存せず生成する。**
+        # 以前は「screening通過 → recommendation生成 → その分岐でのみ報告」という
+        # 責務結合があり、保有銘柄が1件でもscreening除外されると
+        # ポートフォリオ時価の分母が欠け、全HOLDING/BOTH候補の集中度判定が
+        # CONCENTRATION_RELIABILITY_INSUFFICIENTで停止していた
+        # (#29により金融株を1銘柄でも保有していると恒久化する)。
+        # ここで生成することで、以降にearly-returnが何本増えても報告は消えない。
+        # snapshotがNone(現在値そのものを取得できなかった)場合はfactを作らない。
+        # ポートフォリオ総額が不完全となり、銘柄集中度・業種集中度とも
+        # fail-closeする(**0円で補完しない**)。
+        exposure_fact = (
+            _build_portfolio_exposure_fact(
+                stock_code=stock_code,
+                source=source,
+                holding_quantity=holding_quantity,
+                snapshot=snapshot,
+            )
+            if snapshot is not None
+            else None
+        )
+        if exposure_fact is not None:
+            candidate_entry = _encode_portfolio_exposure_fact(exposure_fact)
+            if len(candidate_entry.encode("utf-8")) <= MAX_SECTOR_ENTRY_BYTES:
+                sector_entry = candidate_entry
+            else:
+                logger.error(
+                    "buy_candidates_handler: portfolio exposure entry exceeds "
+                    "MAX_SECTOR_ENTRY_BYTES=%d stock_code=%s",
+                    MAX_SECTOR_ENTRY_BYTES,
+                    stock_code,
+                )
+
+        outcome = service.analyze(stock_code, now, snapshot=snapshot)
+        if outcome.data_error:
+            # --- BUYパイプライン第3次修正(2026-07)。個別のデータ取得エラーは
+            # 購入候補通知パイプラインからLINE個別送信しない(既定)。CloudWatch
+            # 警告ログとバッチ完了サマリーのdata_insufficient件数への集計のみと
+            # する。監査ログへの記録はBuySignalService.analyze()側
+            # (snapshot is Noneの分岐)で既に完了している。運用上どうしても
+            # 個別のLINE通知が必要な場合のみ、config.notification.buy_candidates.
+            # notify_data_errorsをtrueにすることで有効化できる ---
+            item = WatchlistService().get_item(stock_code)
+            if config.notification.buy_candidates.notify_data_errors:
+                notification_service.notify_data_error(
+                    stock_code,
+                    outcome.data_error,
+                    now,
+                    stock_name=item.stock_name if item else None,
+                )
+            else:
+                name_part = f" {item.stock_name}" if item and item.stock_name else ""
+                logger.warning(
+                    "buy_candidate_data_error stock_code=%s%s message=%s",
+                    stock_code,
+                    name_part,
+                    outcome.data_error,
+                )
+            category = "data_insufficient"
+            result = {"stock_code": stock_code, "recommended": False, "notified": False}
+            record_purchase_category = PurchaseCategory.DATA_INSUFFICIENT
+            record_final_buy_action = BuyAction.DATA_INSUFFICIENT
+            record_raw_buy_action = BuyAction.DATA_INSUFFICIENT
+            _record_evaluation_audit(
+                audit_service,
+                rule_version,
+                now,
+                stock_code,
+                source,
+                holding_quantity,
+                average_acquisition_price,
+                current_market_value=None,
+                unrealized_profit_loss=None,
+                unrealized_profit_loss_pct=None,
+                base_buy_action=BuyAction.DATA_INSUFFICIENT,
+                final_buy_action=BuyAction.DATA_INSUFFICIENT,
+                conflicting_holding_action=None,
+                holding_data_inconsistent=False,
+                batch_id=batch_id,
+            )
+        elif outcome.buy_action == BuyAction.EXCLUDED or outcome.recommendation is None:
+            # 投資対象スクリーニングで除外(第1段階)。screening_passed=Falseの場合、
+            # recommendationは常にNoneとなる想定(buy_signal_service.py参照)。
+            # Issue #82: 除外されても保有していることに変わりはないため、
+            # portfolio exposure factはこの分岐に入る前に既に生成・報告済みである
+            # (screening eligibility ≠ portfolio exposure membership)。
+            category = "hold"
+            result = {"stock_code": stock_code, "recommended": False, "notified": False}
+            record_purchase_category = PurchaseCategory.EXCLUDED
+            record_final_buy_action = BuyAction.EXCLUDED
+            record_raw_buy_action = BuyAction.EXCLUDED
+            record_exclusion_reasons = outcome.exclusion_reasons or None
+            _record_evaluation_audit(
+                audit_service,
+                rule_version,
+                now,
+                stock_code,
+                source,
+                holding_quantity,
+                average_acquisition_price,
+                current_market_value=None,
+                unrealized_profit_loss=None,
+                unrealized_profit_loss_pct=None,
+                base_buy_action=BuyAction.EXCLUDED,
+                final_buy_action=BuyAction.EXCLUDED,
+                conflicting_holding_action=None,
+                holding_data_inconsistent=False,
+                exclusion_reasons=record_exclusion_reasons,
+                batch_id=batch_id,
+            )
+        else:
+            recommendation = outcome.recommendation
+            assert outcome.buy_action is not None  # noqa: S101 - recommendationがあれば必ず設定される
+            base_buy_action = outcome.buy_action
+            final_recommendation = recommendation
+            conflicting_holding_action: RecommendationType | None = None
+            holding_data_inconsistent = False
+            current_market_value: Decimal | None = None
+            unrealized_profit_loss: Decimal | None = None
+            unrealized_profit_loss_pct: Decimal | None = None
+            holding_owner_count: int | None = None
+            holding_ids: tuple[str, ...] | None = None
+
+            if source in (CandidateSource.HOLDING, CandidateSource.BOTH):
+                current_price = recommendation.price_at_recommendation
+                trading_unit = config.profit_taking.trading_unit.default_trading_unit
+                holding_data_inconsistent, holding_is_odd_lot = _holding_data_consistency(
+                    holding_quantity, average_acquisition_price, trading_unit
+                )
+                # holding_quantity/average_acquisition_priceは_build_unified_targets()側で
+                # 既に全owner集約済みの値(M3.1)。current_market_valueもowner合算の
+                # 総株数に対して算出されるため、自動的に全owner合算値になる。
+                if holding_quantity is not None and holding_quantity > 0:
+                    current_market_value = current_price * holding_quantity
+                    if average_acquisition_price is not None and average_acquisition_price > 0:
+                        total_acquisition = average_acquisition_price * holding_quantity
+                        unrealized_profit_loss = current_market_value - total_acquisition
+                        unrealized_profit_loss_pct = (
+                            unrealized_profit_loss / total_acquisition * 100
+                        )
+
+                # M3.1(複数owner対応): 同一stock_codeを保有する全owner分のHoldingを
+                # 集約して扱う(監査記録用にholding_owner_count/holding_idsも保持する)。
+                holdings_for_stock = PortfolioService().list_holdings_by_stock(stock_code)
+                holding_owner_count = len(holdings_for_stock)
+                holding_ids = tuple(h.holding_id for h in holdings_for_stock)
+
+                # --- 買い増し固有リスク: 売却・利確判定との競合(要求仕様§6)。
+                # base_buy_actionがBUY系、かつ保有データに致命的な不整合が無い
+                # 場合のみ確認する(不整合な保有データでSell/ProfitTakingを
+                # 実行しても無意味なため)。共通購入判断と同一snapshotを渡すことで
+                # 現在値・財務データの矛盾を防ぐ。
+                #
+                # M3.1(複数owner対応): 全owner分のHoldingを独立にSell/ProfitTaking
+                # 評価する(例: 本人#8306→SELL、子供#8306→HOLD)。1owner分でも
+                # 売却/利確系の競合Recommendationがあれば競合ありとして扱い、
+                # BUY/買い増しを抑止する。複数ownerから異なる種別の競合が同時に
+                # 出た場合は、Cross Pipeline Priorityと同じ優先度表
+                # (notification_priority_for_recommendation、CRITICAL_RISK>
+                # PROMOTED_TO_BUY>SELL/PARTIAL_SELL>BUY>ATTENTION>その他)に従って
+                # 最も強いものをconflicting_holding_actionとして記録する
+                # (新たな優先順位は新設しない) ---
+                if base_buy_action in BUY_FAMILY_ACTIONS and not holding_data_inconsistent:
+                    sell_service = SellSignalService(
+                        providers=providers,
+                        config=config,
+                        business_calendar=calendar,
+                        execution_context=execution_context,
+                    )
+                    profit_service = ProfitTakingService(
+                        providers=providers,
+                        config=config,
+                        business_calendar=calendar,
+                        execution_context=execution_context,
+                    )
+                    best_conflict: Recommendation | None = None
+                    best_conflict_priority = -1
+                    for owner_holding in holdings_for_stock:
+                        sell_outcome = sell_service.analyze(owner_holding, now, snapshot=snapshot)
+                        holding_conflict = sell_outcome.recommendation
+                        if holding_conflict is None:
+                            profit_outcome = profit_service.analyze(
+                                owner_holding, now, snapshot=snapshot
+                            )
+                            holding_conflict = profit_outcome.recommendation
+                        if holding_conflict is None:
+                            continue
+                        candidate_priority = notification_priority_for_recommendation(
+                            holding_conflict
+                        )
+                        if candidate_priority > best_conflict_priority:
+                            best_conflict_priority = candidate_priority
+                            best_conflict = holding_conflict
+                    if best_conflict is not None:
+                        conflicting_holding_action = best_conflict.recommendation_type
+
+                final_recommendation = recommendation.model_copy(
+                    update={
+                        "candidate_source": source,
+                        "holding_quantity": holding_quantity,
+                        "average_acquisition_price": average_acquisition_price,
+                        "current_market_value": current_market_value,
+                        "unrealized_profit_loss": unrealized_profit_loss,
+                        "unrealized_profit_loss_pct": unrealized_profit_loss_pct,
+                        "base_buy_action": base_buy_action,
+                        "conflicting_holding_action": conflicting_holding_action,
+                    }
+                )
+
+                # Issue #82: portfolio exposure factの報告はここでは行わない。
+                # screening/analysisの結果に依存しないよう、snapshot取得直後へ
+                # 移動済み(この分岐に到達しない銘柄も分母へ算入するため)。
+            else:
+                final_recommendation = recommendation.model_copy(
+                    update={
+                        "candidate_source": source,
+                        "base_buy_action": base_buy_action,
+                        "add_on_eligibility": AddOnEligibility.NOT_APPLICABLE,
+                    }
+                )
+
+            # Issue #71 F-D2/F-C8: batch_idが確定している(=通常の非同期fan-out
+            # 経路)場合のみrecommendation_idを決定的にする。batch_id=Noneの
+            # 呼び出し元(白箱テスト等)は対象外とし、従来どおりanalyze()が
+            # 割り当てたuuid4のままにする(挙動不変)。
+            if batch_id is not None:
+                final_recommendation = final_recommendation.model_copy(
+                    update={
+                        "recommendation_id": _deterministic_recommendation_id(batch_id, stock_code)
+                    }
+                )
+            is_new_recommendation = recommendation_repo.insert_if_absent(final_recommendation)
+            if not is_new_recommendation:
+                # 非同期invokeの再試行等による同一(batch_id, stock_code)の
+                # 重複配信。Recommendationは既に保存済みのため再保存しない
+                # (Issue #71 F-D2/F-C8)。
+                logger.info(
+                    "buy candidates: duplicate delivery skipped (recommendation "
+                    "already exists) batch_id=%s stock_code=%s",
+                    batch_id,
+                    stock_code,
+                )
+            if execution_context.is_validation:
+                # 通知検証モード機能(2026-08追加): _finalize_batchが正常完了後に
+                # 検証用テーブルから削除するため、このバッチで保存した
+                # recommendation_idをrecord_result経由で報告する(4.2節参照)。
+                validation_recommendation_id = final_recommendation.recommendation_id
+            # 判定精度向上機能Phase A: DecisionSnapshotを記録する(スコア項目は
+            # Phase Bまで全てNone)。失敗しても既存の通知・戻り値には一切影響しない。
+            # 通知検証モード機能(2026-08追加): VALIDATIONでは通常運用の判定履歴を
+            # 汚さないため保存自体をスキップする。
+            # Issue #71: 重複配信でRecommendationが既に存在した場合はスキップする
+            # (決定的IDにより同一のdecision_idになるため再実行しても安全ではあるが、
+            # 判定に使ったsnapshotの時刻等がリトライごとに変わり得ることに起因する
+            # 不要な内容比較・警告ログを避けるため、ここで打ち切る)。
+            if not execution_context.is_validation and is_new_recommendation:
+                decision_snapshot_saved = save_decision_snapshot_safely(
+                    DecisionSnapshotRepository(), final_recommendation, DecisionType.BUY, logger
+                )
+                if not decision_snapshot_saved:
+                    # Issue #672(HF-7): 保存失敗をUSERへ通知する(判定・Recommendation・通知・
+                    # 戻り値は変えない。通知の失敗も本処理を止めない)。
+                    _notify_handled_failure_safely(
+                        "DECISION_SNAPSHOT_SAVE",
+                        "BUY_CANDIDATES_DECISION_SNAPSHOT_SAVE_FAILED",
+                        now,
+                        batch_id,
+                    )
+                # Issue #160 / #457(PR-3): 判断の安全条件(G1〜G4)のshadow計測。**保存が完了した
+                # 後**に置くため、Recommendation・DecisionSnapshot・通知・戻り値を変えられない。
+                # shadowがOFF(既定)なら何もしない。SHADOWでも評価・記録の失敗は隔離され、
+                # 例外は本流へ伝播しない(このtry全体が銘柄の判定結果を失うことを防ぐ)。
+                # VALIDATIONは上のifが既に除外している。
+                observe_judgment_safety_shadow(
+                    final_recommendation,
+                    outcome,
+                    ENGINE_BUY_CANDIDATES,
+                    now,
+                    execution_context=execution_context,
+                    audit_service=audit_service,
+                )
+                # Issue #582: 適正価格信頼度(valuation_confidence)のHIGH tier到達可否
+                # shadow計測。上記と同じ理由(保存後にのみ置く・失敗隔離・VALIDATION除外済み)
+                # で、observe_judgment_safety_shadowと同じ合流点から呼ぶ。
+                observe_valuation_confidence_shadow(
+                    final_recommendation,
+                    outcome,
+                    now,
+                    execution_context=execution_context,
+                    audit_service=audit_service,
+                )
+
+            # --- WATCH終了通知(コードレビュー対応2026-08、§3)。
+            # PROMOTED_TO_BUY(BUY到達)はここでは対象にしない(§2の「BUY到達」
+            # 通知へ統合済み、format_notification_text側で「到達」ラベル・
+            # 「N日監視後」を表示する)。TRADE_EVENTによる終了は
+            # WatchStateService.end_for_trade_events()経由のためwatch_
+            # transition_typeが設定されず、ここには現れない。
+            # 防御的対策(コードレビュー対応2026-08、指摘1): WatchStateService側で
+            # PROMOTED_TO_BUYをstale判定より優先する修正を行ったが、万一
+            # watch_transition_type=ENDEDのままbuy_actionがBUY家族になっている
+            # 状態が発生しても、BUY到達通知と監視終了通知の二重送信を防ぐため
+            # ここでも同じ条件を明示的に確認する。 ---
+            if (
+                final_recommendation.watch_transition_type == WatchTransitionType.ENDED.value
+                and final_recommendation.watch_end_reason in WATCH_END_NOTIFIABLE_REASONS
+                and final_recommendation.buy_action not in BUY_FAMILY_ACTIONS
+                and config.notification.watch_end_notification.enabled
+                and (final_recommendation.watch_previous_consecutive_business_days or 0)
+                >= config.notification.watch_end_notification.min_consecutive_business_days
+            ):
+                watch_end_ranking_entry = final_recommendation.recommendation_id
+
+            record_final_buy_action = final_recommendation.buy_action
+            record_raw_buy_action = base_buy_action
+            record_recommendation_id = final_recommendation.recommendation_id
+
+            if final_recommendation.buy_action == BuyAction.MANUAL_REVIEW:
+                category = "review"
+                record_purchase_category = PurchaseCategory.MANUAL_REVIEW
+                result = {"stock_code": stock_code, "recommended": True, "notified": False}
+            elif outcome.ranking_group == "buy_candidate":
+                # 実際の送信可否判定は行わず、ランキング候補として登録するだけに
+                # 留める(全銘柄処理完了後、購入候補ランキング順に評価・送信する)。
+                category = "candidate_not_ranked"
+                record_purchase_category = PurchaseCategory.BUY_CANDIDATE
+                ranking_entry = _encode_buy_ranking_entry(final_recommendation)
+                result = {"stock_code": stock_code, "recommended": True, "notified": False}
+            elif outcome.ranking_group == "watch_price":
+                # 買い候補サマリー表示改修(2026-08): 表示上「買い間近」(NEAR_BUY)と
+                # 「買い待ち」(それ以外のWATCH_FOR_PRICE・WATCH_BEFORE_EARNINGS)を
+                # 分離する。NEAR BUY/WATCH_BEFORE_EARNINGS向けの日次ランキング
+                # エントリ生成ロジック自体は変更しない(既存どおり)。
+                is_near_buy = (
+                    final_recommendation.buy_action == BuyAction.WATCH_FOR_PRICE
+                    and final_recommendation.watch_type is not None
+                )
+                category = "near_buy" if is_near_buy else "watch_wait"
+                record_purchase_category = (
+                    resolve_purchase_category(
+                        final_recommendation.buy_action, final_recommendation.watch_type
+                    )
+                    or PurchaseCategory.WATCH_FOR_PRICE
+                )
+                if (
+                    final_recommendation.watch_type is not None
+                    or final_recommendation.buy_action == BuyAction.WATCH_BEFORE_EARNINGS
+                ):
+                    near_buy_ranking_entry = _encode_near_buy_ranking_entry(final_recommendation)
+                result = {"stock_code": stock_code, "recommended": True, "notified": False}
+            else:
+                category = "hold"
+                record_purchase_category = PurchaseCategory.NOT_ATTRACTIVE
+                result = {"stock_code": stock_code, "recommended": True, "notified": False}
+
+            _record_evaluation_audit(
+                audit_service,
+                rule_version,
+                now,
+                stock_code,
+                source,
+                holding_quantity,
+                average_acquisition_price,
+                current_market_value,
+                unrealized_profit_loss,
+                unrealized_profit_loss_pct,
+                base_buy_action=base_buy_action,
+                final_buy_action=final_recommendation.buy_action or base_buy_action,
+                conflicting_holding_action=conflicting_holding_action,
+                holding_data_inconsistent=holding_data_inconsistent,
+                holding_owner_count=holding_owner_count,
+                holding_ids=holding_ids,
+                batch_id=batch_id,
+            )
+    except Exception:  # noqa: BLE001 - 1銘柄の想定外エラーで再帰呼び出し全体を落とさない
+        logger.exception("buy candidate analysis failed unexpectedly stock_code=%s", stock_code)
+        result = {"stock_code": stock_code, "recommended": False, "notified": False, "failed": True}
+        # Issue #667(HF-2 B1)
+        _notify_handled_failure_safely(
+            "CANDIDATE_ANALYSIS", "BUY_CANDIDATES_ANALYSIS_FAILED", now, batch_id
+        )
+
+    if batch_id is not None:
+        evaluation_record_saved = _save_evaluation_record_safely(
+            evaluation_record_repo,
+            batch_id,
+            stock_code,
+            now,
+            rule_version,
+            source,
+            record_purchase_category,
+            record_final_buy_action,
+            record_raw_buy_action,
+            record_recommendation_id,
+            execution_context,
+            record_exclusion_reasons,
+        )
+        needs_code = category in ("data_insufficient", "failed")
+        stock_code_for_category = stock_code if needs_code else None
+        progress = record_result(
+            batch_id,
+            category,
+            stock_code=stock_code_for_category,
+            ranking_entry=ranking_entry,
+            sector_entry=sector_entry,
+            validation_recommendation_id=validation_recommendation_id,
+            near_buy_ranking_entry=near_buy_ranking_entry,
+            watch_end_ranking_entry=watch_end_ranking_entry,
+            evaluation_record_saved_stock_code=(stock_code if evaluation_record_saved else None),
+            # Issue #57 B1: finalize eligibilityの正本となる完了識別子。
+            # stock_code引数はcategoryが"data_insufficient"/"failed"のときしか
+            # 渡されないため流用できず、専用引数として常に渡す。
+            completion_id=stock_code,
+        )
+        if progress is not None and progress.is_complete:
+            # Issue #31: 完了トリガーの実行権を原子的に取得し、取得できた1実行
+            # だけが_finalize_batch(ランキング・digest/summary送信・監査記録等)を
+            # 実行する。正常終了時のみcompleted記録し、例外時は記録しない
+            # (stale化後に後続トリガーがtakeoverして再実行できる)。
+            # Issue #57 B1: is_complete/gateの正本はcompleted_codesの要素数へ
+            # 変更済み。同一銘柄のLambda非同期retryでcompletedカウンタが二重
+            # 加算されても、未処理銘柄を残したままここへ到達しない。
+            finalize_token = try_acquire_completion_finalize(batch_id, now)
+            if finalize_token is None:
+                logger.info(
+                    "buy candidates finalize skipped (already acquired or completed) batch_id=%s",
+                    batch_id,
+                )
+            else:
+                try:
+                    _finalize_batch(
+                        progress,
+                        batch_id,
+                        config,
+                        now,
+                        recommendation_repo,
+                        notification_service,
+                        execution_context,
+                        evaluation_record_repo,
+                        latest_batch_pointer_repo,
+                    )
+                except BaseException as exc:
+                    # Issue #57 B1: 捕捉可能な失敗を永続化する(観測のみ。
+                    # completed_atは書かないためgateの意味論は不変で、再駆動も
+                    # まだ行わない=Phase B2)。記録の失敗で元の例外を握りつぶさない。
+                    _mark_finalize_failure_safely(batch_id, finalize_token, now, exc)
+                    raise
+                mark_completion_finalize_completed(batch_id, finalize_token, now)
+                # Issue #603 (Q'): 購入側 Shadow の『枠』。finalize の完了記録の**後**に、
+                # 実行権を取得した 1 起動だけが呼ぶ。設定 OFF(既定)なら最初の判定で戻り、
+                # 例外は送出しない。
+                _observe_allocation_shadow_safely(
+                    batch_id=batch_id,
+                    now=now,
+                    execution_context=execution_context,
+                    audit_service=audit_service,
+                    remaining_time_ms=remaining_time_ms,
+                    wiring_factory=_shadow_wiring_factory(
+                        progress=progress,
+                        batch_id=batch_id,
+                        now=now,
+                        config=config,
+                        recommendation_repo=recommendation_repo,
+                    ),
+                )
+    return result
+
+
+def _shadow_candidate_ids(progress: BatchProgress) -> dict[str, str]:
+    """finalize の ranking entries(BUY 候補)→ 銘柄コード → 推奨 ID。読めない entry は飛ばす。"""
+    ids: dict[str, str] = {}
+    unreadable = 0
+    for entry in progress.ranking_entries:
+        try:
+            _, stock_code, recommendation_id = _decode_buy_ranking_entry(entry)
+        except ValueError:
+            # 自前の符号化と復号が食い違ったときだけ起きる(バグの信号なので数えて出す)
+            unreadable += 1
+            continue
+        ids[stock_code] = recommendation_id
+    if unreadable:
+        # 値は出さない(件数だけ)。この候補は Shadow の母数から外れる(黙って消さない)
+        logger.warning(
+            "allocation shadow: %d ranking entr(ies) could not be read and are not candidates",
+            unreadable,
+        )
+    return ids
+
+
+def _shadow_wiring_factory(
+    *,
+    progress: BatchProgress,
+    batch_id: str,
+    now: dt.datetime,
+    config: AppConfig,
+    recommendation_repo: RecommendationRepository,
+) -> Callable[[], ShadowRunner]:
+    """設定 ON のときだけ入口が呼ぶ。配線の module は、ここで初めて import する(OFF では不要)。"""
+
+    def factory() -> ShadowRunner:
+        from jstock_advisor.lambda_handlers.allocation_shadow_wiring import build_shadow_runner
+
+        return build_shadow_runner(
+            config=config,
+            batch_id=batch_id,
+            now=now,
+            candidate_ids=_shadow_candidate_ids(progress),
+            holding_recommendation_id=lambda code: _deterministic_recommendation_id(batch_id, code),
+            recommendation_repo=recommendation_repo,
+        )
+
+    return factory
+
+
+def _observe_allocation_shadow_safely(
+    *,
+    batch_id: str,
+    now: dt.datetime,
+    execution_context: ExecutionContext,
+    audit_service: AuditService,
+    remaining_time_ms: Callable[[], int] | None,
+    wiring_factory: Callable[[], ShadowRunner] | None = None,
+) -> None:
+    """Q' の入口を呼ぶ。入口自体が例外を送出しない契約だが、本流を守るため二重に握る。
+
+    戻り値は使わない(Shadow の出力は買い判定・通知の入力に入らない)。
+    """
+    try:
+        observe_allocation_shadow(
+            batch_id=batch_id,
+            now=now,
+            execution_context=execution_context,
+            audit_service=audit_service,
+            remaining_time_ms=remaining_time_ms,
+            wiring_factory=wiring_factory,
+        )
+    except Exception as exc:  # noqa: BLE001 - 購入判定・通知・完了処理へ波及させない
+        logger.warning("allocation shadow entry raised and was isolated (%s)", type(exc).__name__)
+
+
+def _run_finalize_only_recovery(
+    record: CompletionBatchRecord,
+    config: AppConfig,
+    now: dt.datetime,
+    recommendation_repo: RecommendationRepository,
+    notification_service: LineNotificationService,
+    execution_context: ExecutionContext,
+    evaluation_record_repo: BuyCandidateEvaluationRecordRepository,
+    latest_batch_pointer_repo: LatestBuyCandidateBatchPointerRepository,
+) -> dict[str, Any]:
+    """締めくくり処理だけを再実行する(Issue #57 Phase B2)。
+
+    **通常workerの処理は行わない。** `_finalize_batch()`のみを、通常経路と
+    まったく同じ依存(repository / notification service / ExecutionContext)で
+    呼び出す。
+
+    実行権は**既存の`try_acquire_completion_finalize()`**で取得する
+    (recovery専用のgateは作らない=Issue #31のat-most-onceを迂回しない)。
+    取得回数上限もこのgateのConditionExpressionが正本であり、上限到達時は
+    Noneが返るため無限invokeにならない。
+    """
+    batch_id = record.batch_id
+    finalize_token = try_acquire_completion_finalize(batch_id, now)
+    if finalize_token is None:
+        # 他実行が取得済み / 既にfinalize済み / 取得回数上限のいずれか。
+        # 上限到達は運用者向けに明示する(B2では新しい通知は追加しない)。
+        if record.attempts_exhausted:
+            logger.error(
+                "finalize recovery exhausted batch_id=%s batch_family=%s "
+                "attempt_count=%d reason=FINALIZE_RETRY_EXHAUSTED",
+                batch_id,
+                BatchFamily.BUY_CANDIDATES.value,
+                record.attempt_count,
+            )
+            return {"finalize_recovery": "EXHAUSTED"}
+        logger.info(
+            "finalize recovery skipped (already acquired or completed) batch_id=%s",
+            batch_id,
+        )
+        return {"finalize_recovery": "SKIPPED"}
+    try:
+        _finalize_batch(
+            record.progress,
+            batch_id,
+            config,
+            now,
+            recommendation_repo,
+            notification_service,
+            execution_context,
+            evaluation_record_repo,
+            latest_batch_pointer_repo,
+        )
+    except BaseException as exc:
+        _mark_finalize_failure_safely(batch_id, finalize_token, now, exc)
+        raise
+    mark_completion_finalize_completed(batch_id, finalize_token, now)
+    logger.info("finalize recovery completed batch_id=%s", batch_id)
+    return {"finalize_recovery": "COMPLETED"}
+
+
+def _mark_finalize_failure_safely(
+    batch_id: str, finalize_token: str, now: dt.datetime, exc: BaseException
+) -> None:
+    """finalize失敗の記録を試みる(Issue #57 B1)。
+
+    記録は観測目的のbest-effortであり、**元の例外の伝播を妨げてはならない**。
+    記録自体が失敗した場合は警告を残すだけで飲み込む(呼び出し側が元の例外を
+    再送出することで、Lambdaのretry/可視化は従来どおり働く)。
+    """
+    try:
+        mark_completion_finalize_failed(batch_id, finalize_token, now, exc)
+    except Exception:  # noqa: BLE001 - 記録失敗で元の例外を隠さない
+        logger.warning(
+            "buy candidates: failed to persist finalize failure batch_id=%s",
+            batch_id,
+            exc_info=True,
+        )
+
+
+def _save_evaluation_record_safely(
+    evaluation_record_repo: BuyCandidateEvaluationRecordRepository | None,
+    batch_id: str,
+    stock_code: str,
+    now: dt.datetime,
+    rule_version: str,
+    source: CandidateSource,
+    purchase_category: PurchaseCategory,
+    final_buy_action: BuyAction | None,
+    raw_buy_action: BuyAction | None,
+    recommendation_id: str | None,
+    execution_context: ExecutionContext,
+    exclusion_reasons: list[str] | None = None,
+) -> bool:
+    """BuyCandidateEvaluationRecordの構築・保存失敗が既存の判定・通知フローを
+    絶対にブロックしないためのラッパー(save_decision_snapshot_safely()と同じ
+    設計方針)。将来のLINE詳細理由照会機能に向けた参照用の副次的な記録であり、
+    失敗してもWARNINGログのみに留め、呼び出し元へ伝播させない。
+
+    戻り値は保存に成功したかどうか(LINE UI第二弾「対象確認」機能2026-08で
+    追加)。呼び出し元はこの結果をrecord_result()のevaluation_record_saved_
+    stock_code引数へ渡し、latest batch pointerの更新条件(全対象銘柄分の
+    保存成功)の判定に使う。
+
+    Issue #105: VALIDATIONでは保存自体をスキップする。BuyCandidateEvaluationRecordは
+    本番テーブル専用(検証用テーブルを持たない)ため、ここでスキップしないと
+    「VALIDATIONは通常運用の永続履歴を汚さない」という既存契約に反する。
+    対称的な`HoldingEvaluationRecord`(holdings_watchlist_handler.py)も同じく
+    分離ではなくスキップ方式であり、それに揃える。
+
+    スキップの意思表示は`execution_context`で行い、`evaluation_record_repo=None`
+    (=未注入)へ流用しない。戻り値Falseは「保存していない」という事実どおりの値で、
+    唯一の消費先であるlatest batch pointerの更新条件はNORMAL限定
+    (`_finalize_batch`参照)のため、VALIDATIONでの挙動に影響しない。
+    """
+    if execution_context.is_validation:
+        return False
+    if evaluation_record_repo is None:
+        return False
+    try:
+        evaluation_record_repo.upsert(
+            BuyCandidateEvaluationRecord(
+                evaluation_id=build_evaluation_id(batch_id, stock_code),
+                batch_id=batch_id,
+                stock_code=stock_code,
+                evaluated_at=now,
+                rule_version=rule_version,
+                candidate_source=source,
+                purchase_category=purchase_category,
+                final_buy_action=final_buy_action,
+                raw_buy_action=raw_buy_action,
+                recommendation_id=recommendation_id,
+                exclusion_reasons=(
+                    tuple(exclusion_reasons) if exclusion_reasons is not None else None
+                ),
+            )
+        )
+        return True
+    except Exception:  # noqa: BLE001 - 参照用の副次記録の失敗で本処理を止めない
+        logger.warning(
+            "buy_candidates_handler: failed to save BuyCandidateEvaluationRecord "
+            "stock_code=%s batch_id=%s",
+            stock_code,
+            batch_id,
+            exc_info=True,
+        )
+        # Issue #667(HF-2 B3)
+        _notify_handled_failure_safely(
+            "EVALUATION_RECORD_SAVE",
+            "BUY_CANDIDATES_EVALUATION_RECORD_SAVE_FAILED",
+            now,
+            batch_id,
+        )
+        return False
+
+
+@dataclass(frozen=True)
+class PortfolioExposureAggregate:
+    """全保有銘柄のportfolio exposureを集計した結果(Issue #82)。
+
+    **時価の可用性と業種の可用性を独立した2軸として保持する。**
+    以前は単一の `PortfolioValuationBasis` に両者が畳み込まれており、
+    業種が1件不明なだけで銘柄集中度まで評価不能になっていた。
+
+    - `basis` / `portfolio_total`: 銘柄集中度の分母。**全保有銘柄の時価**が
+      揃った場合のみ `MARKET_VALUE`。1件でも欠落・競合すれば `UNAVAILABLE`
+      (価格欠損時のfail-closeは従来どおり維持する。0円補完はしない)
+    - `sector_totals` / `sector_exposure_complete`: 業種集中度の入力。
+      **業種不明の銘柄が1件でもあれば `sector_exposure_complete=False`** とし、
+      業種集中度のみDATA_INSUFFICIENT扱いとする(銘柄集中度は巻き添えにしない)
+    - `coverage_ratio`: **observability / audit / completeness把握専用**。
+      authorizationには一切使用しない(部分カバレッジによるfail-open禁止)
+    """
+
+    sector_totals: dict[BuyIndustrySector, Decimal]
+    portfolio_total: Decimal | None
+    basis: PortfolioValuationBasis
+    sector_exposure_complete: bool
+    coverage_ratio: float
+    # 銘柄コード → 集計に採用したfact。候補自身がどの業種バケットに属するかを
+    # ここから引く(screening由来のRecommendation.buy_industry_sectorに依存しない)。
+    facts_by_stock: dict[str, PortfolioExposureFact]
+
+    def sector_total_for(self, stock_code: str) -> Decimal | None:
+        """銘柄の業種集中度に使う業種別時価を返す。判定できない場合はNone。
+
+        Noneは「業種集中度を評価できない」を意味し、**0円ではない**
+        (0を返すと「業種内の時価が0」という誤った事実になる)。
+        """
+        if not self.sector_exposure_complete:
+            return None
+        fact = self.facts_by_stock.get(stock_code)
+        if fact is None or not fact.sector_is_known:
+            return None
+        return self.sector_totals.get(fact.sector)
+
+
+def _unavailable_exposure(coverage_ratio: float) -> PortfolioExposureAggregate:
+    """時価が揃っていない場合の集計結果(stock/sectorとも fail-close)。"""
+    return PortfolioExposureAggregate(
+        sector_totals={},
+        portfolio_total=None,
+        basis=PortfolioValuationBasis.UNAVAILABLE,
+        sector_exposure_complete=False,
+        coverage_ratio=coverage_ratio,
+        facts_by_stock={},
+    )
+
+
+def _aggregate_portfolio_exposure(
+    exposure_entries: list[str], holding_count: int
+) -> PortfolioExposureAggregate:
+    """portfolio exposure factを銘柄コード単位で集計する(要求仕様§5後半・§7・§8)。
+
+    Issue #82 で `_aggregate_sector_entries` から改称・拡張した。報告元が
+    「screeningを通過した銘柄」から「保有している全銘柄」へ変わったため、
+    名前も screening 由来の語彙(sector entry)を残さない。
+    DynamoDB属性名 `sector_entries` は既存schema互換のため変更しない。
+
+    保有銘柄全員分のエントリが揃い、かつ内容競合(同一銘柄で異なる値)が無い
+    場合のみ `PortfolioValuationBasis.MARKET_VALUE` とする。1件でも欠落・競合が
+    あれば `UNAVAILABLE` とし、時価ベースの比率を信頼できないものとして扱う
+    (時価と取得金額を混在させない)。DynamoDB String Setは順序保証が無いため、
+    「最後に見つかった値を採用」はしない。
+
+    **業種不明(`sector_availability=UNKNOWN`)は欠落ではない。** 時価は判明して
+    いるためポートフォリオ分母へ算入し、`sector_exposure_complete=False` として
+    業種集中度側だけを不成立にする。
+    """
+    if holding_count == 0:
+        return _unavailable_exposure(0.0)
+
+    if len(exposure_entries) > MAX_SECTOR_ENTRIES:
+        logger.error(
+            "buy_candidates_handler: exposure entry count=%d exceeds MAX_SECTOR_ENTRIES=%d",
+            len(exposure_entries),
+            MAX_SECTOR_ENTRIES,
+        )
+        return _unavailable_exposure(0.0)
+
+    by_stock: dict[str, PortfolioExposureFact] = {}
+    conflicting_codes: set[str] = set()
+    for raw_entry in exposure_entries:
+        fact = _decode_portfolio_exposure_fact(raw_entry)
+        if fact is None:
+            logger.warning(
+                "buy_candidates_handler: invalid portfolio exposure entry=%r ignored", raw_entry
+            )
+            continue
+        existing = by_stock.get(fact.stock_code)
+        if existing is not None and existing != fact:
+            conflicting_codes.add(fact.stock_code)
+            continue
+        by_stock[fact.stock_code] = fact
+
+    coverage_ratio = len(by_stock) / holding_count if holding_count > 0 else 0.0
+
+    if conflicting_codes:
+        logger.error(
+            "buy_candidates_handler: conflicting portfolio exposure values for stock_codes=%s",
+            sorted(conflicting_codes),
+        )
+        return _unavailable_exposure(coverage_ratio)
+
+    if len(by_stock) < holding_count:
+        # 価格・株数を取得できなかった保有銘柄が残っている状態。ポートフォリオ
+        # 総額そのものが不完全なため、銘柄集中度・業種集中度ともfail-closeする
+        # (0円補完はしない)。Issue #82 以降、screening除外は欠落の原因ではない。
+        logger.warning(
+            "buy_candidates_handler: portfolio exposure coverage incomplete (%d/%d holdings)",
+            len(by_stock),
+            holding_count,
+        )
+        return _unavailable_exposure(coverage_ratio)
+
+    sector_totals: dict[BuyIndustrySector, Decimal] = {}
+    portfolio_total = Decimal("0")
+    sector_exposure_complete = True
+    for fact in by_stock.values():
+        portfolio_total += fact.current_market_value
+        if fact.sector_is_known:
+            sector_totals[fact.sector] = (
+                sector_totals.get(fact.sector, Decimal("0")) + fact.current_market_value
+            )
+        else:
+            # 業種不明の銘柄を「その他セクター」として集計へ含めない。含めると
+            # 実際には別業種かもしれない時価を1つのバケットへ混ぜることになる。
+            sector_exposure_complete = False
+
+    if not sector_exposure_complete:
+        logger.warning(
+            "buy_candidates_handler: sector exposure incomplete "
+            "(unknown industry present); sector concentration is DATA_INSUFFICIENT"
+        )
+
+    return PortfolioExposureAggregate(
+        sector_totals=sector_totals,
+        portfolio_total=portfolio_total,
+        basis=PortfolioValuationBasis.MARKET_VALUE,
+        sector_exposure_complete=sector_exposure_complete,
+        coverage_ratio=coverage_ratio,
+        facts_by_stock=by_stock,
+    )
+
+
+def _record_notification_outcome_audit(
+    audit_service: AuditService,
+    rule_version: str,
+    now: dt.datetime,
+    recommendation: Recommendation,
+    unified_rank: int | None,
+    notification_rank: int | None,
+    notification_status: str,
+    eligibility: NotificationEligibility,
+    basis: PortfolioValuationBasis,
+    portfolio_total_market_value: Decimal | None,
+    coverage_ratio: float,
+    batch_id: str,
+    notification_pathway: str,
+) -> None:
+    """ランキングに登録された候補(BUY系)について記録する監査(要求仕様§4・§10・§14)。
+
+    unified_rank=Noneは、順位付けを行わない一過性の通知(WATCH終了通知等、
+    コードレビュー対応2026-08)を記録する場合に使う。
+
+    Issue #531(#71 F-C14): 唯一の呼び出し元`_finalize_batch()`はbatch_idを
+    必ず持つ(白箱テストからの直接呼び出しは存在しない)ため、
+    `_record_evaluation_audit()`と異なりbatch_id=Noneの後方互換分岐は無く、
+    常に`record_if_absent()`(batch_id+notification_pathway+stock_code由来の
+    決定的audit_id)で非同期fan-outの再配信(#528/#558/#622と同型の欠陥)による
+    監査ログの重複を防ぐ。audit_idは`f"unified_buy_candidate_notification_
+    outcome:{batch_id}:{notification_pathway}:{stock_code}"`の4構成要素からなる
+    (PR #622 F2と同型の粒度。#622と同じ理由でdecision_type prefix/batch_id/
+    notification_pathway/stock_codeのいずれを落としても正当な監査記録が
+    失われうる)。
+
+    `notification_pathway`は`_finalize_batch()`内の4つの独立したループ
+    (BUYランキング/送信/NEAR BUYランキング/WATCH終了通知)のうちどちらから
+    呼ばれたかを表す(`"buy"`はBUYランキング・送信の2ループ、`"near_buy"`・
+    `"watch_end"`はそれぞれ専用ループ)。**サブちゃんレビュー対応(F1。PR #625。
+    本PR以前に存在した「ランキングループは1銘柄1回だけ呼ぶ」という記述は
+    誤りだった**: 同一stock_codeが同一batch内でNEAR_BUYループとWATCH終了通知
+    ループの両方から異なる内容で呼ばれる経路が実在する(NEAR_BUY監視中の
+    銘柄が決算接近で当日WATCH_BEFORE_EARNINGSへ切り替わる場合。監視終了
+    〔watch_transition_type=ENDED〕と新たな監視開始〔ranking_group=
+    "watch_price"〕が同一候補処理内の別々の条件で同時に成立しうる)。
+    `notification_pathway`を欠くと、この2つの記録が同一audit_idへ収束し、
+    後から呼ばれた側が例外もログも無く黙って失われる(重複防止より害が大きい)。
+    同一pathway内では、`_finalize_batch()`の各ループが1銘柄につきちょうど
+    1回だけこの関数を呼ぶ(早期continueによる相互排他分岐)ため、同一batch・
+    同一pathway内で同一stock_codeが2回呼ばれることはない。
+    """
+    reliable = basis == PortfolioValuationBasis.MARKET_VALUE
+    block_category = eligibility.block_category.value if eligibility.block_category else None
+    portfolio_total_str = (
+        str(portfolio_total_market_value) if portfolio_total_market_value is not None else None
+    )
+    audit_service.record_if_absent(
+        audit_id=f"unified_buy_candidate_notification_outcome:{batch_id}:"
+        f"{notification_pathway}:{recommendation.stock_code}",
+        decision_type="unified_buy_candidate_notification_outcome",
+        stock_code=recommendation.stock_code,
+        input_values={
+            "recommendation_id": recommendation.recommendation_id,
+            "notification_pathway": notification_pathway,
+        },
+        calculation_formulas={},
+        output_values={
+            "unified_rank": unified_rank,
+            "notification_rank": notification_rank,
+            "notification_status": notification_status,
+            "block_category": block_category,
+            "block_reason": eligibility.block_reason,
+            "portfolio_valuation_basis": basis.value,
+            "portfolio_total_market_value": portfolio_total_str,
+            "portfolio_value_coverage_ratio": coverage_ratio,
+            "position_ratio_reliability": reliable,
+            "sector_ratio_reliability": reliable,
+        },
+        data_sources=[],
+        rule_version=rule_version,
+        timestamp=now,
+    )
+
+
+def _update_evaluation_record_outcome_safely(
+    evaluation_record_repo: BuyCandidateEvaluationRecordRepository | None,
+    batch_id: str,
+    stock_code: str,
+    unified_rank: int | None,
+    notification_rank: int | None,
+    eligible: bool,
+    block_category: str | None,
+    block_reason: str | None,
+    add_on_block_reasons: tuple[str, ...],
+    send_outcome: str | None,
+    execution_context: ExecutionContext,
+) -> None:
+    """買い候補ランキングループの各finalize判定結果を、判定時点(worker側)で
+    既に作成済みのBuyCandidateEvaluationRecordへ追記する(save_decision_
+    snapshot_safely()と同じ「失敗しても本処理を止めない」設計方針)。
+
+    Issue #105: VALIDATIONでは`_save_evaluation_record_safely()`が保存自体を
+    スキップするため、ここも**対称にスキップする**。片側だけ抑止すると、
+    finalizeで対象銘柄数ぶんの"BuyCandidateEvaluationRecord not found"
+    warningが出続けるうえ、read自体は本番テーブルへ発生してしまう。
+    """
+    if execution_context.is_validation:
+        return
+    if evaluation_record_repo is None:
+        return
+    try:
+        evaluation_id = build_evaluation_id(batch_id, stock_code)
+        existing = evaluation_record_repo.get(evaluation_id)
+        if existing is None:
+            logger.warning(
+                "buy_candidates_handler: BuyCandidateEvaluationRecord not found at finalize "
+                "stock_code=%s batch_id=%s",
+                stock_code,
+                batch_id,
+            )
+            return
+        evaluation_record_repo.upsert(
+            existing.model_copy(
+                update={
+                    "unified_rank": unified_rank,
+                    "notification_rank": notification_rank,
+                    "notification_eligible": eligible,
+                    "notification_block_category": block_category,
+                    "notification_block_reason": block_reason,
+                    "add_on_block_reasons": add_on_block_reasons,
+                    "send_outcome": send_outcome,
+                }
+            )
+        )
+    except Exception:  # noqa: BLE001 - 参照用の副次記録の失敗で本処理を止めない
+        # Issue #667(HF-2 B4)。本関数はnowを引数に持たないため、通知時刻は
+        # 失敗検知時点のUTC時刻を直接取得する(既存シグネチャを変更しない
+        # ための最小diff)。
+        _notify_handled_failure_safely(
+            "NOTIFICATION_OUTCOME_RECORD_UPDATE",
+            "BUY_CANDIDATES_NOTIFICATION_OUTCOME_RECORD_UPDATE_FAILED",
+            dt.datetime.now(dt.UTC),
+            batch_id,
+        )
+        logger.warning(
+            "buy_candidates_handler: failed to update BuyCandidateEvaluationRecord "
+            "stock_code=%s batch_id=%s",
+            stock_code,
+            batch_id,
+            exc_info=True,
+        )
+
+
+def _finalize_batch(
+    progress: BatchProgress,
+    batch_id: str,
+    config: AppConfig,
+    now: dt.datetime,
+    recommendation_repo: RecommendationRepository,
+    notification_service: LineNotificationService,
+    execution_context: ExecutionContext = _DEFAULT_EXECUTION_CONTEXT,
+    evaluation_record_repo: BuyCandidateEvaluationRecordRepository | None = None,
+    latest_batch_pointer_repo: LatestBuyCandidateBatchPointerRepository | None = None,
+) -> None:
+    """全銘柄の処理完了を検知したワーカーが1回だけ呼ぶ。購入候補ランキング順に
+    以下の固定順序でゲートを評価する(breakしない。全件をループし尽くす):
+      1. データ品質  2. 保有銘柄固有ゲート(売却競合→保有データ整合性→
+      ポートフォリオデータ信頼性→銘柄集中→業種集中)  3. 再送防止  4. 最大5件判定
+    最大5件に到達していても他のゲートを先に評価し、真に全ゲートを通過した
+    6位以下だけをOUTSIDE_TOP_5として扱う(統合BUY候補パイプライン2026-07)。
+    """
+    max_notifications = config.notification.buy_candidate_max_notifications_per_run
+    audit_service = AuditService(execution_context=execution_context)
+    rule_version = RuleVersionService().get_active_version_or(RULE_VERSION_PLACEHOLDER)
+
+    buy_entries: list[tuple[tuple[float, ...], str, str]] = [
+        _decode_buy_ranking_entry(entry) for entry in progress.ranking_entries
+    ]
+    # 降順ソート。同点時は銘柄コード昇順で決定性を確保する(要求仕様15節)。
+    buy_entries.sort(key=lambda item: (tuple(-v for v in item[0]), item[1]))
+
+    # progress.sector_entriesはDynamoDB属性名(既存schema互換のため改称しない)だが、
+    # 中身はIssue #82以降 screening結果に依存しないportfolio exposure factである。
+    exposure = _aggregate_portfolio_exposure(progress.sector_entries, progress.holding_count)
+    portfolio_total = exposure.portfolio_total
+    basis = exposure.basis
+    coverage_ratio = exposure.coverage_ratio
+
+    data_quality_blocked_count = 0
+    trade_cooldown_blocked_count = 0
+    cross_pipeline_blocked_count = 0
+    addon_blocked_count = 0
+    resend_suppressed_count = 0
+    outside_top5_count = 0
+    record_not_found_count = 0
+    eligible_winners: list[tuple[int, Recommendation]] = []
+
+    for unified_rank, (_sort_key, stock_code, recommendation_id) in enumerate(buy_entries, start=1):
+        recommendation = recommendation_repo.get(recommendation_id)
+        if recommendation is None:
+            logger.warning(
+                "buy_candidates_handler: recommendation not found for ranking winner "
+                "stock_code=%s recommendation_id=%s",
+                stock_code,
+                recommendation_id,
+            )
+            record_not_found_count += 1
+            _update_evaluation_record_outcome_safely(
+                evaluation_record_repo,
+                batch_id,
+                stock_code,
+                unified_rank,
+                None,
+                False,
+                "RECORD_NOT_FOUND",
+                "RECORD_NOT_FOUND",
+                (),
+                None,
+                execution_context,
+            )
+            continue
+
+        dq = notification_service.check_data_quality_eligibility(
+            recommendation, now, context=NotificationContext.BUY_CANDIDATE_BATCH
+        )
+        if not dq.eligible:
+            data_quality_blocked_count += 1
+            _record_notification_outcome_audit(
+                audit_service,
+                rule_version,
+                now,
+                recommendation,
+                unified_rank,
+                None,
+                "NOT_REQUIRED",
+                dq,
+                basis,
+                portfolio_total,
+                coverage_ratio,
+                batch_id=batch_id,
+                notification_pathway="buy",
+            )
+            _update_evaluation_record_outcome_safely(
+                evaluation_record_repo,
+                batch_id,
+                stock_code,
+                unified_rank,
+                None,
+                False,
+                dq.block_category.value
+                if dq.block_category
+                else EligibilityBlockCategory.DATA_QUALITY.value,
+                dq.block_reason,
+                (),
+                None,
+                execution_context,
+            )
+            continue
+
+        # コードレビュー対応(2026-08): このBUYランキングループには売買
+        # クールダウン判定が欠落していた(NEAR BUYループのみcheck_trade_
+        # cooldown_eligibility()を呼んでいた)。買ったばかりの銘柄へ再度
+        # BUY通知が送られてしまう不備のため、あわせて修正する。
+        buy_cooldown = notification_service.check_trade_cooldown_eligibility(recommendation, now)
+        if not buy_cooldown.eligible:
+            trade_cooldown_blocked_count += 1
+            _record_notification_outcome_audit(
+                audit_service,
+                rule_version,
+                now,
+                recommendation,
+                unified_rank,
+                None,
+                buy_cooldown.block_reason or "NOT_REQUIRED",
+                buy_cooldown,
+                basis,
+                portfolio_total,
+                coverage_ratio,
+                batch_id=batch_id,
+                notification_pathway="buy",
+            )
+            _update_evaluation_record_outcome_safely(
+                evaluation_record_repo,
+                batch_id,
+                stock_code,
+                unified_rank,
+                None,
+                False,
+                buy_cooldown.block_category.value
+                if buy_cooldown.block_category
+                else EligibilityBlockCategory.TRADE_COOLDOWN.value,
+                buy_cooldown.block_reason,
+                (),
+                None,
+                execution_context,
+            )
+            continue
+
+        # cross-pipeline重複抑止(コードレビュー対応2026-08、指摘5)。
+        buy_priority = notification_service.check_cross_pipeline_priority_eligibility(
+            recommendation, now
+        )
+        if not buy_priority.eligible:
+            cross_pipeline_blocked_count += 1
+            _record_notification_outcome_audit(
+                audit_service,
+                rule_version,
+                now,
+                recommendation,
+                unified_rank,
+                None,
+                buy_priority.block_reason or "NOT_REQUIRED",
+                buy_priority,
+                basis,
+                portfolio_total,
+                coverage_ratio,
+                batch_id=batch_id,
+                notification_pathway="buy",
+            )
+            _update_evaluation_record_outcome_safely(
+                evaluation_record_repo,
+                batch_id,
+                stock_code,
+                unified_rank,
+                None,
+                False,
+                buy_priority.block_category.value
+                if buy_priority.block_category
+                else EligibilityBlockCategory.LOW_PRIORITY.value,
+                buy_priority.block_reason,
+                (),
+                None,
+                execution_context,
+            )
+            continue
+
+        if recommendation.candidate_source in (CandidateSource.HOLDING, CandidateSource.BOTH):
+            # Issue #82: 業種集中度を判定できない場合はNoneを渡し、
+            # add_on_risk側で業種ゲートのみDATA_INSUFFICIENTとする。
+            # 以前はDecimal("0")を埋めていたため、「業種不明」が
+            # 「業種内の時価0円」と同義になっていた(0円補完の禁止)。
+            # 業種はexposure fact側から引く(screening結果に由来する
+            # Recommendation.buy_industry_sectorへ依存させない)。
+            sector_total = exposure.sector_total_for(recommendation.stock_code)
+            trading_unit = config.profit_taking.trading_unit.default_trading_unit
+            holding_data_inconsistent, holding_is_odd_lot = _holding_data_consistency(
+                recommendation.holding_quantity,
+                recommendation.average_acquisition_price,
+                trading_unit,
+            )
+            assessment, addon_eligibility = evaluate_add_on_eligibility(
+                current_market_value=recommendation.current_market_value or Decimal("0"),
+                current_price=recommendation.price_at_recommendation,
+                trading_unit=trading_unit,
+                portfolio_total_market_value=portfolio_total,
+                sector_total_market_value=sector_total,
+                portfolio_valuation_basis=basis,
+                conflicting_holding_action=recommendation.conflicting_holding_action,
+                holding_data_inconsistent=holding_data_inconsistent,
+                holding_is_odd_lot=holding_is_odd_lot,
+                config=config.add_on,
+            )
+            # --- Recommendationは不変スナップショットのため、ワーカーが既に保存
+            # 済みのレコードを上書き保存することはできない
+            # (RecommendationRepository.saveはrecommendation_id重複時に例外を送出
+            # する設計)。finalize時に確定するadd-on評価結果はここでは永続化せず、
+            # 通知本文の生成・監査ログ記録のためのin-memoryコピーとしてのみ使う
+            # (最終的な処分はunified_buy_candidate_notification_outcome監査に
+            # 記録される)。---
+            recommendation = recommendation.model_copy(
+                update={
+                    "projection_basis": assessment.projection_basis,
+                    "projected_add_on_quantity": assessment.projected_add_on_quantity,
+                    "projected_add_on_price": assessment.projected_add_on_price,
+                    "projected_add_on_amount": assessment.projected_add_on_amount,
+                    "projected_investment_amount": (
+                        (recommendation.current_market_value or Decimal("0"))
+                        + assessment.projected_add_on_amount
+                    ),
+                    "current_position_ratio": assessment.current_position_ratio,
+                    "projected_position_ratio": assessment.projected_position_ratio,
+                    "current_sector_ratio": assessment.current_sector_ratio,
+                    "projected_sector_ratio": assessment.projected_sector_ratio,
+                    "add_on_eligibility": (
+                        AddOnEligibility.ELIGIBLE
+                        if addon_eligibility.eligible
+                        else AddOnEligibility.BLOCKED
+                    ),
+                    "add_on_block_reasons": assessment.reasons,
+                    "buy_action": (
+                        recommendation.buy_action
+                        if addon_eligibility.eligible
+                        else BuyAction.MANUAL_REVIEW
+                    ),
+                }
+            )
+            if not addon_eligibility.eligible:
+                addon_blocked_count += 1
+                _record_notification_outcome_audit(
+                    audit_service,
+                    rule_version,
+                    now,
+                    recommendation,
+                    unified_rank,
+                    None,
+                    "NOT_REQUIRED",
+                    addon_eligibility,
+                    basis,
+                    portfolio_total,
+                    coverage_ratio,
+                    batch_id=batch_id,
+                    notification_pathway="buy",
+                )
+                _update_evaluation_record_outcome_safely(
+                    evaluation_record_repo,
+                    batch_id,
+                    stock_code,
+                    unified_rank,
+                    None,
+                    False,
+                    addon_eligibility.block_category.value
+                    if addon_eligibility.block_category
+                    else None,
+                    addon_eligibility.block_reason,
+                    assessment.reasons,
+                    None,
+                    execution_context,
+                )
+                continue
+
+        resend = notification_service.check_resend_eligibility(recommendation, now)
+        if not resend.eligible:
+            resend_suppressed_count += 1
+            _record_notification_outcome_audit(
+                audit_service,
+                rule_version,
+                now,
+                recommendation,
+                unified_rank,
+                None,
+                resend.block_reason or "SUPPRESSED",
+                resend,
+                basis,
+                portfolio_total,
+                coverage_ratio,
+                batch_id=batch_id,
+                notification_pathway="buy",
+            )
+            _update_evaluation_record_outcome_safely(
+                evaluation_record_repo,
+                batch_id,
+                stock_code,
+                unified_rank,
+                None,
+                False,
+                resend.block_category.value
+                if resend.block_category
+                else EligibilityBlockCategory.RECENTLY_NOTIFIED.value,
+                resend.block_reason,
+                (),
+                None,
+                execution_context,
+            )
+            continue
+
+        if len(eligible_winners) >= max_notifications:
+            outside_top5_count += 1
+            _record_notification_outcome_audit(
+                audit_service,
+                rule_version,
+                now,
+                recommendation,
+                unified_rank,
+                None,
+                "NOT_REQUIRED",
+                NotificationEligibility(
+                    eligible=False,
+                    block_category=EligibilityBlockCategory.OUTSIDE_TOP_5,
+                    block_reason="OUTSIDE_TOP_5",
+                ),
+                basis,
+                portfolio_total,
+                coverage_ratio,
+                batch_id=batch_id,
+                notification_pathway="buy",
+            )
+            _update_evaluation_record_outcome_safely(
+                evaluation_record_repo,
+                batch_id,
+                stock_code,
+                unified_rank,
+                None,
+                False,
+                EligibilityBlockCategory.OUTSIDE_TOP_5.value,
+                "OUTSIDE_TOP_5",
+                (),
+                None,
+                execution_context,
+            )
+            continue
+
+        eligible_winners.append((unified_rank, recommendation))
+
+    send_result = notification_service.notify_buy_candidates_digest(
+        [rec for _, rec in eligible_winners],
+        now,
+        # Issue #17: claim identityの安定した送信判断ID。同一バッチのretry・
+        # 二重finalizeでは不変、別バッチ起動では必ず異なる。
+        batch_id=batch_id,
+    )
+
+    notification_rank = 0
+    sent_count = 0
+    send_failed_count = 0
+    # 通知ドライラン機能(2026-08追加): DRY_RUN時は全通知条件・ランキング・
+    # 上限判定を通過していても外部LINE送信のみ行われない(WOULD_SEND_DRY_RUN)。
+    # 「通知済み」にも「送信失敗」にも計上しない、独立したカウンタとする。
+    dry_run_would_send_count = 0
+    # Issue #36: claim機構(Issue #17)がチャンクのpushを抑止した銘柄
+    # (CLAIM_SUPPRESSED)。今回の実行は送信していないため「通知済み」に
+    # 計上せず、notification_result_countsの「その他抑止」へ合算する。
+    claim_suppressed_count = 0
+    for unified_rank, rec in eligible_winners:
+        outcome = send_result.get(rec.stock_code, "SEND_FAILED")
+        # 通知検証モード機能(2026-08追加): SENT_VALIDATIONもLINE送信に成功した
+        # 銘柄数として扱う(NotificationLog未保存を理由に0件扱いにしない)。
+        # コードレビュー対応(2026-08、買い候補サマリー表示改修): SENT_LOG_FAILED
+        # はLINE送信自体には成功しているため、表示上・件数上は「通知済み」として
+        # 扱う(「送信失敗」とはしない)。内部のsend_outcomeでのみSENT_LOG_FAILEDを
+        # 区別し、既存どおりLambda例外による運用検知(下記log_failed)は維持する。
+        if outcome == "WOULD_SEND_DRY_RUN":
+            dry_run_would_send_count += 1
+            # コードレビュー対応(2026-08、通知ドライラン機能): 通知条件は通過した
+            # (eligible=True)が実LINE送信はしていないため、notification_status
+            # (実際の送信結果)へ"SENT"を記録しない。「eligible=True・
+            # send_outcome=WOULD_SEND_DRY_RUN」の組み合わせで、「条件は満たしたが
+            # 実送信はしていない」ことを監査上も明確に区別する(将来のLINEからの
+            # 理由照会機能で「送信済み」と誤認されないようにするため)。
+            _record_notification_outcome_audit(
+                audit_service,
+                rule_version,
+                now,
+                rec,
+                unified_rank,
+                None,
+                outcome,
+                NotificationEligibility(eligible=True),
+                basis,
+                portfolio_total,
+                coverage_ratio,
+                batch_id=batch_id,
+                notification_pathway="buy",
+            )
+            _update_evaluation_record_outcome_safely(
+                evaluation_record_repo,
+                batch_id,
+                rec.stock_code,
+                unified_rank,
+                None,
+                True,
+                None,
+                None,
+                (),
+                outcome,
+                execution_context,
+            )
+        elif outcome in ("SENT_AND_RECORDED", "SENT_VALIDATION", "SENT_LOG_FAILED"):
+            notification_rank += 1
+            sent_count += 1
+            _record_notification_outcome_audit(
+                audit_service,
+                rule_version,
+                now,
+                rec,
+                unified_rank,
+                notification_rank,
+                "SENT",
+                NotificationEligibility(eligible=True),
+                basis,
+                portfolio_total,
+                coverage_ratio,
+                batch_id=batch_id,
+                notification_pathway="buy",
+            )
+            _update_evaluation_record_outcome_safely(
+                evaluation_record_repo,
+                batch_id,
+                rec.stock_code,
+                unified_rank,
+                notification_rank,
+                True,
+                None,
+                None,
+                (),
+                outcome,
+                execution_context,
+            )
+        elif outcome == "CLAIM_SUPPRESSED":
+            # Issue #36: claim機構による抑止は通知条件をすべて通過した後
+            # (eligible=True)の送信段階で起きるため、送信失敗(else)へ
+            # 落とさず明示分岐で「その他抑止」へ計上する。「eligible=True・
+            # send_outcome=CLAIM_SUPPRESSED」の組み合わせで「条件は満たしたが
+            # 今回の実行はpushしていない(別実行が送信済み/送信中)」ことを
+            # 監査上も区別する(WOULD_SEND_DRY_RUNと同じ記録パターン)。
+            claim_suppressed_count += 1
+            _record_notification_outcome_audit(
+                audit_service,
+                rule_version,
+                now,
+                rec,
+                unified_rank,
+                None,
+                outcome,
+                NotificationEligibility(eligible=True),
+                basis,
+                portfolio_total,
+                coverage_ratio,
+                batch_id=batch_id,
+                notification_pathway="buy",
+            )
+            _update_evaluation_record_outcome_safely(
+                evaluation_record_repo,
+                batch_id,
+                rec.stock_code,
+                unified_rank,
+                None,
+                True,
+                None,
+                None,
+                (),
+                outcome,
+                execution_context,
+            )
+        else:
+            send_failed_count += 1
+            _record_notification_outcome_audit(
+                audit_service,
+                rule_version,
+                now,
+                rec,
+                unified_rank,
+                None,
+                outcome,
+                NotificationEligibility(eligible=False, block_reason=outcome),
+                basis,
+                portfolio_total,
+                coverage_ratio,
+                batch_id=batch_id,
+                notification_pathway="buy",
+            )
+            _update_evaluation_record_outcome_safely(
+                evaluation_record_repo,
+                batch_id,
+                rec.stock_code,
+                unified_rank,
+                None,
+                False,
+                None,
+                outcome,
+                (),
+                outcome,
+                execution_context,
+            )
+
+    log_failed = [code for code, outcome in send_result.items() if outcome == "SENT_LOG_FAILED"]
+    if log_failed:
+        logger.error(
+            "buy_candidates_handler: NotificationLog save failed after successful LINE send "
+            "stock_codes=%s (manual verification required)",
+            sorted(log_failed),
+        )
+
+    # --- NEAR BUY/WATCH_BEFORE_EARNINGS専用ランキング→finalizeループ
+    # (BUY候補裾野拡大機能2026-08、要求仕様§1-B)。BUYループとは独立した
+    # 集計・日次上限を持つ。data quality → trade cooldown → resend →
+    # (NEAR BUYのみ)日次上限、の順でゲートを評価する。 ---
+    near_buy_entries: list[tuple[tuple[float, ...], str, str]] = [
+        _decode_near_buy_ranking_entry(entry) for entry in progress.near_buy_ranking_entries
+    ]
+    near_buy_entries.sort(key=lambda item: item[0])  # distance_pct昇順、同点は-quality_score昇順
+    near_buy_max = config.buy_decision.near_buy.daily_max_notifications
+    near_buy_daily_count = 0
+    near_buy_sent_count = 0
+
+    for near_unified_rank, (_nb_sort_key, nb_stock_code, nb_recommendation_id) in enumerate(
+        near_buy_entries, start=1
+    ):
+        nb_recommendation = recommendation_repo.get(nb_recommendation_id)
+        if nb_recommendation is None:
+            logger.warning(
+                "buy_candidates_handler: recommendation not found for near-buy winner "
+                "stock_code=%s recommendation_id=%s",
+                nb_stock_code,
+                nb_recommendation_id,
+            )
+            continue
+
+        nb_dq = notification_service.check_data_quality_eligibility(
+            nb_recommendation, now, context=NotificationContext.BUY_CANDIDATE_BATCH
+        )
+        if not nb_dq.eligible:
+            _record_notification_outcome_audit(
+                audit_service,
+                rule_version,
+                now,
+                nb_recommendation,
+                near_unified_rank,
+                None,
+                "NOT_REQUIRED",
+                nb_dq,
+                basis,
+                portfolio_total,
+                coverage_ratio,
+                batch_id=batch_id,
+                notification_pathway="near_buy",
+            )
+            continue
+
+        nb_cooldown = notification_service.check_trade_cooldown_eligibility(nb_recommendation, now)
+        if not nb_cooldown.eligible:
+            _record_notification_outcome_audit(
+                audit_service,
+                rule_version,
+                now,
+                nb_recommendation,
+                near_unified_rank,
+                None,
+                nb_cooldown.block_reason or "NOT_REQUIRED",
+                nb_cooldown,
+                basis,
+                portfolio_total,
+                coverage_ratio,
+                batch_id=batch_id,
+                notification_pathway="near_buy",
+            )
+            continue
+
+        # cross-pipeline重複抑止(コードレビュー対応2026-08、指摘5)。
+        nb_priority = notification_service.check_cross_pipeline_priority_eligibility(
+            nb_recommendation, now
+        )
+        if not nb_priority.eligible:
+            _record_notification_outcome_audit(
+                audit_service,
+                rule_version,
+                now,
+                nb_recommendation,
+                near_unified_rank,
+                None,
+                nb_priority.block_reason or "NOT_REQUIRED",
+                nb_priority,
+                basis,
+                portfolio_total,
+                coverage_ratio,
+                batch_id=batch_id,
+                notification_pathway="near_buy",
+            )
+            continue
+
+        nb_resend = notification_service.check_resend_eligibility(nb_recommendation, now)
+        if not nb_resend.eligible:
+            _record_notification_outcome_audit(
+                audit_service,
+                rule_version,
+                now,
+                nb_recommendation,
+                near_unified_rank,
+                None,
+                nb_resend.block_reason or "SUPPRESSED",
+                nb_resend,
+                basis,
+                portfolio_total,
+                coverage_ratio,
+                batch_id=batch_id,
+                notification_pathway="near_buy",
+            )
+            continue
+
+        # 日次上限はNEAR_BUYカテゴリのみに適用する(WATCH_BEFORE_EARNINGSは
+        # 元々対象銘柄数が少ないため上限を設けない)。
+        is_near_buy = nb_recommendation.watch_type == WatchType.NEAR_BUY
+        if is_near_buy and near_buy_daily_count >= near_buy_max:
+            _record_notification_outcome_audit(
+                audit_service,
+                rule_version,
+                now,
+                nb_recommendation,
+                near_unified_rank,
+                None,
+                "NOT_REQUIRED",
+                NotificationEligibility(
+                    eligible=False,
+                    block_category=EligibilityBlockCategory.DAILY_LIMIT_NEAR_BUY,
+                    block_reason="DAILY_LIMIT_NEAR_BUY",
+                ),
+                basis,
+                portfolio_total,
+                coverage_ratio,
+                batch_id=batch_id,
+                notification_pathway="near_buy",
+            )
+            continue
+
+        # コードレビュー対応(2026-08、LINE通知アクション限定化): NEAR BUY/
+        # WATCH_BEFORE_EARNINGSは「今すぐ売買アクションを取れない」監視系
+        # 判定のため、ここまでの全ゲート通過後もLINEへは送信しない
+        # (WatchStateService側の内部監視・昇格判定自体はこのゲートより前段
+        # で完了済みのため一切影響を受けない)。送らなかったこと自体は
+        # NON_ACTIONABLEとしてAuditへ必ず記録する(黙って握りつぶさない)。
+        near_buy_sent_count += 1
+        if is_near_buy:
+            near_buy_daily_count += 1
+        _record_notification_outcome_audit(
+            audit_service,
+            rule_version,
+            now,
+            nb_recommendation,
+            near_unified_rank,
+            near_buy_sent_count,
+            "NOT_REQUIRED",
+            NotificationEligibility(
+                eligible=False,
+                block_category=EligibilityBlockCategory.NON_ACTIONABLE,
+                block_reason="NON_ACTIONABLE",
+            ),
+            basis,
+            portfolio_total,
+            coverage_ratio,
+            batch_id=batch_id,
+            notification_pathway="near_buy",
+        )
+
+    # --- WATCH終了通知の実送信経路(コードレビュー対応2026-08、§3)。
+    # ランキングは不要(1銘柄1回のみ発生する一過性イベント)なため、日次上限
+    # ループとは異なり単純な順次処理とする。 ---
+    for we_recommendation_id in progress.watch_end_ranking_entries:
+        we_recommendation = recommendation_repo.get(we_recommendation_id)
+        if we_recommendation is None:
+            logger.warning(
+                "buy_candidates_handler: recommendation not found for watch-end notification "
+                "recommendation_id=%s",
+                we_recommendation_id,
+            )
+            continue
+
+        we_dq = notification_service.check_data_quality_eligibility(
+            we_recommendation, now, context=NotificationContext.BUY_CANDIDATE_BATCH
+        )
+        if not we_dq.eligible:
+            _record_notification_outcome_audit(
+                audit_service,
+                rule_version,
+                now,
+                we_recommendation,
+                None,
+                None,
+                "NOT_REQUIRED",
+                we_dq,
+                basis,
+                portfolio_total,
+                coverage_ratio,
+                batch_id=batch_id,
+                notification_pathway="watch_end",
+            )
+            continue
+
+        we_cooldown = notification_service.check_trade_cooldown_eligibility(we_recommendation, now)
+        if not we_cooldown.eligible:
+            _record_notification_outcome_audit(
+                audit_service,
+                rule_version,
+                now,
+                we_recommendation,
+                None,
+                None,
+                we_cooldown.block_reason or "NOT_REQUIRED",
+                we_cooldown,
+                basis,
+                portfolio_total,
+                coverage_ratio,
+                batch_id=batch_id,
+                notification_pathway="watch_end",
+            )
+            continue
+
+        # コードレビュー対応(2026-08、LINE通知アクション限定化): WATCH終了通知は
+        # 「監視をやめた」ことの報告であり、ユーザーに売買アクションを促す通知
+        # ではないため、NEAR BUY/WATCH_BEFORE_EARNINGSと同様にLINE送信をやめ、
+        # NON_ACTIONABLEとしてAuditへ記録するのみとする。
+        _record_notification_outcome_audit(
+            audit_service,
+            rule_version,
+            now,
+            we_recommendation,
+            None,
+            None,
+            "NOT_REQUIRED",
+            NotificationEligibility(
+                eligible=False,
+                block_category=EligibilityBlockCategory.NON_ACTIONABLE,
+                block_reason="NON_ACTIONABLE",
+            ),
+            basis,
+            portfolio_total,
+            coverage_ratio,
+            batch_id=batch_id,
+            notification_pathway="watch_end",
+        )
+
+    # 買い候補サマリー表示改修(2026-08): 「購入判定」(判定状態)と「買い候補の
+    # 通知結果」(通知処理状態)を明確に分離した2種類の内訳を組み立てる。
+    # 「買い候補」総数(candidate_not_ranked)は判定時点の値をそのまま使い、
+    # finalizeで0へ上書きしない(以前はここで購入判定の総数自体が消えていた)。
+    purchase_judgment_counts = {
+        "buy_candidate": progress.category_counts.get("candidate_not_ranked", 0),
+        "near_buy": progress.category_counts.get("near_buy", 0),
+        "watch_wait": progress.category_counts.get("watch_wait", 0),
+        "not_attractive": progress.category_counts.get("hold", 0),
+        "manual_review": progress.category_counts.get("review", 0),
+        "data_insufficient": progress.category_counts.get("data_insufficient", 0),
+        "failed": progress.category_counts.get("failed", 0),
+    }
+    other_suppressed_count = (
+        data_quality_blocked_count
+        + trade_cooldown_blocked_count
+        + cross_pipeline_blocked_count
+        # Issue #36: claim機構による送信抑止(別実行が送信済み/送信中)。
+        # 再通知ポリシーによる抑止(resend_suppressed)とは限らないため、
+        # 「その他抑止」へ計上する(承認済み設計)。
+        + claim_suppressed_count
+    )
+    notification_result_counts = {
+        "sent": sent_count,
+        "notification_limit": outside_top5_count,
+        "resend_suppressed": resend_suppressed_count,
+        "addon_blocked": addon_blocked_count,
+        "other_suppressed": other_suppressed_count,
+        "send_failed": send_failed_count,
+        "other_error": record_not_found_count,
+        # 通知ドライラン機能(2026-08追加): 「通知済み」にも「送信失敗」にも
+        # 計上しない独立区分。SEND/NORMALでは構造的に常に0のまま
+        # (WOULD_SEND_DRY_RUNはnotification_mode=DRY_RUN時にしか発生しない)。
+        "dry_run_would_send": dry_run_would_send_count,
+    }
+
+    notification_service.notify_batch_summary(
+        _PROCESS_NAME,
+        progress.total,
+        progress.category_counts,
+        now,
+        data_insufficient_stock_codes=progress.data_insufficient_stock_codes,
+        failed_stock_codes=progress.failed_stock_codes,
+        buy_candidates_sent_count=sent_count,
+        near_buy_sent_count=near_buy_sent_count,
+        send_empty_summary=config.notification.send_empty_summary,
+        purchase_judgment_counts=purchase_judgment_counts,
+        notification_result_counts=notification_result_counts,
+    )
+
+    # LINE UI第二弾「対象確認」機能(2026-08)向け、latest completed batch
+    # pointerの更新。以下2条件を両方満たす場合のみ更新する:
+    #   1. execution_context.mode == NORMAL(VALIDATION/DRY_RUNでは絶対に
+    #      更新しない。mode自体を直接比較し、is_validation/is_dry_runという
+    #      派生プロパティの意味論に依存しない最も明示的な条件とする)
+    #   2. このbatchの全対象銘柄についてBuyCandidateEvaluationRecordの保存が
+    #      実際に成功している(evaluation_record_saved_stock_codesの件数が
+    #      total と一致。EvaluationRecord保存はbest-effortのため、GSI反映
+    #      遅延とは独立に、保存そのものの欠損を見逃さないための判定)。
+    # 条件を満たさない場合はポインタを更新せず、直前の正常完了batchの値を
+    # 維持する(新しいNotificationLog保存失敗(下記log_failed)によってここまで
+    # 到達していれば、通知系のブックキーピング障害であり分析結果自体は既に
+    # 完成しているため、ポインタ更新には影響させない)。
+    if latest_batch_pointer_repo is not None and execution_context.mode == ExecutionMode.NORMAL:
+        saved_count = len(progress.evaluation_record_saved_stock_codes)
+        # Issue #65 F-F8: totalが不明なときはポインタを進めない(fail-closed)。
+        # ★ totalを0とみなすと、saved_count==0の回に条件が成立し、
+        # **不完全なバッチで最新バッチポインタが前進**してしまう。
+        # 進めなかった場合は前回正常batchのポインタが維持され、
+        # 次回の実行で改めて判定される。
+        if progress.total_known and saved_count == progress.total:
+            latest_batch_pointer_repo.update_latest_completed(
+                LatestBuyCandidateBatchPointer(
+                    latest_completed_batch_id=batch_id,
+                    completed_at=now,
+                    total_candidates=progress.total,
+                )
+            )
+        else:
+            logger.error(
+                "buy_candidates_handler: evaluation record save incomplete, "
+                "latest batch pointer NOT updated (前回正常batchのまま維持) "
+                "batch_id=%s saved=%d total=%s",
+                batch_id,
+                saved_count,
+                progress.total if progress.total_known else "UNKNOWN",
+            )
+
+    if execution_context.is_validation:
+        # 通知検証モード機能(2026-08追加): 通知送信が正常終了した後、このバッチで
+        # 保存した全Recommendationを検証用テーブルから削除する(使い捨て
+        # テーブルのため。異常終了時はTTL(2時間)が安全網となる)。個別の削除
+        # 失敗はバッチの成功可否・LINE送信結果に影響させないベストエフォート処理。
+        for recommendation_id in progress.validation_recommendation_ids:
+            try:
+                recommendation_repo.delete(recommendation_id)
+            except Exception:  # noqa: BLE001 - TTLで最終的に解消されるため処理は継続する
+                logger.warning(
+                    "buy_candidates_handler: failed to delete validation recommendation "
+                    "recommendation_id=%s (TTLで自動削除されます)",
+                    recommendation_id,
+                    exc_info=True,
+                )
+
+    if log_failed:
+        # LINE送信自体は成功済みだがNotificationLog保存に失敗した銘柄がある。
+        # 二重送信を避けるためこのバッチ内では再送しないが、記録漏れを見逃さない
+        # よう、Lambda呼び出し自体を失敗させて運用検知(CloudWatch Alarm等)に
+        # 委ねる(統合BUY候補パイプライン2026-07)。
+        raise RuntimeError(
+            f"notify_buy_candidates_digest: NotificationLog保存に失敗した銘柄があります "
+            f"(LINE送信自体は成功済み): {sorted(log_failed)}"
+        )
+
+
+def handler(event: dict[str, Any], context: object) -> dict[str, Any]:
+    # 通知検証モード機能(2026-08追加)。不正なexecution_modeは他の一切の処理より
+    # 前にここで例外を送出し、Lambda呼び出し自体を失敗させる(NORMALへフォール
+    # バックしない)。
+    execution_context = resolve_execution_context(event)
+    now = dt.datetime.now(dt.UTC)
+    config = load_config()
+    calendar = BusinessCalendar.from_config(config.holiday_calendar)
+    providers = build_real_provider_bundle(now, config)
+    recommendation_repo = RecommendationRepository.for_execution_context(execution_context)
+    evaluation_record_repo = BuyCandidateEvaluationRecordRepository()
+    latest_batch_pointer_repo = LatestBuyCandidateBatchPointerRepository()
+    # BUY候補裾野拡大機能(2026-08、§5-1): 子Lambda(task=buy_candidate)は
+    # 親Lambdaがdetect_and_apply()の結果をイベントペイロード経由で伝播した
+    # trade_detection_confirmedをそのまま使う。
+    # ★ 既定は**False(fail-close)**である(Issue #211 / #70 F-B3)。
+    #   キーが無い = 「この実行で検知完了を確認できていない」であり、
+    #   確認できていないまま通常通知を送るfail-openは採用しない
+    #   (line_notification_service §5-1)。
+    #   通常のscheduled経路では親が必ず実値を渡すためキーは常に存在し、
+    #   この既定は参照されない(挙動不変)。既定が効くのは
+    #   finalize-only recovery等、親が値を持たない経路だけである。
+    trade_detection_confirmed = event.get("trade_detection_confirmed", False)
+    notification_service = LineNotificationService(
+        line_client=build_line_client_for_run(dry_run=execution_context.is_dry_run),
+        notification_log_repository=NotificationLogRepository(),
+        # LINE通知dedupの原子化(Issue #17): NORMAL実行の送信決定を原子的に
+        # 一意化するclaimリポジトリ(VALIDATION/DRY_RUNでは使用されない)。
+        notification_claim_repository=NotificationClaimRepository(),
+        recommendation_repository=recommendation_repo,
+        config=config,
+        execution_context=execution_context,
+        trade_detection_confirmed=trade_detection_confirmed,
+    )
+
+    if is_recovery_event(event):
+        # Issue #57 B2: finalize-only recovery。**通常workerの処理は一切行わない**
+        # (銘柄評価・Recommendation/DecisionSnapshot/EvaluationRecord再生成・
+        # Audit再登録・record_result・fanoutのいずれも実行しない)。task分岐より
+        # 前に置き、未知のrecovery_actionが通常worker経路へ落ちないようにする。
+        record = resolve_finalize_only_request(event, BatchFamily.BUY_CANDIDATES, execution_context)
+        if record is None:
+            return {"finalize_recovery": "REJECTED"}
+        return _run_finalize_only_recovery(
+            record,
+            config,
+            now,
+            recommendation_repo,
+            notification_service,
+            execution_context,
+            evaluation_record_repo,
+            latest_batch_pointer_repo,
+        )
+
+    if event.get("task") == "buy_candidate":
+        # 子Lambda: batch_idはevent由来なのでこの時点で既に確定している。
+        if execution_context.is_validation:
+            logger.info(
+                "VALIDATION MODE task=buy_candidate execution_mode=VALIDATION "
+                "notification_mode=%s event_notification_mode=%r is_dry_run=%s "
+                "validation_run_id=%s stock_code=%s",
+                execution_context.notification_mode.value,
+                event.get("notification_mode"),
+                execution_context.is_dry_run,
+                event.get("batch_id"),
+                event["stock_code"],
+            )
+        average_acquisition_price = (
+            Decimal(event["average_acquisition_price"])
+            if event.get("average_acquisition_price") is not None
+            else None
+        )
+        result = _process_single_candidate(
+            event["stock_code"],
+            CandidateSource(event["source"]),
+            event.get("holding_quantity"),
+            average_acquisition_price,
+            event.get("batch_id"),
+            now,
+            providers,
+            config,
+            calendar,
+            recommendation_repo,
+            notification_service,
+            execution_context,
+            evaluation_record_repo,
+            latest_batch_pointer_repo,
+            getattr(context, "get_remaining_time_in_millis", None),
+        )
+        # Issue #309 同型 sweep: ここは現時点では stock_code と真偽値しか持たないが、
+        # dict を丸ごと出す形そのものが、後からキーが 1 つ増えただけで漏れる。
+        # ★ 「いま PII が無いから良い」とはしない。形を揃えて塞ぐ。
+        # Issue #362: 子の正常系の終端にも batch_id を出し、「うまくいった1件」を run へ
+        # 結びつけられるようにする。既存の抽出手順を壊さないよう、既存のprefixと
+        # 各フィールドの並びは変えず、**末尾へ足す**。batch_id は event 由来で、
+        # owner・holding_id を含まない識別子(PIIではない)。
+        logger.info(
+            "buy_candidates_handler single candidate done stock_code=%s "
+            "recommended=%s notified=%s failed=%s batch_id=%s",
+            result.get("stock_code"),
+            result.get("recommended"),
+            result.get("notified"),
+            result.get("failed"),
+            event.get("batch_id"),
+        )
+        return result
+
+    # Issue #440: JPX休場日は、市場依存のこのentryをskipする(正常なno-op)。
+    # 順序: validation(上のresolve_execution_context)→ recovery/child等の非対象分岐(上)→
+    # 本gate(allow_market_closedの検証 → JST日付 → BusinessCalendar)→ 通常処理。
+    # 最初の状態変更(trade検知・batch行・fan-out・市場依存の通知)より前で判定する。
+    # recovery(前営業日のbatchの回復)とchildは休場日でも止めない(gateの上で処理済み)。
+    if should_skip_for_market_closed(
+        event, execution_context, now, config, handler="buy_candidates"
+    ):
+        return {"dispatched": 0, "skipped": SKIP_REASON}
+
+    # 通常のスケジュール起動(ディスパッチのみ行い、銘柄ごとの実処理は非同期の
+    # 自己再帰呼び出しに委ねる。気になる銘柄と保有銘柄を銘柄コード単位で統合し、
+    # 両方に登録されている銘柄は1回だけ評価する)
+    # 株主優待レジストリの読み込み件数チェックは、銘柄ごとのワーカー呼び出しでは
+    # なくバッチ開始時(ここ)で1回だけ行う(2026-07仕様レビュー対応)。
+    check_registry_health(
+        config.notification.operations.shareholder_benefit_registry_min_expected_entries
+    )
+
+    # --- BUY候補裾野拡大機能(2026-08、§5-1・§5-2): 売買イベント検知を
+    # BUY候補Lambda・保有銘柄Lambdaの起動順序に依存させない。両ハンドラの
+    # 入口でTradeCooldownService.detect_and_apply()を呼ぶ(冪等・PROCESSING/
+    # COMPLETEDロックにより当日1回だけ実際の検知処理が走る)。検知した
+    # TradeEventをWatchStateService.end_for_trade_events()へ明示的に渡し、
+    # 該当銘柄のWatchStateを終了する(TradeCooldownServiceとWatchStateServiceは
+    # 直接依存しない、責務分離)。
+    trade_cooldown_service = TradeCooldownService(
+        business_calendar=calendar,
+        config=config.notification.trade_cooldown,
+        execution_context=execution_context,
+    )
+    current_holdings_by_id = {h.holding_id: h for h in PortfolioService().list_holdings()}
+    detection_outcome = trade_cooldown_service.detect_and_apply(current_holdings_by_id, now)
+    if detection_outcome.confirmed:
+        watch_state_service = WatchStateService(
+            business_calendar=calendar, execution_context=execution_context
+        )
+        # 再コードレビュー対応(2026-08、JST暦日境界修正・指摘4): 保有銘柄Lambda側
+        # (holdings_watchlist_handler.py)と同じ理由でJST暦日(evaluation_date_jst)
+        # を使う(TradeDetectionの基準日・WatchStateの経過判定基準日を統一する)。
+        watch_state_service.end_for_trade_events(detection_outcome.events, evaluation_date_jst(now))
+    else:
+        logger.warning(
+            "buy_candidates_handler: trade detection not confirmed this run "
+            "(TRADE_DETECTION_IN_PROGRESSとして通常通知をfail-closedする)"
+        )
+
+    function_name = resolve_function_name(context, os.environ.get("AWS_LAMBDA_FUNCTION_NAME", ""))
+    # Issue #558: EventBridge Schedulerのretryで同一論理実行が新しいbatch_idで
+    # 再dispatchされることを防ぐため、event["scheduled_time"]から決定論的に
+    # batch_idを導出する(#65 F-E7と同じ導出ロジック。_scheduling.py参照)。
+    # _build_unified_targets()より前に確定させる(レビュー対応F1: 同関数内の
+    # 中断監査記録がbatch_id由来の決定的audit_idを必要とするため)。
+    batch_id = derive_scheduled_batch_id("buy-candidates", event, now)
+    targets = _build_unified_targets(config, now, execution_context, batch_id)
+    holding_count = sum(
+        1 for t in targets if t.source in (CandidateSource.HOLDING, CandidateSource.BOTH)
+    )
+    # Issue #533(#319 Phase 2): dispatch経路はbatch開始時点の環境変数値で固定する
+    # (以後この変数を再評価しない。1回のbatch起動は必ず開始時点の経路のまま)。
+    use_sqs_dispatch = buy_candidate_sqs_dispatch_enabled()
+    dispatch_mode = DISPATCH_MODE_SQS if use_sqs_dispatch else DISPATCH_MODE_LEGACY
+    started = start_batch(
+        batch_id,
+        len(targets),
+        now,
+        # Issue #57 B2: reconcilerがstatusではなくfamily markerで積極識別するため、
+        # 種別と実行文脈をここで必ず永続化する。
+        BatchFamily.BUY_CANDIDATES,
+        execution_context,
+        holding_count=holding_count,
+        dispatch_mode=dispatch_mode,
+    )
+    if not started:
+        # Issue #558: 同一batch_idでの2回目の開始(Scheduler retry等)。正常な
+        # idempotency結果として扱い、fanout・通知・進捗初期化のいずれも
+        # 行わずに終了する(ERROR/例外にしない。retryをさらに誘発しない)。
+        logger.info("buy_candidates_handler: duplicate batch start ignored batch_id=%s", batch_id)
+        return {"dispatched": 0, "skipped": "duplicate_batch_start"}
+    # Issue #754: 株主優待registryのcoverageを、候補側・保有側の2軸でINFO記録する(読み込み済みの
+    # targetsから算出するため、watchlist・holdingsの追加の読み込みは無い。判定・通知は変えない)。
+    check_registry_coverage(
+        candidate_codes=[
+            t.stock_code
+            for t in targets
+            if t.source in (CandidateSource.WATCHLIST, CandidateSource.BOTH)
+        ],
+        holding_codes=[
+            t.stock_code
+            for t in targets
+            if t.source in (CandidateSource.HOLDING, CandidateSource.BOTH)
+        ],
+    )
+    if execution_context.is_validation:
+        # 通知検証モード機能(2026-08追加): batch_idはここで初めて確定するため、
+        # イベント解析直後ではなくこの時点でVALIDATION開始ログを出す。
+        logger.info(
+            "VALIDATION MODE START execution_mode=VALIDATION notification_mode=%s "
+            "validation_run_id=%s target_count=%d",
+            execution_context.notification_mode.value,
+            batch_id,
+            len(targets),
+        )
+
+    # Issue #818 案B: fan-outの前に、dispatcher(このプロセス1つ)が窓内の日付のEDINET書類一覧を
+    # あらかじめ取得してL2(共有cache)を新しくする。子は新しい成功cacheを再利用し、同じ日付の
+    # 重複取得(最初の数秒に多数のcoldなプロセスが同時に取得する構造)を避ける。
+    # fail-soft: 例外・タイムアウトでもfan-outは始める。失敗はcacheへ保存しない(子は従来どおり
+    # 自分で取得を試み、失敗すれば従来どおりFETCH_FAILED → DATA_INSUFFICIENTのまま。Issue #53)。
+    prefetch_recent_document_lists_safely(now)
+
+    for target in targets:
+        child_payload: dict[str, Any] = {
+            "task": "buy_candidate",
+            "stock_code": target.stock_code,
+            "source": target.source.value,
+            "batch_id": batch_id,
+            "holding_quantity": target.holding_quantity,
+            "average_acquisition_price": (
+                str(target.average_acquisition_price)
+                if target.average_acquisition_price is not None
+                else None
+            ),
+            "execution_mode": execution_context.mode.value,
+            "trade_detection_confirmed": detection_outcome.confirmed,
+        }
+        # バグ修正(2026-08、通知ドライラン機能): notification_modeを子Lambdaへ
+        # 伝播し忘れており、VALIDATION+DRY_RUNで起動しても子Lambda側は
+        # notification_mode未指定→既定のSEND扱いとなり、実LINE送信が抑止
+        # されない不備があった。NORMAL実行時はresolve_execution_context()が
+        # execution_mode=NORMAL+notification_mode指定をエラーにするため、
+        # VALIDATION時のみキー自体を追加する(NORMAL実行への影響を避ける)。
+        if execution_context.is_validation:
+            child_payload["notification_mode"] = execution_context.notification_mode.value
+        if use_sqs_dispatch:
+            dispatch_sqs(os.environ["BUY_CANDIDATE_QUEUE_URL"], child_payload)
+        else:
+            dispatch_async(function_name, child_payload)
+
+    logger.info(
+        "buy_candidates_handler dispatched: scanned=%d (holdings=%d) batch_id=%s",
+        len(targets),
+        holding_count,
+        batch_id,
+    )
+    return {"dispatched": len(targets)}

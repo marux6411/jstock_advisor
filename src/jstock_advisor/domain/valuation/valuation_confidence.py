@@ -1,0 +1,136 @@
+"""適正価格の信頼度(2026-07 BUYパイプライン再設計。要求仕様9節・12節・13節)。
+
+`confidence_scoring.py`の共通エンジンとは別に、購入判断基準価格・安全余裕率
+バケットを決めるための固有ルールをここに実装する(手法間バラつき率1.60/2.00・
+業種別モデル未適用・簡易DCF依存・平準化EPS信頼度)。Recommendation全体の
+信頼度は引き続き共通エンジンを使い、両者の保守的な方(min)を最終的に採用する。
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+from jstock_advisor.domain.entities.enums import ConfidenceLevel
+
+_MIN_METHODS_FOR_MEDIUM_OR_HIGH = 2
+
+# NO_VALUATION_ANCHORの直接原因コード(2026-08、ウォッチリスト表示改善で
+# 共通定数化)。ValuationAnchorBlockingReason.codeへ設定する値、および表示層
+# (stock_analysis_view_service.py/watchlist_judgment_summary_formatter.py)が
+# code→文言変換に使う値は、必ずこれらの定数を経由し、文字列リテラルを
+# 複数箇所へ重複定義しないこと。
+CODE_NO_VALID_VALUATION_METHODS = "NO_VALID_VALUATION_METHODS"
+CODE_TOO_FEW_VALUATION_METHODS = "TOO_FEW_VALUATION_METHODS"
+CODE_VALUATION_DISPERSION_TOO_HIGH = "VALUATION_DISPERSION_TOO_HIGH"
+CODE_VALUATION_ANCHOR_CALCULATION_FAILED = "VALUATION_ANCHOR_CALCULATION_FAILED"
+
+
+@dataclass(frozen=True)
+class ValuationAnchorBlockingReason:
+    """valuation_anchor(購入判断基準価格)を生成できなかった直接原因の構造化記録
+    (2026-08、NO_VALUATION_ANCHOR表示不備の是正対応)。
+
+    reasons_not_high(HIGHへ格上げしなかっただけの補助理由。業種別モデル未適用・
+    簡易DCF使用等、ほぼ全銘柄で恒常的に成立しうる)とは異なり、こちらは
+    「なぜvaluation_anchor自体をNoneにしたか」という直接原因のみを表す。
+    表示層(StockAnalysisViewService)が現在configを再取得して原因を再判定
+    しなくて済むよう、判定時点に実際に使用した実測値・基準値をそのまま保持する。
+    """
+
+    code: str
+    actual_value: float | None = None
+    threshold_value: float | None = None
+
+
+@dataclass(frozen=True)
+class ValuationConfidenceResult:
+    level: ConfidenceLevel
+    reasons_not_high: list[str] = field(default_factory=list)
+    blocking_reason: ValuationAnchorBlockingReason | None = None
+
+
+def determine_valuation_confidence(
+    *,
+    methods_used_count: int,
+    dispersion_ratio: float | None,
+    dispersion_medium_max: float,
+    dispersion_anchor_block: float,
+    industry_model_applied: bool,
+    uses_simplified_dcf: bool,
+    normalized_eps_confidence: ConfidenceLevel | None,
+    require_industry_model: bool = True,
+) -> ValuationConfidenceResult:
+    """--- Issue #186(2026-09-06): dispersionによるLOW判定の閾値を分離した ---
+
+    従来はdispersion > auto_buy_block(2.00)でLOWへ倒し、その結果
+    compute_valuation_anchor()がNoneを返して買付価格が一切生成されなかった。
+    しかし「ばらつきが大きいので自動で買わない」という安全機能は
+    decide_buy_action()とvalidate_buy_recommendation()が同じ2.00で既に持っており、
+    ここでLOWへ倒すのは同じ判断の重複だった。重複の副作用として、方式値を
+    上げるとanchorが 有 -> 無 -> 有 と非単調に反転する挙動が生じていた
+    (保存済み判定記録の実測で、BUY判定の26.1%がanchorを持たず、その98.0%が
+    この分岐に由来していた)。
+
+    そこで本関数のLOW判定はanchor_block(既定50.0)へ移し、
+    「比較対象として成立していない極端な入力を保護する」用途に限定する。
+    auto_buy_block(2.00)は変更していない。自動購入の禁止は引き続き
+    decide_buy_action()/validate_buy_recommendation()が担う。
+
+    --- Issue #582(2026-09-28): require_industry_model(既定True) ---
+
+    industry_model_appliedは#208の調査により恒久的にFalseとなることが
+    判明しており、本関数のHIGH tierはProductionで一度も到達していない。
+    `require_industry_model=False`を渡すと、industry_model_appliedを
+    reasons_not_highの判定対象から除外する(他の理由〔dispersion・簡易DCF・
+    平準化EPS信頼度〕は従来どおり評価する)。既定値Trueは既存呼び出し元の
+    挙動を完全に保つ(#582のDOMAIN_WIP_DECLARATION・COMPATIBILITY_EVIDENCE
+    参照)。Falseを渡す呼び出しは現時点でshadow計測専用であり、Production
+    のBUY判定・Recommendation保存には使用しない。
+    """
+    if methods_used_count == 0:
+        return ValuationConfidenceResult(
+            ConfidenceLevel.LOW,
+            ["有効な適正価格算出手法がありません"],
+            blocking_reason=ValuationAnchorBlockingReason(code=CODE_NO_VALID_VALUATION_METHODS),
+        )
+
+    reasons_not_high: list[str] = []
+    if dispersion_ratio is not None and dispersion_ratio > dispersion_medium_max:
+        reasons_not_high.append(
+            f"適正価格手法間のばらつきが{dispersion_medium_max}倍を超えています"
+        )
+    if require_industry_model and not industry_model_applied:
+        reasons_not_high.append("業種別適正価格モデル未適用")
+    if uses_simplified_dcf:
+        reasons_not_high.append("簡易DCF(固定割引率・固定成長率の前提)を使用")
+    if normalized_eps_confidence is not None and normalized_eps_confidence != ConfidenceLevel.HIGH:
+        reasons_not_high.append("平準化EPSの信頼度が十分でない")
+
+    if methods_used_count < _MIN_METHODS_FOR_MEDIUM_OR_HIGH:
+        return ValuationConfidenceResult(
+            ConfidenceLevel.LOW,
+            [*reasons_not_high, "有効な適正価格算出手法が2件未満です"],
+            blocking_reason=ValuationAnchorBlockingReason(
+                code=CODE_TOO_FEW_VALUATION_METHODS,
+                actual_value=float(methods_used_count),
+                threshold_value=float(_MIN_METHODS_FOR_MEDIUM_OR_HIGH),
+            ),
+        )
+    if dispersion_ratio is not None and dispersion_ratio > dispersion_anchor_block:
+        return ValuationConfidenceResult(
+            ConfidenceLevel.LOW,
+            [
+                *reasons_not_high,
+                f"適正価格手法間のばらつきが{dispersion_anchor_block}倍を超えており"
+                "比較対象として成立していないため基準価格を算出しません",
+            ],
+            blocking_reason=ValuationAnchorBlockingReason(
+                code=CODE_VALUATION_DISPERSION_TOO_HIGH,
+                actual_value=dispersion_ratio,
+                threshold_value=dispersion_anchor_block,
+            ),
+        )
+
+    if reasons_not_high:
+        return ValuationConfidenceResult(ConfidenceLevel.MEDIUM, reasons_not_high)
+    return ValuationConfidenceResult(ConfidenceLevel.HIGH, [])

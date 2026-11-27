@@ -1,0 +1,93 @@
+# LINE通知の再通知ルール設定(要求仕様16節)
+
+version: 1
+
+# 前回通知からこの日数(暦日)が経過したら、同じ判定内容でも再通知する
+resend_after_days: 5
+
+# 推奨価格(買値/売値の代表値)がこの割合(%)以上変化したら再通知する
+price_change_resend_threshold_pct: 3.0
+
+# 買い候補分析で、1回の実行あたり実際にLINE通知する上限件数。
+# 買い候補スコア(100点満点)が高い順に上位N件のみ通知し、残りは通知を見送る
+# (要求仕様2026-07追加: 通知の一斉大量送信を防ぐため)
+buy_candidate_max_notifications_per_run: 5
+
+# 買い候補分析で、購入条件を満たす銘柄が0件だった場合に、バッチ完了サマリー
+# (対象銘柄数・内訳件数)自体をLINEへ送るかどうか(BUYパイプライン第2次修正
+# 2026-07追加。要求仕様16節)。
+#
+# Issue #568: docs/functional_spec.md 10.2節(2026-08-21改訂)は「0件でも
+# 『該当なし』を明示送信する」設計を既に文書化しており、保有銘柄側
+# (holdings_watchlist_handler.py)も同改訂でこの挙動へ統一済みである。
+# 買い候補側だけがfalseのままだったため、0件の日にバッチが正常終了した
+# ことすら利用者へ伝わらない(障害で動いていないのか、0件で正常終了した
+# のかをLINE通知だけからは区別できない)不具合になっていた。既定はtrue
+# (常に送信)とし、holdings側と対称にする。
+send_empty_summary: true
+
+# BUY候補バッチ専用の通知設定(BUYパイプライン第3次修正2026-07追加)。
+buy_candidates:
+  # 個別銘柄のデータ取得エラーをLINEへ個別送信するか。falseの場合、
+  # CloudWatch警告ログ+バッチ完了サマリーの内訳件数(data_insufficient)
+  # のみとし、個別LINE送信は行わない(「今日買える銘柄だけを通知する」方針)。
+  notify_data_errors: false
+
+# 運用障害通知の設定(BUYパイプライン第3次修正2026-07追加)。
+# BUY候補の個別データ取得エラー通知(buy_candidates.notify_data_errors)とは
+# 目的が異なるため、意図的に別設定として分離している。
+operations:
+  # バッチ全体が異常終了した場合に運用向け通知を行うか。
+  notify_batch_failure: true
+  # 株主優待レジストリの読み込み件数がこれ未満ならWARNINGログを出す
+  # (2026-07仕様レビュー対応: CSV取込漏れ等の運用ミスをすぐ検知するため)。
+  # 0でWARNINGを無効化する(件数のINFOログは常に出る)。
+  shareholder_benefit_registry_min_expected_entries: 1
+
+# 統合BUY候補パイプライン(2026-07追加)。気になる銘柄・保有銘柄それぞれを
+# BUY候補評価対象へ含めるかを個別に制御する。両方trueの場合、同一銘柄は
+# 統合され1回だけ評価される(要求仕様§2)。
+include_watchlist: true
+include_holdings: true
+
+# WATCH通知(保有継続・監視)で、適正価格の手法間乖離が大きい/信頼度が低い
+# 場合に注意書きを表示する閾値(2026-07仕様レビュー対応)。強気/弱気の比率が
+# この値以上のとき「手法間の推定差が大きい」とみなす。
+fair_value_large_spread_ratio: 2.0
+
+# --- BUY候補裾野拡大・NEAR BUY監視・通知制御の再設計(2026-08)で追加 ---
+# 上記の既存キー(resend_after_days等)はBUY/SELL系にそのまま適用され続ける
+# (完全後方互換)。NEAR BUY/WATCH_BEFORE_EARNINGSのみ、通常の再送防止を
+# バイパスして毎営業日通知する。
+notification_policy:
+  near_buy:
+    notify_every_business_day: true
+  watch_before_earnings:
+    notify_every_business_day: true
+
+# 保有銘柄リストの変化(新規購入/買い増し/一部売却/全部売却)を検知した後、
+# 通常の売買推奨通知(BUY/買い増し/SELL/一部売却検討/NEAR BUY/
+# WATCH_BEFORE_EARNINGS)を抑止する営業日数。重大リスク通知
+# (URGENT_HOLDING_REVIEW/URGENT_REVIEW)は貫通する。
+trade_cooldown:
+  enabled: true
+  buy_business_days: 5
+  sell_business_days: 5
+  partial_trade_business_days: 3
+
+# NEAR BUYの監視が終了した際、この営業日数以上継続していた場合のみ
+# 「監視終了」通知を送る。
+watch_end_notification:
+  enabled: true
+  min_consecutive_business_days: 5
+
+# 売買検知の部分適用クラッシュ時のtakeover再検知漏れを解消するconsumption step
+# (Issue #71 F-C11 Phase 2 = Issue #529)。毎時の既存reconciler(watchlist_batch_
+# reconciler_handler.py)へ相乗りし、pending_marker=PENDINGのまま取り残された
+# TradeEventRecordを検出してWatchState終了を再実行する。1回のreconciler実行
+# あたりの処理上限件数(watchlist_screening_rules.yamlのmax_timeout_finalize_
+# rows_per_runと同じ「無制限に長時間化させない」ための境界。TradeEventの
+# 想定発生頻度〔保有銘柄の売買イベントのみ〕はwatchlist finalizeより大幅に
+# 少ないため、この値自体で詰まることは通常想定しない)。
+trade_event_reconciliation:
+  max_records_per_run: 200

@@ -1,0 +1,187 @@
+"""全テスト共通のfixture(Issue #229)。
+
+## 何を解決するか
+
+`json_store.DEFAULT_STORE_DIR` はリポジトリ直下の `data/local_store` を
+ハードコードしており、環境変数などの差し替え口が無い。そのため
+`store_dir` を明示しないテストは**利用者の実データストアへ直接書き込む**。
+
+その結果、`data/local_store/audit_log.json` は実測で 91.8MB / 29,579件まで育ち、
+1件のupsertに約5.5秒(全読み→パース→全再直列化→全書き出し)かかるようになった。
+`tests/unit/test_watchlist_finalize_integration.py` が「hangする」と見えていたのは
+デッドロックではなく、この蓄積による極端な低速化である(空の一時ディレクトリでの
+A/Bでは20 testsが24.47秒で完走した)。
+
+**OS依存でも順序依存でもない。** 長く使っている作業コピーであれば同じことが起きる。
+CIで再現しないのは `data/local_store/*.json` が `.gitignore` 対象で、
+毎回まっさらな作業ディレクトリから始まるためである。
+
+## なぜ tests/ 直下に置くか
+
+`tests/unit/conftest.py` ではなく `tests/` 直下に置く。
+`tests/integration/` が既に存在するため(現時点ではテスト0件)、
+将来そちらへテストが増えたときに同じ問題を繰り返さないようにする。
+
+## なぜ src 側に差し替え口を作らないか
+
+`json_store.py` は共通部品カタログの **S-17 永続化ストア層**であり、
+変更すると lock 対象が全領域へ広がる。本fixtureはテスト実行時にのみ効き、
+srcを1行も変更しない。
+
+## 既存の個別回避策は残す
+
+`_NoopAuditService` / `_FakeTradeCooldownService` /
+`tests/unit/conftest.py` の `csv_import_ledger` は、同じ問題を個別に
+回避してきたものだが**削除しない**。監査を書かないことでテストの関心を絞る
+という別の役割も持っており、同時に消すと本fixtureの効果と副作用を
+切り分けられなくなる。
+"""
+
+from __future__ import annotations
+
+import itertools
+from collections.abc import Iterator, Sequence
+from pathlib import Path
+
+import pytest
+
+from jstock_advisor.infrastructure.local_repository import json_store
+from tests.support.time_semantics_registry import _REGISTRY, cohort_marker_name
+
+# Issue #866: Markdown を実際に読むテストが tests/ci_markdown_subset.txt に載っていることを検査する
+# (Markdown のみの変更で全体 pytest を省略する ci.yml の前提。plugin の説明は同 module)。
+pytest_plugins = ["tests.support.markdown_read_audit"]
+
+
+#: 既定の store のパスを割り当てるときの、テストごとに一意な番号(Issue #967)
+_store_dir_counter = itertools.count()
+#: このセッション(worker)で割り当てた『`tmp_path` を使わない』既定の store のパス。
+#: セッションの終わりに重複が 0 件であることを検査する(一意性は 1 件のテストでは証明できない)
+_assigned_store_dirs: list[Path] = []
+
+
+def duplicated_store_dirs(paths: Sequence[Path]) -> list[Path]:
+    """重複して割り当てられたパス(あれば)。セッション終了時の検査と、その契約テストが使う。"""
+    seen: set[Path] = set()
+    duplicated: list[Path] = []
+    for path in paths:
+        if path in seen:
+            duplicated.append(path)
+        seen.add(path)
+    return duplicated
+
+
+def _assign_default_store_dir(base: Path) -> Path:
+    """`tmp_path` を使わないテストへ、既定の store のパス(基底の配下・一意)を割り当てる。
+
+    ★ 重複を割り当てたら、そのテストの setup をその場で失敗させる(記録には残す)★。
+    セッション終了時の検査(`pytest_sessionfinish`)は、pytest-xdist では worker の中で動くため
+    worker が書き換えた終了コードが controller へ伝わらない(実測: trial/xdist-967 で、番号を定数に
+    して重複させた `-n 2` の run が成功した)。テストの失敗は worker から controller へ伝わるので、
+    xdist でも失敗として現れるのはこの『その場の失敗』である。
+    """
+    store_dir = base / "default_store" / f"t{next(_store_dir_counter)}"
+    duplicated = store_dir in _assigned_store_dirs
+    _assigned_store_dirs.append(store_dir)
+    if duplicated:
+        raise AssertionError(f"default store dir assigned to more than one test: {store_dir}")
+    return store_dir
+
+
+def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
+    """★ 一意性の検査(Issue #967)★。
+
+    同じセッションで同じ既定の store のパスを 2 つのテストが使っていたら失敗にする。
+    ★ 単独のプロセスの実行の最後の網である。pytest-xdist では worker の終了コードが controller へ
+    伝わらない(上の `_assign_default_store_dir` の説明)ため、xdist の実行ではその場の失敗が本体 ★。
+    """
+    duplicated = duplicated_store_dirs(_assigned_store_dirs)
+    if duplicated:
+        session.exitstatus = int(pytest.ExitCode.TESTS_FAILED)
+        message = f"ERROR: default store dir assigned to more than one test: {len(duplicated)}"
+        print(message)  # noqa: T201 - セッション終了時の失敗の通知(テストの外)
+
+
+@pytest.fixture(autouse=True)
+def _isolated_default_store_dir(
+    request: pytest.FixtureRequest,
+    tmp_path_factory: pytest.TempPathFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> Iterator[Path]:
+    """`json_store.DEFAULT_STORE_DIR` をテストごとの一時ディレクトリへ向ける。
+
+    function scopeとする。session scopeにすると1回の実行で1つのストアを
+    共有することになり、**本Issueと同じ蓄積の問題を小規模に再現する**。
+
+    `JsonCollectionStore.__init__` は `store_dir or DEFAULT_STORE_DIR` を
+    **構築時に解決**するため、本fixtureはストアが構築される前に差し替わって
+    いる必要がある。srcにはimport時にストアを構築するmoduleが存在しない
+    ことを確認済みであり(実測0件)、autouseのfunction scopeで足りる。
+
+    `store_dir` を明示しているテスト(実測89ファイル)と、自前で
+    `DEFAULT_STORE_DIR` をmonkeypatchしているテスト(実測2ファイル)には
+    影響しない。後者は各テスト内のmonkeypatchが本fixtureより後に効き、
+    どちらも一時ディレクトリを向く。
+
+    ## Issue #967: `tmp_path` を要求するのは、テストが `tmp_path` を使うときだけ
+
+    この fixture が全テストで `tmp_path` を要求すると、`tmp_path` のディレクトリ作成が
+    全テストの固定費になる(実測: 1 件あたり約 7 ms。純粋関数だけのテストでは setup が時間の
+    約 95%)。`tmp_path` を使うテスト(fixture 経由を含む。実測 2,819 / 18,271 件)は、これまでどおり
+    `tmp_path / "local_store"` を既定にする(`store_dir` fixture = `tmp_path / "local_store"` と
+    同じ場所を指す偶然の一致が、従来どおり保たれる)。それ以外(実測 15,452 件)は、pytest の基底
+    ディレクトリの配下の『テストごとに一意なパス』を既定にする。★ どちらも作らない
+    (store が構築されるとき作られる)= 『初期状態は存在しない』を保つ ★。
+    """
+    if "tmp_path" in request.fixturenames:
+        store_dir = request.getfixturevalue("tmp_path") / "local_store"
+    else:
+        store_dir = _assign_default_store_dir(tmp_path_factory.getbasetemp())
+    monkeypatch.setattr(json_store, "DEFAULT_STORE_DIR", store_dir)
+    yield store_dir
+
+
+@pytest.fixture(autouse=True)
+def _no_real_edinet_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    """開発機の環境変数 `EDINET_API_KEY` がテストを実EDINETへ接続させないようにする(Issue #818)。
+
+    BuyCandidates dispatcherは、fan-outの前にEDINETの書類一覧を事前取得する
+    (`infrastructure/edinet/window_prefetch.py`)。APIキーが設定されている環境では、
+    dispatcherを通るテストが実際のEDINETを呼びうる。キーを使うテストは、各テストの中で
+    `monkeypatch.setenv` / 明示の引数で渡す(後から効くため、本fixtureの削除に影響されない)。
+    """
+    monkeypatch.delenv("EDINET_API_KEY", raising=False)
+
+
+# --- Issue #277: cohort marker の自動付与 -----------------------------------------
+#
+# cohort の正本は tests/support/time_semantics_registry.py の _REGISTRY である。
+# ここでは収集時に marker を**動的に付ける**だけで、テスト側へ pytestmark を
+# 手で書かせない。手で書かせると registry と二重管理になり、必ず drift する
+# (registry の V8 が防ごうとした「静かに外れる」経路を、もう 1 本作ることになる)。
+#
+# ★ 「付け忘れる対象」が存在しないため、移行漏れは原理的に起きない。
+# ★ それでも自動付与そのものは壊れうるので、
+#   tests/unit/test_issue_277_cohort_markers.py が
+#   「registry の全エントリに marker が実際に付いていること」を検証する。
+
+
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    """registry に登録されたモジュールの item へ cohort marker を付ける。
+
+    ★ items の**順序は変えない**。並べ替えも間引きもせず、marker を足すだけである。
+    """
+    repo_root = Path(__file__).resolve().parents[1]
+    by_module = {entry.module: entry.cohort for entry in _REGISTRY}
+    for item in items:
+        path = getattr(item, "path", None)
+        if path is None:  # pragma: no cover - 古い pytest との互換
+            continue
+        try:
+            relative = Path(path).resolve().relative_to(repo_root).as_posix()
+        except ValueError:  # pragma: no cover - repo 外のテストは対象外
+            continue
+        cohort = by_module.get(relative)
+        if cohort is None:
+            continue
+        item.add_marker(getattr(pytest.mark, cohort_marker_name(cohort)))

@@ -1,0 +1,145 @@
+"""適正価格の複数手法化(要求仕様8節)。
+
+単一の適正価格を絶対値として扱わず、複数手法の結果をレンジ(弱気/中立/強気)と
+して保持する。各手法は算出できなかった場合、捏造せずexclusion_reasonを残す。
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+from decimal import Decimal
+from enum import StrEnum
+
+from jstock_advisor.domain.entities.base import ImmutableSnapshot
+from jstock_advisor.domain.entities.enums import ConfidenceLevel
+
+
+class FairValueUnusableReasonCode(StrEnum):
+    """FairValueRange.usable_for_trading_judgment=Falseの直接原因の構造化コード
+    (Issue #21)。
+
+    build_fair_value_range()の3つの発火条件と1対1対応する。機械判定
+    (表示分岐等)はこのcodeを正本とし、unusable_reason(自由文)は判定時点の
+    監査・説明用スナップショットとして扱う(自由文のparse分岐は禁止)。
+    """
+
+    NO_VALID_METHODS = "NO_VALID_METHODS"
+    TOO_FEW_METHODS = "TOO_FEW_METHODS"
+    METHOD_SPREAD_TOO_WIDE = "METHOD_SPREAD_TOO_WIDE"
+
+
+class ProfitTakingFairValueBlockReasonCode(StrEnum):
+    """利確判定が想定上限価格(ceiling)を使えなかった直接原因の構造化コード
+    (Issue #221 Phase 1)。
+
+    FairValueUnusableReasonCode(Issue #21)とは別の軸である。あちらは
+    build_fair_value_range()が「レンジそのものを売買判断に使えない」と
+    決めた場合(usable_for_trading_judgment=False)の理由であり、その3値は
+    同関数の3つの発火条件と1対1で対応する。本enumはレンジ自体は使える
+    (usable_for_trading_judgment=True)にもかかわらず、利確判定側の
+    追加ゲート(_fair_value_action_usable())がより厳しい基準で弾いた場合を
+    表す。両者は閾値が異なるため、片方だけが成立する帯が存在する。
+
+    FairValueUnusableReasonCodeへ値を足さないのは、あちらのdocstringが
+    宣言している「build_fair_value_range()の3つの発火条件と1対1対応する」
+    という不変条件を壊さないためである。
+    """
+
+    METHOD_SPREAD_TOO_WIDE_FOR_ACTION = "METHOD_SPREAD_TOO_WIDE_FOR_ACTION"
+    # --- Issue #471: 利確判定側の他の不成立条件も、原因ごとに構造化する(追加のみ。既存の値は不変)。
+    #: 手法数が利確判定側の下限(condition_based_judgment.min_fair_value_methods_for_partial)未満。
+    #: レンジ側の下限(min_methods_required)より厳しいため、レンジは使えるのに
+    #: 利確側で弾かれる帯がある。
+    TOO_FEW_METHODS_FOR_ACTION = "TOO_FEW_METHODS_FOR_ACTION"
+    #: 適正価格が最新の決算を反映していない(fair_value_reflects_latest_earnings が False)。
+    FAIR_VALUE_NOT_REFLECTING_LATEST_EARNINGS = "FAIR_VALUE_NOT_REFLECTING_LATEST_EARNINGS"
+    #: 最新の決算を反映しているか判定できない(None)。「反映していない」と断定しない。
+    FAIR_VALUE_EARNINGS_REFLECTION_UNKNOWN = "FAIR_VALUE_EARNINGS_REFLECTION_UNKNOWN"
+    #: 次回決算までの営業日数が利確判定側の下限
+    #: (min_business_days_to_earnings_for_fair_value_action)未満。
+    EARNINGS_TOO_CLOSE_FOR_ACTION = "EARNINGS_TOO_CLOSE_FOR_ACTION"
+
+
+class ValuationExclusionReason(ImmutableSnapshot):
+    """適正価格の算出方式が集計から除外された理由の構造化記録
+    (BUYパイプライン第2次修正(2026-07)で追加。要求仕様10節)。
+
+    「除外した」という事実だけでなく、どの条件でどの基準値に対して
+    外れ値と判定したかを監査可能な形で残す。
+    """
+
+    code: str
+    message: str
+    actual_value: Decimal | float | None = None
+    reference_value: Decimal | float | None = None
+
+
+class FairValueMethodResult(ImmutableSnapshot):
+    method: str  # "target_yield" | "per" | "pbr" | "historical_range" | "dcf"
+    fair_value: Decimal | None
+    input_values: dict[str, str] = {}
+    input_dates: dict[str, dt.date] = {}
+    assumptions: dict[str, str] = {}
+    confidence: ConfidenceLevel
+    exclusion_reason: str | None = None
+
+    # --- BUYパイプライン再設計(2026-07)で追加。算出できたことと、その結果を
+    # 適正価格集計に採用してよいことは別(要求仕様9節・10節)。不適切な前提
+    # (EPS負数・分割未調整・特別配当の恒常化等)の場合はapplicable=Falseとし、
+    # exclusion_reasonへ理由を残したうえで集計(min/max/median/mean)から除外する ---
+    applicable: bool = True
+    source_date: dt.date | None = None
+
+    # --- BUYパイプライン第2次修正(2026-07)で追加。要求仕様10節: 下方外れ値
+    # (現在値の10%未満・他方式中央値の40%未満等)の構造化記録。DCFの単年度
+    # キャッシュフロー歪み等により、上方乖離フィルタでは検出できない異常に
+    # 低い算出値を検出する ---
+    exclusion_detail: ValuationExclusionReason | None = None
+
+    # --- Issue #179(2026-09)で追加。除外閾値のすぐ下(境界帯)にあったため
+    # 完全に除外せず、他方式の中央値へ寄せて採用した場合の構造化記録。
+    # exclusion_detailが「集計から外した理由」であるのに対し、こちらは
+    # 「外さずに値を寄せた事実」であり、applicableはTrueのまま、fair_valueは
+    # 補間後の値になる。actual_valueへは補間前のraw値を残すため、
+    # #20 O-Cの下方シナリオ観測と同じ粒度で元の算出値を追跡できる。
+    # このフィールドを持たない既存レコードはNoneとして読める(後方互換)。
+    transition_detail: ValuationExclusionReason | None = None
+
+
+class FairValueRange(ImmutableSnapshot):
+    bear: Decimal | None
+    neutral: Decimal | None
+    bull: Decimal | None
+    overall_confidence: ConfidenceLevel
+    methods_used: list[FairValueMethodResult]
+    methods_excluded: list[FairValueMethodResult]
+    usable_for_trading_judgment: bool
+    unusable_reason: str | None = None
+    # Issue #21: unusable_reasonの構造化コード(usable=False時のみ非None)。
+    # 既存のusable_for_trading_judgment/unusable_reasonの意味は変更しない。
+    unusable_reason_code: FairValueUnusableReasonCode | None = None
+
+    # --- BUYパイプライン再設計(2026-07)で追加。単一の「最終適正価格」ではなく
+    # 手法間のバラつきを扱えるようにする(要求仕様9節)。SELL側の
+    # usable_for_trading_judgmentはそのまま維持し、これらは追加情報として扱う ---
+    valuation_min: Decimal | None = None
+    valuation_max: Decimal | None = None
+    valuation_median: Decimal | None = None
+    valuation_mean: Decimal | None = None
+    valuation_dispersion_ratio: float | None = None  # = valuation_max / valuation_min
+    methods_used_count: int | None = None
+
+    # --- BUYパイプライン第2次修正(2026-07)で追加。要求仕様9節: 通知に表示する
+    # 「購入判断に実際に使用したレンジ」(下方外れ値除外後)と、監査用の
+    # 「全手法参考値」を分離する。valuation_min/maxは下方外れ値除外後の値
+    # (=購入判断用)を指すよう意味を変更し、decision_valuation_min/maxは
+    # そのエイリアスとして通知層が明示的に参照できるようにする ---
+    decision_valuation_min: Decimal | None = None
+    decision_valuation_max: Decimal | None = None
+
+    # --- BUYパイプライン第3次修正(2026-07)で追加。要求仕様: 外れ値フィルタ適用後
+    # に比較・購入判断へ使える方式が1件以下になった場合(3方式が互いを外れ値と
+    # みなし合う等)、除外前の結果へフォールバックしたうえで、その事実を明示的な
+    # 低信頼シグナルとして買付価格信頼性ゲート(buy_price_reliability.py)へ
+    # 伝える ---
+    outlier_filter_blocking_reason: str | None = None
